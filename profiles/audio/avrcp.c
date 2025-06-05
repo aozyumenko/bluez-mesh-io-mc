@@ -3577,7 +3577,7 @@ static struct avrcp_player *create_ct_player(struct avrcp *session,
 
 	path = device_get_path(session->dev);
 
-	mp = media_player_controller_create(path, id);
+	mp = media_player_controller_create(path, "avrcp", id);
 	if (mp == NULL) {
 		g_free(player);
 		return NULL;
@@ -3878,6 +3878,15 @@ static void avrcp_now_playing_changed(struct avrcp *session,
 	struct media_player *mp = player->user_data;
 
 	DBG("NowPlaying changed");
+
+	/* reset the list_items operation, if it is in progress or else we will
+	 * crash because _clear_playlist() frees the items
+	 */
+	if (player->p) {
+		g_slist_free(player->p->items);
+		g_free(player->p);
+		player->p = NULL;
+	}
 
 	media_player_clear_playlist(mp);
 }

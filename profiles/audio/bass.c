@@ -90,6 +90,7 @@ struct bass_assistant {
 	struct btd_device *device;	/* Broadcast source device */
 	struct bass_data *data;		/* BASS session with peer device */
 	uint8_t sgrp;
+	uint8_t sid;
 	uint8_t bis;
 	uint32_t bid;
 	struct bt_bap_qos qos;
@@ -106,6 +107,7 @@ struct bass_delegator {
 	struct bt_bap *bap;
 	unsigned int state_id;
 	unsigned int bcode_id;
+	uint8_t sid;
 	uint8_t *bcode;
 	unsigned int timeout;
 	struct queue *bcode_reqs;
@@ -646,6 +648,7 @@ static void bap_attached(struct bt_bap *bap, void *user_data)
 		btd_device_get_bdaddr_type(device),
 		BT_IO_OPT_MODE, BT_IO_MODE_ISO,
 		BT_IO_OPT_QOS, &bap_sink_pa_qos,
+		BT_IO_OPT_ISO_BC_SID, dg->sid,
 		BT_IO_OPT_INVALID);
 	if (!dg->io) {
 		error("%s", err->message);
@@ -911,6 +914,7 @@ static DBusMessage *push(DBusConnection *conn, DBusMessage *msg,
 		params.addr_type = BT_BASS_ADDR_RANDOM;
 
 	bacpy(&params.addr, device_get_address(assistant->device));
+	params.sid = assistant->sid;
 	put_le24(assistant->bid, params.bid);
 	params.pa_sync = PA_SYNC_NO_PAST;
 	params.pa_interval = PA_INTERVAL_UNKNOWN;
@@ -1067,12 +1071,11 @@ static void src_ad_search_bid(void *data, void *user_data)
 
 static struct bass_assistant *assistant_new(struct btd_adapter *adapter,
 		struct btd_device *device, struct bass_data *data,
-		uint8_t sgrp, uint8_t bis, struct bt_bap_qos *qos,
+		uint8_t sgrp, uint8_t sid, uint8_t bis, struct bt_bap_qos *qos,
 		struct iovec *meta, struct iovec *caps)
 {
 	struct bass_assistant *assistant;
 	char src_addr[18];
-	char dev_addr[18];
 
 	assistant = new0(struct bass_assistant, 1);
 	if (!assistant)
@@ -1083,6 +1086,7 @@ static struct bass_assistant *assistant_new(struct btd_adapter *adapter,
 	assistant->device = device;
 	assistant->data = data;
 	assistant->sgrp = sgrp;
+	assistant->sid = sid;
 	assistant->bis = bis;
 	assistant->qos = *qos;
 
@@ -1096,10 +1100,10 @@ static struct bass_assistant *assistant_new(struct btd_adapter *adapter,
 							assistant);
 
 	ba2str(device_get_address(device), src_addr);
-	ba2str(device_get_address(data->device), dev_addr);
 
-	assistant->path = g_strdup_printf("%s/src_%s/dev_%s/bis%d",
-		adapter_get_path(adapter), src_addr, dev_addr, bis);
+	assistant->path = g_strdup_printf("%s/src_%s/sid%d/bis%d",
+					device_get_path(data->device), src_addr,
+					sid, bis);
 
 	g_strdelimit(assistant->path, ":", '_');
 
@@ -1146,7 +1150,7 @@ static void bis_probe(uint8_t sid, uint8_t bis, uint8_t sgrp,
 		DBG("%s data %p BIS %d", addr, data, bis);
 
 		assistant = assistant_new(adapter, device, data, sgrp,
-							bis, qos, meta, caps);
+						sid, bis, qos, meta, caps);
 
 		if (g_dbus_register_interface(btd_get_dbus_connection(),
 						assistant->path,
@@ -1320,6 +1324,7 @@ probe:
 
 	dg->device = device;
 	dg->src = bcast_src;
+	dg->sid = params->sid;
 	dg->bcode_reqs = queue_new();
 	dg->setups = queue_new();
 
@@ -1460,6 +1465,7 @@ static int handle_mod_src_req(struct bt_bcast_src *bcast_src,
 				btd_device_get_bdaddr_type(dg->device),
 				BT_IO_OPT_MODE, BT_IO_MODE_ISO,
 				BT_IO_OPT_QOS, &bap_sink_pa_qos,
+				BT_IO_OPT_ISO_BC_SID, dg->sid,
 				BT_IO_OPT_INVALID);
 			if (!dg->io) {
 				error("%s", err->message);
