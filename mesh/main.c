@@ -50,9 +50,10 @@ static const struct option main_options[] = {
 };
 
 static const char *io_usage =
-	       "\t(auto | generic:[hci]<index> | unit:<fd_path>)\n"
+	       "\t(auto | generic:[hci]<index> | nrf52:<serial_path> | unit:<fd_path>)\n"
 	       "\t\tauto - Use first available controller (MGMT or raw HCI)\n"
 	       "\t\tgeneric - Use raw HCI io on interface hci<index>\n"
+	       "\t\tnrf52 - Use nRF52-based serial mesh controller on <serial_path> device\n"
 	       "\t\tunit - Use test IO (for automatic testing only)\n";
 
 static void usage(void)
@@ -183,7 +184,20 @@ static bool parse_io(const char *optarg, enum mesh_io_type *type, void **opts)
 			return true;
 
 		return false;
+	} else if (strstr(optarg, "nrf52") == optarg) {
+		char *serial_path;
 
+		*type = MESH_IO_TYPE_NRF52;
+
+		optarg += strlen("nrf52");
+		if (!*optarg || *optarg != ':')
+			return false;
+
+		optarg++;
+		serial_path = strdup(optarg);
+
+		*opts = serial_path;
+		return true;
 	} else if (strstr(optarg, "unit") == optarg) {
 		char *test_path;
 

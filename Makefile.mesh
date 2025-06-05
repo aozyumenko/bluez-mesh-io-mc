@@ -19,6 +19,8 @@ mesh_sources = mesh/mesh.h mesh/mesh.c \
 				mesh/mesh-io-unit.h mesh/mesh-io-unit.c \
 				mesh/mesh-io-mgmt.h mesh/mesh-io-mgmt.c \
 				mesh/mesh-io-generic.h mesh/mesh-io-generic.c \
+				mesh/mesh-io-nrf52.h mesh/mesh-io-nrf52.c \
+				mesh/nrf52-serial.h mesh/nrf52-serial.c \
 				mesh/net.h mesh/net.c \
 				mesh/crypto.h mesh/crypto.c \
 				mesh/friend.h mesh/friend.c \
