@@ -553,16 +553,13 @@ static void rx_worker(struct l_idle *idle, void *user_data)
     if (io == NULL || io->pvt == NULL || io->pvt->serial_fd < 0)
         return;
 
-    /* cleanup expired Response Wait tasks */
-//    nrf_cmd_rsp_wait_task_flush();
-
     result = nrf_packet_receive(pvt->serial_fd, pvt->rx_buffer,
                                 sizeof(pvt->rx_buffer), &pvt->rx_idx,
                                 nrf_serial_packet_rx, io);
 
     if (!result) {
         pvt->rx_error_cnt++;
-//        l_debug("rx_error_cnt=%d", pvt->rx_error_cnt);
+        l_debug("rx_error_cnt=%d", pvt->rx_error_cnt);
     }
 
     // TODO: check rx_error_cnt and tx_error_cnt
@@ -573,11 +570,6 @@ static void rx_worker(struct l_idle *idle, void *user_data)
 ///////////////////////////////////////////////////////
 
 
-// FIXME: move to top
-//static void tx_to(struct l_timeout *timeout, void *user_data);
-//static void tx_worker(void *user_data);
-
-
 static void nrf_cmd_resp_ble_ad_data_send_cb(uint32_t token, const nrf_serial_packet_t *packet, void *user_data)
 {
     struct mesh_io *io = user_data;
@@ -586,29 +578,19 @@ static void nrf_cmd_resp_ble_ad_data_send_cb(uint32_t token, const nrf_serial_pa
     if (pvt == NULL)
         return;
 
-//    if (pvt == NULL || pvt->tx == NULL) {
-//        l_debug("token 0x%x not found", token);
-//        return;
-//    }
-
-//    if (token != pvt->tx->token) {
-//        l_debug("invalid packet token 0x%x, expected 0x%x", token, pvt->tx->token);
-//        return;
-//    }
-
     if (packet == NULL || packet->payload.evt.cmd_rsp.status != SERIAL_STATUS_SUCCESS) {
         pvt->tx_error_cnt++;
 
-        l_error("Can't send BLE Advertising: %d, token=0x%x",
-            packet != NULL ? packet->payload.evt.cmd_rsp.status : -1, token);
+        l_debug("Can't send BLE Advertising: %d, token=0x%x, tx_error_cnt=%u",
+            packet != NULL ? packet->payload.evt.cmd_rsp.status : -1, token, pvt->tx_error_cnt);
     }
-    else {
-        l_debug("ACK packet: token=0x%x", token);
-    }
+//    else {
+//        l_debug("ACK packet: token=0x%x", token);
+//    }
 }
 
 
-static bool nrf_cmd_send_ble_ad_data_send(struct mesh_io *io, struct tx_pkt *tx)
+static void ad_data_send(struct mesh_io *io, struct tx_pkt *tx)
 {
     struct mesh_io_private *pvt = io->pvt;
     nrf_serial_packet_t packet;
@@ -628,19 +610,9 @@ l_debug("delete packet tx=%p", tx);
         l_free(tx);
     }
 
-    ret = nrf_packet_send(pvt->serial_fd, &packet);
-    if (ret) {
-        cmd_rsp_add(io, SERIAL_OPCODE_CMD_BLE_AD_DATA_SEND, tx->token,
-                    nrf_cmd_resp_ble_ad_data_send_cb, io);
-//        ret = nrf_cmd_rsp_wait_task_add(SERIAL_OPCODE_CMD_BLE_AD_DATA_SEND, tx->token,
-//                                        nrf_cmd_resp_ble_ad_data_send_cb, io);
-//        if (!ret) {
-//            l_error("Can't register callback on SERIAL_OPCODE_CMD_BLE_AD_DATA_SEND response");
-//            return false;
-//        }
-    }
-
-    return true;
+    (void) nrf_packet_send(pvt->serial_fd, &packet);
+    cmd_rsp_add(io, SERIAL_OPCODE_CMD_BLE_AD_DATA_SEND, tx->token,
+                nrf_cmd_resp_ble_ad_data_send_cb, io);
 }
 
 
@@ -655,19 +627,10 @@ static void tx_to(struct l_timeout *timeout, void *user_data)
     if (pvt == NULL)
         return;
 
-//    if (pvt->tx != NULL) {
-//        /* packet already sending */
-//        pvt->tx_restart = true;
-//l_debug("suspend tx task", tx);
-//        return;
-//    }
-
     tx = l_queue_pop_head(pvt->tx_pkts);
     if (tx == NULL) {
-//if (pvt->tx != NULL) l_debug("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
         l_timeout_remove(timeout);
         pvt->tx_timeout = NULL;
-//        pvt->tx = NULL;
         return;
     }
 
@@ -684,11 +647,9 @@ static void tx_to(struct l_timeout *timeout, void *user_data)
 //l_debug("tx=%p, count=%u, interval=%u", tx, count, ms);
 
     tx->delete = !!(count == 1);
-l_debug("########## token=0x%x, count=%d, tx->delete=%d", tx->token, count, tx->delete);
+//l_debug("########## token=0x%x, count=%d, tx->delete=%d", tx->token, count, tx->delete);
 
-    // FixMe: process sending error!!!!!!!!!!!!!
-    (void)nrf_cmd_send_ble_ad_data_send(io, tx);
-
+    ad_data_send(io, tx);
 
     if (count == 1) {
         /* Recalculate wakeup if we are responding to POLL */
@@ -701,7 +662,6 @@ l_debug("########## token=0x%x, count=%d, tx->delete=%d", tx->token, count, tx->
     }
     else
         l_queue_push_tail(pvt->tx_pkts, tx);
-
 
     if (timeout != NULL) {
         pvt->tx_timeout = timeout;
@@ -909,7 +869,7 @@ static bool send_tx(struct mesh_io *io, struct mesh_io_send_info *info,
     tx->len = len;
     tx->token = get_next_token();
 
-l_debug("***** token=0x%x", tx->token);
+l_debug("***** tx=%p, token=0x%x", tx, tx->token);
 
     if (info->type == MESH_IO_TIMING_TYPE_POLL_RSP)
         l_queue_push_head(pvt->tx_pkts, tx);
@@ -917,11 +877,9 @@ l_debug("***** token=0x%x", tx->token);
         l_queue_push_tail(pvt->tx_pkts, tx);
     }
 
-//    if (pvt->tx == NULL) {
-        l_timeout_remove(pvt->tx_timeout);
-        pvt->tx_timeout = NULL;
-        l_idle_oneshot(tx_worker, io, NULL);
-//    }
+    l_timeout_remove(pvt->tx_timeout);
+    pvt->tx_timeout = NULL;
+    l_idle_oneshot(tx_worker, io, NULL);
 
     return true;
 }
@@ -940,10 +898,6 @@ static bool tx_cancel(struct mesh_io *io, const uint8_t *data, uint8_t len)
             tx = l_queue_remove_if(pvt->tx_pkts, find_by_ad_type,
                                    L_UINT_TO_PTR(data[0]));
             l_free(tx);
-
-//            if (tx == pvt->tx)
-//                pvt->tx = NULL;
-
         } while (tx);
     } else {
         struct tx_pattern pattern = {
@@ -955,10 +909,6 @@ static bool tx_cancel(struct mesh_io *io, const uint8_t *data, uint8_t len)
             tx = l_queue_remove_if(pvt->tx_pkts, find_by_pattern,
                                    &pattern);
             l_free(tx);
-
-//            if (tx == pvt->tx)
-//                pvt->tx = NULL;
-
         } while (tx);
     }
 
