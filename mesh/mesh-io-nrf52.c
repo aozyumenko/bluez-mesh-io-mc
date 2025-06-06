@@ -31,9 +31,8 @@
 
 
 
-#define DEFAULT_ADDR     "\x55\x55\x55\x55\x55\x55"
-
-
+#define DEFAULT_ADDR            "\x55\x55\x55\x55\x55\x55"
+#define CMD_RSP_TIMEOUT         50
 
 
 
@@ -57,32 +56,45 @@ struct mesh_io_private {
 
     /* Tx packet */
     struct l_queue *tx_pkts;
-//    struct l_queue *tx_proc_pkts;
     struct l_timeout *tx_timeout;
-    struct tx_pkt *tx;
+    struct l_queue *tx_cmd_rsps;
+    struct l_timeout *tx_cmd_rsp_timeout;
     int tx_error_cnt;
 };
 
 
+typedef void (*cmd_rsp_cb_t)(uint32_t token, const nrf_serial_packet_t *packet, void *user_data);
+
+struct cmd_rsp {
+    bool used;
+    uint8_t opcode;
+    uint32_t token;
+    unsigned long long instant;
+    cmd_rsp_cb_t cb;
+    void *user_data;
+};
+
+
 struct process_data {
-    struct mesh_io_private      *pvt;
-    const uint8_t               *data;
-    uint8_t                     len;
-    struct mesh_io_recv_info    info;
+    struct mesh_io_private *pvt;
+    const uint8_t *data;
+    uint8_t len;
+    struct mesh_io_recv_info info;
 };
 
 
 struct tx_pkt {
-    struct mesh_io_send_info    info;
-    bool                        delete;
-    uint32_t                    token;
-    uint8_t                     len;
-    uint8_t                     pkt[NRF_MESH_SERIAL_CMD_PAYLOAD_MAXLEN];
+    struct mesh_io_send_info info;
+    bool delete;
+    uint32_t token;
+    uint8_t len;
+    uint8_t pkt[NRF_MESH_SERIAL_CMD_PAYLOAD_MAXLEN];
 };
 
+
 struct tx_pattern {
-    const uint8_t       *data;
-    uint8_t             len;
+    const uint8_t *data;
+    uint8_t len;
 };
 
 
@@ -90,7 +102,7 @@ struct tx_pattern {
 static void nrf_start(void *user_data);
 static void nrf_stop(struct mesh_io *io);
 static bool nrf_cmd_send(struct mesh_io *io, uint8_t opcode, uint32_t token, size_t length,
-                         uint8_t *payload, nrf_serial_cmd_rsp_cb_t cb, void *user_data);
+                         uint8_t *payload, cmd_rsp_cb_t cb, void *user_data);
 
 static bool nrf_cmd_send_reset(struct mesh_io *io);
 static bool nrf_cmd_send_serial_version_get(struct mesh_io *io);
@@ -181,10 +193,114 @@ static bool find_by_token(const void *a, const void *b)
 }
 
 
+
 /* send command */
 
+
+static bool cmd_rsp_find_by_instant(const void *a, const void *b)
+{
+    const struct cmd_rsp *rsp = a;
+    const unsigned long long *instant = b;
+
+    return rsp->instant <= *instant;
+}
+
+
+static bool cmd_rsp_find_by_packet(const void *a, const void *b)
+{
+    const struct cmd_rsp *rsp = a;
+    const nrf_serial_packet_t *packet = b;
+
+    return packet->opcode == SERIAL_OPCODE_EVT_CMD_RSP &&
+        rsp->opcode == packet->payload.evt.cmd_rsp.opcode &&
+        rsp->token == packet->payload.evt.cmd_rsp.token;
+}
+
+
+static void cmd_rsp_worker(struct l_timeout *timeout, void *user_data)
+{
+    struct mesh_io *io = user_data;
+    struct mesh_io_private *pvt = io->pvt;
+    struct cmd_rsp *rsp;
+    struct timeval tm;
+    unsigned long long instant;
+
+    if (pvt == NULL)
+        return;
+
+    gettimeofday(&tm, NULL);
+    instant = tm.tv_sec * 1000;
+    instant += tm.tv_usec / 1000;
+
+    while ((rsp = l_queue_find(pvt->tx_cmd_rsps, cmd_rsp_find_by_instant,
+                               &instant)) != NULL) {
+        rsp->cb(rsp->token, NULL, rsp->user_data);
+        l_queue_remove_if(pvt->tx_cmd_rsps, simple_match, rsp);
+        l_free(rsp);
+    }
+
+    if (l_queue_length(io->rx_regs) == 0) {
+        l_timeout_remove(timeout);
+        pvt->tx_cmd_rsp_timeout = NULL;
+    } else {
+        l_timeout_modify_ms(timeout, CMD_RSP_TIMEOUT);
+    }
+}
+
+
+static void cmd_rsp_add(struct mesh_io *io, uint8_t opcode, uint32_t token, cmd_rsp_cb_t cb, void *user_data)
+{
+    struct mesh_io_private *pvt = io->pvt;
+    struct cmd_rsp *rsp;
+    struct timeval tm;
+    unsigned long long instant;
+
+    if (pvt == NULL || cb == NULL)
+        return;
+
+    gettimeofday(&tm, NULL);
+    instant = tm.tv_sec * 1000;
+    instant += tm.tv_usec / 1000;
+
+    rsp = l_new(struct cmd_rsp, 1);
+
+    rsp->opcode = opcode;
+    rsp->token = token;
+    rsp->instant = instant + CMD_RSP_TIMEOUT;
+    rsp->user_data = user_data;
+    rsp->cb = cb;
+
+    l_queue_push_tail(pvt->tx_cmd_rsps, rsp);
+
+    if (pvt->tx_cmd_rsp_timeout == NULL) {
+        pvt->tx_cmd_rsp_timeout = l_timeout_create_ms(CMD_RSP_TIMEOUT,
+                                                      cmd_rsp_worker, io, NULL);
+    }
+}
+
+
+static bool cmd_rsp_handle(struct mesh_io *io, const nrf_serial_packet_t *packet)
+{
+    struct mesh_io_private *pvt = io->pvt;
+    struct cmd_rsp *rsp;
+
+    if (pvt == NULL)
+        return false;
+
+    rsp = l_queue_find(pvt->tx_cmd_rsps, cmd_rsp_find_by_packet, packet);
+    if (rsp != NULL) {
+        rsp->cb(rsp->token, packet, rsp->user_data);
+        l_queue_remove_if(pvt->tx_cmd_rsps, simple_match, rsp);
+        l_free(rsp);
+        return true;
+    }
+
+    return false;
+}
+
+
 static bool nrf_cmd_send(struct mesh_io *io, uint8_t opcode, uint32_t token, size_t length,
-                         uint8_t *payload, nrf_serial_cmd_rsp_cb_t cb, void *user_data)
+                         uint8_t *payload, cmd_rsp_cb_t cb, void *user_data)
 {
     struct mesh_io_private *pvt = io->pvt;
     nrf_serial_packet_t packet;
@@ -199,17 +315,13 @@ static bool nrf_cmd_send(struct mesh_io *io, uint8_t opcode, uint32_t token, siz
 
     ret = nrf_packet_send(pvt->serial_fd, &packet);
     if (ret) {
-        ret = nrf_cmd_rsp_wait_task_add(opcode, token, cb, user_data);
-        if (!ret) {
-            l_error("Can't register callback on command 0x%02x response", opcode);
-            return false;
-        }
+        cmd_rsp_add(io, opcode, token, cb, user_data);
     }
 
     return true;
 }
 
-
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 static void nrf_cmd_resp_reset_cb(uint32_t token, const nrf_serial_packet_t *packet, void *user_data)
 {
@@ -244,7 +356,6 @@ static void nrf_cmd_resp_serial_version_get_cb(uint32_t token, const nrf_serial_
         if (packet->payload.evt.cmd_rsp.data.serial_version.serial_ver == SERIAL_API_VERSION) {
             if (io->ready)
                 io->ready(io->user_data, true);
-//            (void)nrf_cmd_send_start(io);
         } else {
             if (io->ready)
                 io->ready(io->user_data, false);
@@ -306,86 +417,6 @@ static bool nrf_cmd_send_stop(struct mesh_io *io)
     return nrf_cmd_send(io, SERIAL_OPCODE_CMD_STOP, get_next_token(),
                         0, NULL, nrf_cmd_resp_stop_cb, io);
 }
-
-
-
-////////////////////////////////////////////////////////
-
-static void nrf_cmd_resp_ble_ad_data_send_cb(uint32_t token, const nrf_serial_packet_t *packet, void *user_data)
-{
-    struct mesh_io *io = user_data;
-    struct mesh_io_private *pvt = io->pvt;
-//    struct tx_pkt *tx = l_queue_find(pvt->tx_pkts, find_by_token, L_UINT_TO_PTR(token));
-
-    if (pvt->tx == NULL) {
-        l_debug("token 0x%x not found", token);
-        return;
-    }
-
-    if (token != pvt->tx->token) {
-        l_debug("invalid packet token 0x%x, expected 0x%x", token, pvt->tx->token);
-        return;
-    }
-
-
-    if (packet == NULL || packet->payload.evt.cmd_rsp.status != SERIAL_STATUS_SUCCESS) {
-        pvt->tx_error_cnt++;
-
-//        l_error("Can't send BLE Advertising: %d, token=0x%x, tx_error_cnt=%d", packet != NULL ? packet->payload.evt.cmd_rsp.status : -1, token, pvt->tx_error_cnt);
-        l_error("Can't send BLE Advertising: %d, token=0x%x, cnt=%u, delete=%d",
-            packet != NULL ? packet->payload.evt.cmd_rsp.status : -1, token, pvt->tx->info.u.gen.cnt, pvt->tx->delete);
-
-//        if (tx->info.u.gen.cnt > 0 || tx->delete) {
-//l_debug("resend packet: tx=%p", tx);
-//            tx->delete = false;
-//            tx->info.u.gen.cnt++;
-//        }
-    }
-//    else {
-//        l_debug("ACK packet: %p, token=0x%x, delete=%d", tx, token, tx->delete);
-//    }
-
-    if (pvt->tx->delete) {
-//l_debug("delete packet tx=%p", tx);
-        l_queue_remove_if(pvt->tx_pkts, simple_match, pvt->tx);
-        l_free(pvt->tx);
-        pvt->tx = NULL;
-    }
-}
-
-static bool nrf_cmd_send_ble_ad_data_send(struct mesh_io *io, struct tx_pkt *tx)
-{
-    struct mesh_io_private *pvt = io->pvt;
-    nrf_serial_packet_t packet;
-    bool ret;
-
-//    l_debug("Send CMD_BLE_AD_DATA_SEND");
-
-//    tx->token = get_next_token();
-
-    packet.length = NRF_MESH_SERIAL_PACKET_OVERHEAD + NRF_MESH_SERIAL_CMD_OVERHEAD + tx->len + 1;
-    packet.opcode = SERIAL_OPCODE_CMD_BLE_AD_DATA_SEND;
-    packet.payload.cmd.token = tx->token;
-    packet.payload.cmd.payload.ble_ad_data.data[0] = tx->len;
-    memcpy(&packet.payload.cmd.payload.ble_ad_data.data[1], tx->pkt, tx->len);
-
-
-    ret = nrf_packet_send(pvt->serial_fd, &packet);
-    if (ret) {
-        ret = nrf_cmd_rsp_wait_task_add(SERIAL_OPCODE_CMD_BLE_AD_DATA_SEND, tx->token,
-                                        nrf_cmd_resp_ble_ad_data_send_cb, io);
-        if (!ret) {
-            l_error("Can't register callback on SERIAL_OPCODE_CMD_BLE_AD_DATA_SEND response");
-            return false;
-        }
-    }
-
-    pvt->tx = tx;
-
-    return true;
-}
-
-
 
 
 /////////////////////////////////////////////////
@@ -489,11 +520,12 @@ static void nrf_serial_packet_rx(const nrf_serial_packet_t *packet, void *user_d
 {
     struct mesh_io *io = user_data;
     struct mesh_io_private *pvt = io->pvt;
-    nrf_serial_cmd_rsp_cb_t cmd_rsp_cb;
+    cmd_rsp_cb_t cmd_rsp_cb;
     int i;
 
     if (packet->opcode == SERIAL_OPCODE_EVT_CMD_RSP) {
-        nrf_cmd_rsp_wait_task_handle(packet);
+        (void)cmd_rsp_handle(io, packet);
+//        nrf_cmd_rsp_wait_task_handle(packet);
     } else {
         for (i = 0; i < L_ARRAY_SIZE(packet_handler_list); i++) {
             if (packet_handler_list[i].opcode == packet->opcode) {
@@ -522,7 +554,7 @@ static void rx_worker(struct l_idle *idle, void *user_data)
         return;
 
     /* cleanup expired Response Wait tasks */
-    nrf_cmd_rsp_wait_task_flush();
+//    nrf_cmd_rsp_wait_task_flush();
 
     result = nrf_packet_receive(pvt->serial_fd, pvt->rx_buffer,
                                 sizeof(pvt->rx_buffer), &pvt->rx_idx,
@@ -538,6 +570,80 @@ static void rx_worker(struct l_idle *idle, void *user_data)
 
 
 
+///////////////////////////////////////////////////////
+
+
+// FIXME: move to top
+//static void tx_to(struct l_timeout *timeout, void *user_data);
+//static void tx_worker(void *user_data);
+
+
+static void nrf_cmd_resp_ble_ad_data_send_cb(uint32_t token, const nrf_serial_packet_t *packet, void *user_data)
+{
+    struct mesh_io *io = user_data;
+    struct mesh_io_private *pvt = io->pvt;
+
+    if (pvt == NULL)
+        return;
+
+//    if (pvt == NULL || pvt->tx == NULL) {
+//        l_debug("token 0x%x not found", token);
+//        return;
+//    }
+
+//    if (token != pvt->tx->token) {
+//        l_debug("invalid packet token 0x%x, expected 0x%x", token, pvt->tx->token);
+//        return;
+//    }
+
+    if (packet == NULL || packet->payload.evt.cmd_rsp.status != SERIAL_STATUS_SUCCESS) {
+        pvt->tx_error_cnt++;
+
+        l_error("Can't send BLE Advertising: %d, token=0x%x",
+            packet != NULL ? packet->payload.evt.cmd_rsp.status : -1, token);
+    }
+    else {
+        l_debug("ACK packet: token=0x%x", token);
+    }
+}
+
+
+static bool nrf_cmd_send_ble_ad_data_send(struct mesh_io *io, struct tx_pkt *tx)
+{
+    struct mesh_io_private *pvt = io->pvt;
+    nrf_serial_packet_t packet;
+    bool ret;
+
+    l_debug("Send CMD_BLE_AD_DATA_SEND: token=0x%x", tx->token);
+
+    packet.length = NRF_MESH_SERIAL_PACKET_OVERHEAD + NRF_MESH_SERIAL_CMD_OVERHEAD + tx->len + 1;
+    packet.opcode = SERIAL_OPCODE_CMD_BLE_AD_DATA_SEND;
+    packet.payload.cmd.token = tx->token;
+    packet.payload.cmd.payload.ble_ad_data.data[0] = tx->len;
+    memcpy(&packet.payload.cmd.payload.ble_ad_data.data[1], tx->pkt, tx->len);
+
+    if (tx->delete) {
+l_debug("delete packet tx=%p", tx);
+        l_queue_remove_if(pvt->tx_pkts, simple_match, tx);
+        l_free(tx);
+    }
+
+    ret = nrf_packet_send(pvt->serial_fd, &packet);
+    if (ret) {
+        cmd_rsp_add(io, SERIAL_OPCODE_CMD_BLE_AD_DATA_SEND, tx->token,
+                    nrf_cmd_resp_ble_ad_data_send_cb, io);
+//        ret = nrf_cmd_rsp_wait_task_add(SERIAL_OPCODE_CMD_BLE_AD_DATA_SEND, tx->token,
+//                                        nrf_cmd_resp_ble_ad_data_send_cb, io);
+//        if (!ret) {
+//            l_error("Can't register callback on SERIAL_OPCODE_CMD_BLE_AD_DATA_SEND response");
+//            return false;
+//        }
+    }
+
+    return true;
+}
+
+
 static void tx_to(struct l_timeout *timeout, void *user_data)
 {
     struct mesh_io *io = user_data;
@@ -549,12 +655,19 @@ static void tx_to(struct l_timeout *timeout, void *user_data)
     if (pvt == NULL)
         return;
 
+//    if (pvt->tx != NULL) {
+//        /* packet already sending */
+//        pvt->tx_restart = true;
+//l_debug("suspend tx task", tx);
+//        return;
+//    }
+
     tx = l_queue_pop_head(pvt->tx_pkts);
     if (tx == NULL) {
-if (pvt->tx != NULL) l_debug("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+//if (pvt->tx != NULL) l_debug("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
         l_timeout_remove(timeout);
         pvt->tx_timeout = NULL;
-        pvt->tx = NULL;
+//        pvt->tx = NULL;
         return;
     }
 
@@ -587,11 +700,10 @@ l_debug("########## token=0x%x, count=%d, tx->delete=%d", tx->token, count, tx->
         }
     }
     else
-        // FixMe!!!!!
         l_queue_push_tail(pvt->tx_pkts, tx);
 
 
-    if (timeout) {
+    if (timeout != NULL) {
         pvt->tx_timeout = timeout;
         l_timeout_modify_ms(timeout, ms);
     } else
@@ -609,10 +721,8 @@ static void tx_worker(void *user_data)
 
 
     tx = l_queue_peek_head(pvt->tx_pkts);
-    if (!tx)
+    if (tx == NULL)
         return;
-
-//    l_debug("tx=%p", tx);
 
     switch (tx->info.type) {
     case MESH_IO_TIMING_TYPE_GENERAL:
@@ -735,7 +845,8 @@ static bool dev_init(struct mesh_io *io, void *opts, void *user_data)
 
     pvt->tx_pkts = l_queue_new();
     pvt->tx_timeout = NULL;
-    pvt->tx = NULL;
+    pvt->tx_cmd_rsps = l_queue_new();
+    pvt->tx_cmd_rsp_timeout = NULL;
 
     io->pvt = pvt;
 
@@ -755,11 +866,11 @@ static bool dev_destroy(struct mesh_io *io)
     nrf_stop(io);
 
     l_timeout_remove(pvt->tx_timeout);
-    l_queue_remove_if(pvt->tx_pkts, simple_match, pvt->tx);
     l_queue_destroy(pvt->tx_pkts, l_free);
-    l_free(pvt->tx);
-    l_free(pvt->serial_path);
+    l_timeout_remove(pvt->tx_cmd_rsp_timeout);
+    l_queue_destroy(pvt->tx_cmd_rsps, l_free);
 
+    l_free(pvt->serial_path);
     io->pvt = NULL;
     l_free(pvt);
 
@@ -803,19 +914,14 @@ l_debug("***** token=0x%x", tx->token);
     if (info->type == MESH_IO_TIMING_TYPE_POLL_RSP)
         l_queue_push_head(pvt->tx_pkts, tx);
     else {
-        if (pvt->tx)
-            sending = true;
-        else
-            sending = !l_queue_isempty(pvt->tx_pkts);
-
         l_queue_push_tail(pvt->tx_pkts, tx);
     }
 
-    if (!sending) {
+//    if (pvt->tx == NULL) {
         l_timeout_remove(pvt->tx_timeout);
         pvt->tx_timeout = NULL;
         l_idle_oneshot(tx_worker, io, NULL);
-    }
+//    }
 
     return true;
 }
@@ -835,8 +941,8 @@ static bool tx_cancel(struct mesh_io *io, const uint8_t *data, uint8_t len)
                                    L_UINT_TO_PTR(data[0]));
             l_free(tx);
 
-            if (tx == pvt->tx)
-                pvt->tx = NULL;
+//            if (tx == pvt->tx)
+//                pvt->tx = NULL;
 
         } while (tx);
     } else {
@@ -850,8 +956,8 @@ static bool tx_cancel(struct mesh_io *io, const uint8_t *data, uint8_t len)
                                    &pattern);
             l_free(tx);
 
-            if (tx == pvt->tx)
-                pvt->tx = NULL;
+//            if (tx == pvt->tx)
+//                pvt->tx = NULL;
 
         } while (tx);
     }

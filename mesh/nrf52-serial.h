@@ -34,11 +34,6 @@ typedef struct __attribute((packed))
 
 
 
-//typedef union __attribute((packed))
-//{
-//    serial_cmd_ble_ad_data_t ble_ad_data;
-//} serial_cmd_t;
-
 typedef struct __attribute((packed))
 {
     uint32_t token;     /**< Unique ID of the command. */
@@ -164,19 +159,10 @@ typedef struct __packed {
 
 typedef void (*nrf_packet_rx_cb_t)(const nrf_serial_packet_t *packet, void *user_data);
 
-typedef void (*nrf_serial_cmd_rsp_cb_t)(uint32_t token, const nrf_serial_packet_t *packet, void *user_data);
 
-
-////////////////////////////////////////////
 
 int nrf_uart_init(const char *filename, int speed, int flags);
 
 bool nrf_packet_send(int fd, const nrf_serial_packet_t *packet);
 bool nrf_packet_receive(int fd, uint8_t *rx_buffer, size_t rx_buffer_size, int *rx_idx,
                         nrf_packet_rx_cb_t rx_cb, void *user_data);
-
-
-void nrf_cmd_rsp_wait_task_init();
-bool nrf_cmd_rsp_wait_task_add(uint8_t opcode, uint32_t token, nrf_serial_cmd_rsp_cb_t cb, void *user_data);
-bool nrf_cmd_rsp_wait_task_handle(const nrf_serial_packet_t *packet);
-void nrf_cmd_rsp_wait_task_flush();

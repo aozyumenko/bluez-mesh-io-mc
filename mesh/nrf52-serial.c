@@ -16,20 +16,6 @@
 #define SLIP_ESC_END                    0xdc
 #define SLIP_ESC_ESC                    0xdd
 
-#define CMD_RSP_WAIT_TASK_MAX           64
-#define CMD_RSP_WAIT_TASK_TIMEOUT       1000
-
-
-
-typedef struct {
-    bool used;
-    uint8_t opcode;
-    uint32_t token;
-    unsigned long long instant;
-    nrf_serial_cmd_rsp_cb_t cb;
-    void *user_data;
-} cmd_rsp_wait_task_t;
-
 
 
 // FIXME: for debug only
@@ -37,7 +23,7 @@ extern void _dump(const char *data, size_t len);
 
 
 
-static cmd_rsp_wait_task_t cmd_rsp_wait_task[CMD_RSP_WAIT_TASK_MAX];
+struct l_queue *cmd_rsp_wait_list;
 
 ///////////////////////////////////////////////////////
 
@@ -265,89 +251,4 @@ bool nrf_packet_receive(int fd, uint8_t *rx_buffer, size_t rx_buffer_size, int *
 
     *rx_idx = dst_idx;
     return true;
-}
-
-
-
-
-
-
-
-
-
-
-////////////////////////////////////////////////////
-
-void nrf_cmd_rsp_wait_task_init()
-{
-    int i;
-
-    for (i = 0; i < CMD_RSP_WAIT_TASK_MAX; i++) {
-        cmd_rsp_wait_task[i].used = false;
-    }
-}
-
-bool nrf_cmd_rsp_wait_task_add(uint8_t opcode, uint32_t token, nrf_serial_cmd_rsp_cb_t cb, void *user_data)
-{
-    int i;
-
-//l_debug("opcode=0x%x, token=0x%x", opcode, token);
-    if (cb == NULL)
-        return true;
-
-    for (i = 0; i < CMD_RSP_WAIT_TASK_MAX; i++) {
-        if (!cmd_rsp_wait_task[i].used) {
-            cmd_rsp_wait_task[i].used = true;
-            cmd_rsp_wait_task[i].opcode = opcode;
-            cmd_rsp_wait_task[i].token = token;
-            cmd_rsp_wait_task[i].instant = get_instant() + CMD_RSP_WAIT_TASK_TIMEOUT;
-            cmd_rsp_wait_task[i].user_data = user_data;
-            cmd_rsp_wait_task[i].cb = cb;
-            return true;
-        }
-    }
-
-    return false;
-}
-
-bool nrf_cmd_rsp_wait_task_handle(const nrf_serial_packet_t *packet)
-{
-    int i;
-
-    if (packet->opcode == SERIAL_OPCODE_EVT_CMD_RSP) {
-        for (i = 0; i < CMD_RSP_WAIT_TASK_MAX; i++) {
-//l_debug("task[%d] opcode=0x%x, token=0x%x; packet opcode=0x%x, token=0x%x",
-//        cmd_rsp_wait_task[i].used, cmd_rsp_wait_task[i].opcode, cmd_rsp_wait_task[i].token,
-//        packet->payload.evt.cmd_rsp.opcode, packet->payload.evt.cmd_rsp.token);
-            if (cmd_rsp_wait_task[i].used &&
-                cmd_rsp_wait_task[i].opcode == packet->payload.evt.cmd_rsp.opcode &&
-                cmd_rsp_wait_task[i].token == packet->payload.evt.cmd_rsp.token)
-            {
-                cmd_rsp_wait_task[i].cb(cmd_rsp_wait_task[i].token,
-                                        packet,
-                                        cmd_rsp_wait_task[i].user_data);
-                cmd_rsp_wait_task[i].used = false;
-                return true;
-            }
-        }
-    }
-
-    return false;
-}
-
-void nrf_cmd_rsp_wait_task_flush()
-{
-    unsigned long long current_instant = get_instant();
-    int i;
-
-    for (i = 0; i < CMD_RSP_WAIT_TASK_MAX; i++) {
-        if (cmd_rsp_wait_task[i].used && 
-            cmd_rsp_wait_task[i].instant <= current_instant)
-        {
-            cmd_rsp_wait_task[i].cb(cmd_rsp_wait_task[i].token,
-                                    NULL,
-                                    cmd_rsp_wait_task[i].user_data);
-            cmd_rsp_wait_task[i].used = false;
-        }
-    }
 }
