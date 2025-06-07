@@ -14,7 +14,6 @@
 
 
 /* serial interface defines */
-
 #define NRF_MESH_SERIAL_PACKET_LENGTH_OVERHEAD  (1UL)
 #define NRF_MESH_SERIAL_PACKET_OVERHEAD         (2UL - NRF_MESH_SERIAL_PACKET_LENGTH_OVERHEAD)
 #define NRF_MESH_SERIAL_PACKET_PAYLOAD_MAXLEN   (UINT8_MAX - NRF_MESH_SERIAL_PACKET_OVERHEAD)
@@ -24,6 +23,8 @@
 
 #define NRF_SERIAL_MAX_PACKET_SIZE              (UINT8_MAX + NRF_MESH_SERIAL_PACKET_LENGTH_OVERHEAD)
 #define NRF_SERIAL_MAX_ENCODED_PACKET_SIZE      (1UL + (NRF_SERIAL_MAX_PACKET_SIZE * 2) + 1UL)
+
+#define NRF_MESH_UUID_SIZE                      (16)
 
 
 /** BLE Advertising command packet. */
@@ -67,17 +68,19 @@ typedef struct __attribute((packed))
 
 /* nRF52 serial proxy commands response */
 
+/* command response data with version information */
 typedef struct __attribute((packed))
 {
     uint16_t serial_ver;
 } nrf_serial_evt_cmd_rsp_data_serial_version_t;
 
+/* command response data with device UUID */
 typedef struct __attribute((packed))
 {
-    uint32_t token;
-} nrf_serial_evt_cmd_rsp_data_ble_ad_data_t;
+    uint8_t device_uuid[NRF_MESH_UUID_SIZE];
+} serial_evt_cmd_rsp_data_device_uuid_t;
 
-/** Serial interface housekeeping data. */
+/* serial interface housekeeping data. */
 typedef struct __attribute((packed))
 {
     uint32_t alloc_fail_count;  /**< Number of failed serial packet allocations. */
@@ -105,7 +108,7 @@ typedef struct __attribute((packed))
 #define SERIAL_STATUS_ERROR_INVALID_KEY_DATA    0x98
     union __packed {
         nrf_serial_evt_cmd_rsp_data_serial_version_t    serial_version;
-        nrf_serial_evt_cmd_rsp_data_ble_ad_data_t       ble_ad_data;
+        serial_evt_cmd_rsp_data_device_uuid_t           device_uuid;
         nrf_serial_evt_cmd_rsp_data_housekeeping_t      hk_data;
     } data;
 } nrf_serial_evt_cmd_rsp_t;
@@ -142,6 +145,7 @@ typedef struct __packed {
 #define SERIAL_OPCODE_CMD_START                         (0x03)
 #define SERIAL_OPCODE_CMD_STOP                          (0x04)
 #define SERIAL_OPCODE_CMD_BLE_AD_DATA_SEND              (0x05)
+#define SERIAL_OPCODE_CMD_UUID_GET                      (0x06)
 #define SERIAL_OPCODE_CMD_HOUSEKEEPING_DATA_GET         (0x7e)
 #define SERIAL_OPCODE_CMD_HOUSEKEEPING_DATA_CLEAR       (0x7f)
 

@@ -1,11 +1,10 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <unistd.h>
-#include <sys/time.h>
 #include <fcntl.h>
-#include <poll.h>
 #include <termios.h>
 #include <ell/ell.h>
+#include "util.h"
 #include "src/shared/tty.h"
 #include "nrf52-serial.h"
 
@@ -15,11 +14,6 @@
 #define SLIP_ESC                        0xdb
 #define SLIP_ESC_END                    0xdc
 #define SLIP_ESC_ESC                    0xdd
-
-
-
-// FIXME: for debug only
-extern void _dump(const char *data, size_t len);
 
 
 
@@ -99,19 +93,6 @@ static size_t nrf_slip_decode(const uint8_t *src, ssize_t src_len,
 }
 
 
-static unsigned long long get_instant(void)
-{
-    struct timeval tm;
-    unsigned long long instant;
-
-    gettimeofday(&tm, NULL);
-    instant = tm.tv_sec * 1000;
-    instant += tm.tv_usec / 1000;
-
-    return instant;
-}
-
-
 
 /* interface functions */
 
@@ -124,7 +105,7 @@ int nrf_uart_init(const char *filename, int speed, int flags)
     if (fd < 0) {
         l_error("Failed to open serial port %s: %s",
                 filename, strerror(errno));
-        return false;
+        return -1;
     }
 
     tcflush(fd, TCIOFLUSH);
@@ -176,10 +157,7 @@ bool nrf_packet_send(int fd, const nrf_serial_packet_t *packet)
     encoded_packet[encoded_packet_length] = SLIP_END;
     encoded_packet_length++;
 
-//l_debug("original packet");
-//_dump((void *)packet, packet->length + 1);
-//l_debug("encoded packet");
-//_dump(encoded_packet, encoded_packet_length);
+//    print_packet("send packet", (void *)packet, packet->length + 1);
 
     bytes = write(fd, encoded_packet, encoded_packet_length);
     if (bytes != encoded_packet_length) {
@@ -195,49 +173,32 @@ bool nrf_packet_send(int fd, const nrf_serial_packet_t *packet)
 bool nrf_packet_receive(int fd, uint8_t *rx_buffer, size_t rx_buffer_size, int *rx_idx,
                         nrf_packet_rx_cb_t rx_cb, void *user_data)
 {
-    struct pollfd fds[1];
-    int n;
     uint8_t buf[NRF_SERIAL_MAX_ENCODED_PACKET_SIZE];
     size_t bytes;
     const nrf_serial_packet_t packet;
     size_t packet_length;
     int src_idx, dst_idx;
 
-    fds[0].fd = fd;
-    fds[0].events = POLLIN;
-    fds[0].revents = 0;
-
-    n = poll(fds, 1, 0);
-    if (n <= 0)
-        return true;
-
-    if (fds[0].revents & (POLLHUP | POLLERR | POLLNVAL)) {
-        return false;
-    }
-
     bytes = read(fd, buf, sizeof(buf));
     if (bytes <= 0)
         return false;
-
-//l_debug("receive data");
-//_dump(buf, bytes);
 
     dst_idx = *rx_idx;
     for (src_idx = 0; src_idx < bytes; src_idx++) {
         if (buf[src_idx] == SLIP_END) {
             if (dst_idx > 0) {
-//l_debug("receive packet");
-//_dump(rx_buffer, dst_idx);
                 packet_length = nrf_slip_decode(rx_buffer, dst_idx,
                                                 (uint8_t *)&packet, sizeof(packet));
-//l_debug("decoded packet");
-//_dump((uint8_t *)&packet, packet_length);
+
+//                print_packet("receive packet", (void *)&packet, packet.length + 1);
+
                 *rx_idx = dst_idx = 0;
 
                 if (packet_length == packet.length + 1) {
                     rx_cb(&packet, user_data);
                 } else {
-//l_debug("invalid packet length %u, received %u",  packet.length, packet_length);
+                    l_debug("Invalid packet length %u, received %u",
+                             packet.length, packet_length);
                     return false;
                 }
             }
