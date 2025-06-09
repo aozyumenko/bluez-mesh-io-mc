@@ -7,6 +7,8 @@
 #endif
 
 #define FLOW_CTL        0x0001
+//#define BAUD_RATE       1000000
+#define BAUD_RATE       460800
 
 
 /* serial protocol version */
@@ -84,6 +86,7 @@ typedef struct __attribute((packed))
 typedef struct __attribute((packed))
 {
     uint32_t alloc_fail_count;  /**< Number of failed serial packet allocations. */
+    uint32_t rx_fail_count;
 } nrf_serial_evt_cmd_rsp_data_housekeeping_t;
 
 
