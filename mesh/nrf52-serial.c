@@ -144,7 +144,7 @@ fail:
 bool nrf_packet_send(int fd, const nrf_serial_packet_t *packet)
 {
     uint8_t encoded_packet[sizeof(*packet) * 2 + 2];    /* MAX = END + <every byte is ESC or END> + END */
-    size_t encoded_packet_length;
+    size_t encoded_packet_length = 0;
     ssize_t bytes;
 
     encoded_packet[0] = SLIP_END;
@@ -190,20 +190,19 @@ bool nrf_packet_receive(int fd, uint8_t *rx_buffer, size_t rx_buffer_size, int *
                 packet_length = nrf_slip_decode(rx_buffer, dst_idx,
                                                 (uint8_t *)&packet, sizeof(packet));
 
-//                print_packet("receive packet", (void *)&packet, packet.length + 1);
+//                print_packet("receive packet", (void *)&packet, packet_length);
 
                 *rx_idx = dst_idx = 0;
 
                 if (packet_length == packet.length + 1) {
                     rx_cb(&packet, user_data);
                 } else {
-                    l_debug("Invalid packet length %u, received %u",
+                    l_debug("Invalid packet length %u, received %lu",
                              packet.length, packet_length);
                     return false;
                 }
             }
-        }
-        else {
+        } else {
             if (dst_idx < rx_buffer_size) {
                 rx_buffer[dst_idx++] = buf[src_idx];
             }
