@@ -75,11 +75,34 @@ struct mesh_io_private {
     struct l_timeout *tx_timeout;
     struct l_queue *tx_cmd_rsps;
     struct l_timeout *tx_cmd_rsp_timeout;
+    nrf_serial_packet_t tx_cur_packet;
 
     /* error checking */
     struct l_timeout *error_check_timeout;
     time_t stat_reset_time;
     unsigned long long int stat[STAT_MAX];
+};
+
+
+struct process_data {
+    struct mesh_io_private *pvt;
+    const uint8_t *data;
+    uint8_t len;
+    struct mesh_io_recv_info info;
+};
+
+struct tx_pkt {
+    struct mesh_io *io;
+    struct mesh_io_send_info info;
+    bool delete;
+    uint32_t token;
+    uint8_t len;
+    uint8_t pkt[NRF_MESH_SERIAL_CMD_PAYLOAD_MAXLEN];
+};
+
+struct tx_pattern {
+    const uint8_t *data;
+    uint8_t len;
 };
 
 
@@ -95,43 +118,35 @@ struct cmd_rsp {
 };
 
 
-struct process_data {
-    struct mesh_io_private *pvt;
-    const uint8_t *data;
-    uint8_t len;
-    struct mesh_io_recv_info info;
-};
+typedef void (*nrf_serial_packet_handler_t)(const nrf_serial_packet_t *packet, void *user_data);
+
+typedef struct {
+    uint8_t opcode;
+    nrf_serial_packet_handler_t handler;
+} nrf_serial_packet_handler_entry_t;
 
 
-struct tx_pkt {
-    struct mesh_io_send_info info;
-    bool delete;
-    uint32_t token;
-    uint8_t len;
-    uint8_t pkt[NRF_MESH_SERIAL_CMD_PAYLOAD_MAXLEN];
-};
+/* forward declaritions */
 
-
-struct tx_pattern {
-    const uint8_t *data;
-    uint8_t len;
-};
-
-
-
-
-static void nrf_start(void *user_data);
-static void nrf_stop(struct mesh_io *io);
 static void nrf_cmd_send(struct mesh_io *io, uint8_t opcode, uint32_t token, size_t length,
                          uint8_t *payload, cmd_rsp_cb_t cb, void *user_data);
 
-static bool nrf_cmd_send_reset(struct mesh_io *io);
-static bool nrf_cmd_send_serial_version_get(struct mesh_io *io);
-static bool nrf_cmd_send_start(struct mesh_io *io);
+static void mc_reset(struct mesh_io *io);
+static void mc_start(struct mesh_io *io);
+static void mc_stop(struct mesh_io *io);
+
+static void evt_device_started_cb(const nrf_serial_packet_t *packet, void *user_data);
+static void cmd_resp_reset_cb(uint32_t token, const nrf_serial_packet_t *packet, void *user_data);
+static void nrf_cmd_resp_serial_version_get_cb(uint32_t token, const nrf_serial_packet_t *packet, void *user_data);
 static void nrf_cmd_resp_deviceaddr_get_cb(uint32_t token, const nrf_serial_packet_t *packet, void *user_data);
-static void ad_data_send_cb(uint32_t token, const nrf_serial_packet_t *packet, void *user_data);
+
+//static void ad_data_send_cb(uint32_t token, const nrf_serial_packet_t *packet, void *user_data);
+static void ad_data_send(struct mesh_io *io, struct tx_pkt *tx);
+static void evt_ble_ad_data_received(const nrf_serial_packet_t *packet, void *user_data);
 
 
+
+/* global varoables */
 
 static const char *stat_str[STAT_MAX] = {
     [STAT_TX] = "tx",
@@ -147,6 +162,18 @@ static const char *stat_str[STAT_MAX] = {
 
 
 
+
+static nrf_serial_packet_handler_entry_t packet_handler_list[] = {
+    { SERIAL_OPCODE_EVT_DEVICE_STARTED, evt_device_started_cb },
+    { SERIAL_OPCODE_EVT_BLE_AD_DATA_RECEIVED, evt_ble_ad_data_received },
+};
+
+
+static int tx_packets_alloc = 0;
+
+
+
+/* common tools */
 
 static uint32_t get_instant(void)
 {
@@ -173,6 +200,9 @@ static uint32_t get_next_token()
     return m_token++;
 }
 
+
+
+/* rx/tx queues helpers */
 
 static bool simple_match(const void *a, const void *b)
 {
@@ -207,13 +237,16 @@ static bool find_by_token(const void *a, const void *b)
 }
 
 
+
 /* statictics */
+
 static void stat_reset(struct mesh_io *io)
 {
     struct mesh_io_private *pvt = io->pvt;
     pvt->stat_reset_time = time(NULL);
     memset(&pvt->stat, 0, sizeof(pvt->stat));
 }
+
 
 static void stat_print(struct mesh_io *io)
 {
@@ -228,7 +261,9 @@ static void stat_print(struct mesh_io *io)
     for (int i = 0; i < STAT_MAX; i++) {
         l_debug("    %s: %llu", stat_str[i], pvt->stat[i]);
     }
+l_debug("    TX alloc: %d", tx_packets_alloc);
 }
+
 
 static inline void stat_report(struct mesh_io *io, enum stat_e id)
 {
@@ -243,6 +278,7 @@ static inline void stat_report(struct mesh_io *io, enum stat_e id)
         stat_reset(io);
     }
 }
+
 
 static inline void stat_report_val(struct mesh_io *io, enum stat_e id, unsigned long long val)
 {
@@ -375,7 +411,6 @@ static void nrf_cmd_send(struct mesh_io *io, uint8_t opcode, uint32_t token, siz
 {
     struct mesh_io_private *pvt = io->pvt;
     nrf_serial_packet_t packet;
-    bool ret;
 
     if (pvt == NULL)
         return;
@@ -387,17 +422,17 @@ static void nrf_cmd_send(struct mesh_io *io, uint8_t opcode, uint32_t token, siz
         memcpy(&packet.payload.cmd.payload, payload, length);
     }
 
-    ret = nrf_packet_send(pvt->serial_fd, &packet);
-    if (ret) {
-        cmd_rsp_add(io, opcode, token, cb, user_data);
-    }
+    (void)nrf_packet_send(pvt->serial_fd, &packet);
+    cmd_rsp_add(io, opcode, token, cb, user_data);
 
     stat_report(io, STAT_TX);
 }
 
-////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-static void nrf_cmd_resp_reset_cb(uint32_t token, const nrf_serial_packet_t *packet, void *user_data)
+
+/* mesh controller initialization sequence */
+
+static void cmd_resp_reset_cb(uint32_t token, const nrf_serial_packet_t *packet, void *user_data)
 {
     struct mesh_io *io = user_data;
     struct mesh_io_private *pvt = io->pvt;
@@ -406,60 +441,67 @@ static void nrf_cmd_resp_reset_cb(uint32_t token, const nrf_serial_packet_t *pac
         return;
 
     if (packet != NULL || (packet == NULL && pvt->reset)) {
-        l_error("Can't reset radio");
-        (void)nrf_cmd_send_reset(io);
+        l_error("Can't reset Mesh Controller");
+        mc_reset(io);
     }
 }
 
-static bool nrf_cmd_send_reset(struct mesh_io *io)
+
+static void evt_device_started_cb(const nrf_serial_packet_t *packet, void *user_data)
 {
+    struct mesh_io *io = user_data;
     struct mesh_io_private *pvt = io->pvt;
 
     if (pvt == NULL)
-        return false;
+        return;
 
-    l_debug("Send CMD_RESET");
-    pvt->reset = true;
-    nrf_cmd_send(io, SERIAL_OPCODE_CMD_RESET, get_next_token(),
-                 0, NULL, nrf_cmd_resp_reset_cb, io);
-    return true;
+    l_debug("Mesh Controller started, operating_mode: 0x%x, hw_error: 0x%x, data_credit_available: %d",
+        packet->payload.evt.started.operating_mode,
+        packet->payload.evt.started.hw_error,
+        packet->payload.evt.started.data_credit_available);
+
+    if (packet->payload.evt.started.operating_mode == SERIAL_DEVICE_OPERATING_MODE_APPLICATION && packet->payload.evt.started.hw_error == 0) {
+        pvt->data_credit_available = packet->payload.evt.started.data_credit_available;
+        stat_reset(io);
+        pvt->reset = false;
+
+        /* get protocol version */
+        nrf_cmd_send(io, SERIAL_OPCODE_CMD_SERIAL_VERSION_GET, get_next_token(),
+                     0, NULL, nrf_cmd_resp_serial_version_get_cb, io);
+    }
 }
-
 
 
 static void nrf_cmd_resp_serial_version_get_cb(uint32_t token, const nrf_serial_packet_t *packet, void *user_data)
 {
     struct mesh_io *io = user_data;
 
+    if (packet == NULL) {
+        mc_reset(io);
+        return;
+    }
 
-    if (packet != NULL && packet->payload.evt.cmd_rsp.status == SERIAL_STATUS_SUCCESS) {
-        uint16_t api_ver = packet->payload.evt.cmd_rsp.data.serial_version.serial_ver;
-        l_debug("Serial protocol version: %u.%u", (api_ver >> 8), (api_ver & 0xff));
+    if (packet->payload.evt.cmd_rsp.status != SERIAL_STATUS_SUCCESS) {
+        l_error("Can't get serial protocol version, status: 0x%x",
+                packet->payload.evt.cmd_rsp.status);
+        if (io->ready)
+            io->ready(io->user_data, false);
+        return;
+    }
 
-        if (packet->payload.evt.cmd_rsp.data.serial_version.serial_ver == SERIAL_API_VERSION) {
-            nrf_cmd_send(io, SERIAL_OPCODE_CMD_DEVICEADDR_GET, get_next_token(),
-                         0, NULL, nrf_cmd_resp_deviceaddr_get_cb, io);
-        } else {
-            l_error("Invalid serial protocol version: %u.%u, expected: %u.%u",
+    uint16_t api_ver = packet->payload.evt.cmd_rsp.data.serial_version.serial_ver;
+    l_debug("Serial protocol version: %u.%u", (api_ver >> 8), (api_ver & 0xff));
+
+    if (packet->payload.evt.cmd_rsp.data.serial_version.serial_ver == SERIAL_API_VERSION) {
+        nrf_cmd_send(io, SERIAL_OPCODE_CMD_DEVICEADDR_GET, get_next_token(),
+                     0, NULL, nrf_cmd_resp_deviceaddr_get_cb, io);
+    } else {
+        l_error("Invalid serial protocol version: %u.%u, expected: %u.%u",
                 (api_ver >> 8), (api_ver & 0xff),
                 (SERIAL_API_VERSION >> 8), (SERIAL_API_VERSION & 0xff));
-
-            if (io->ready)
-                io->ready(io->user_data, false);
-        }
+        if (io->ready)
+            io->ready(io->user_data, false);
     }
-    else {
-        (void) nrf_cmd_send_reset(io);
-    }
-
-}
-
-static bool nrf_cmd_send_serial_version_get(struct mesh_io *io)
-{
-    l_debug("Send CMD DEVICE_SERIAL_VERSION");
-    nrf_cmd_send(io, SERIAL_OPCODE_CMD_SERIAL_VERSION_GET, get_next_token(),
-                 0, NULL, nrf_cmd_resp_serial_version_get_cb, io);
-    return true;
 }
 
 
@@ -471,18 +513,26 @@ static void nrf_cmd_resp_deviceaddr_get_cb(uint32_t token, const nrf_serial_pack
     if (pvt == NULL)
         return;
 
-    if (packet != NULL && packet->payload.evt.cmd_rsp.status == SERIAL_STATUS_SUCCESS) {
-        memcpy(pvt->deviceaddr, packet->payload.evt.cmd_rsp.data.deviceaddr.addr, sizeof(pvt->deviceaddr));
-        l_debug("Device address: %02x:%02x:%02x:%02x:%02x:%02x",
+    if (packet == NULL) {
+        mc_reset(io);
+        return;
+    }
+
+    if (packet->payload.evt.cmd_rsp.status != SERIAL_STATUS_SUCCESS) {
+        l_error("Can't get device address, status: 0x%x",
+                packet->payload.evt.cmd_rsp.status);
+        if (io->ready)
+            io->ready(io->user_data, false);
+        return;
+    }
+
+    memcpy(pvt->deviceaddr, packet->payload.evt.cmd_rsp.data.deviceaddr.addr, sizeof(pvt->deviceaddr));
+    l_debug("Device address: %02x:%02x:%02x:%02x:%02x:%02x",
             pvt->deviceaddr[0], pvt->deviceaddr[1], pvt->deviceaddr[2],
             pvt->deviceaddr[3], pvt->deviceaddr[4], pvt->deviceaddr[5]);
 
-        if (io->ready)
-            io->ready(io->user_data, true);
-    }
-    else {
-        (void) nrf_cmd_send_reset(io);
-    }
+    if (io->ready)
+        io->ready(io->user_data, true);
 }
 
 
@@ -494,81 +544,58 @@ static void nrf_cmd_resp_start_cb(uint32_t token, const nrf_serial_packet_t *pac
     if(pvt == NULL)
         return;
 
-    if (packet != NULL && packet->payload.evt.cmd_rsp.status == SERIAL_STATUS_SUCCESS) {
-        l_debug("Started radio");
-        pvt->started = true;
-    }
-    else {
-        l_error("Can't start radio");
-        (void) nrf_cmd_send_reset(io);
-//        pvt->started = false;
-    }
-}
-
-static bool nrf_cmd_send_start(struct mesh_io *io)
-{
-    l_debug("Send CMD_START");
-    nrf_cmd_send(io, SERIAL_OPCODE_CMD_START, get_next_token(),
-                 0, NULL, nrf_cmd_resp_start_cb, io);
-    return true;
-}
-
-
-static void nrf_cmd_resp_stop_cb(uint32_t token, const nrf_serial_packet_t *packet, void *user_data)
-{
-    struct mesh_io *io = user_data;
-    struct mesh_io_private *pvt = io->pvt;
-
-    if (pvt == NULL)
+    if (packet == NULL) {
+        nrf_cmd_send(io, SERIAL_OPCODE_CMD_START, get_next_token(),
+                     0, NULL, nrf_cmd_resp_start_cb, io);
         return;
+    }
 
-    if (packet != NULL && packet->payload.evt.cmd_rsp.status == SERIAL_STATUS_SUCCESS) {
-        l_debug("Stopped radio");
+    if (packet->payload.evt.cmd_rsp.status != SERIAL_STATUS_SUCCESS) {
+        l_error("Can't start Mesh Controller, status: 0x%x",
+                packet->payload.evt.cmd_rsp.status);
         pvt->started = false;
     }
-    else {
-        l_error("Can't stop radio");
-        (void) nrf_cmd_send_reset(io);
-    }
+
+    pvt->started = true;
 }
 
-static bool nrf_cmd_send_stop(struct mesh_io *io)
+
+
+/* mesh controller control */
+
+static void mc_reset(struct mesh_io *io)
 {
-    l_debug("Send CMD_STOP");
+    struct mesh_io_private *pvt = io->pvt;
+
+    if (pvt == NULL)
+        return;
+
+    l_debug("Reset Mesh Controller");
+    pvt->reset = true;
+    nrf_cmd_send(io, SERIAL_OPCODE_CMD_RESET, get_next_token(),
+                 0, NULL, cmd_resp_reset_cb, io);
+}
+
+
+static void mc_start(struct mesh_io *io)
+{
+    l_debug("Start Mesh Controller");
+    nrf_cmd_send(io, SERIAL_OPCODE_CMD_START, get_next_token(),
+                 0, NULL, nrf_cmd_resp_start_cb, io);
+}
+
+
+static void mc_stop(struct mesh_io *io)
+{
+    struct mesh_io_private *pvt = io->pvt;
+
+    if (pvt == NULL)
+        return;
+
+    l_debug("Send Mesh Controller");
     nrf_cmd_send(io, SERIAL_OPCODE_CMD_STOP, get_next_token(),
-                 0, NULL, nrf_cmd_resp_stop_cb, io);
-    return true;
-}
-
-
-/////////////////////////////////////////////////
-
-
-static void process_rx_callbacks(void *v_reg, void *v_rx)
-{
-    struct mesh_io_reg *rx_reg = v_reg;
-    struct process_data *rx = v_rx;
-
-    if (!memcmp(rx->data, rx_reg->filter, rx_reg->len))
-        rx_reg->cb(rx_reg->user_data, &rx->info, rx->data, rx->len);
-}
-
-
-static void process_rx(struct mesh_io_private *pvt, int8_t rssi,
-                       uint32_t instant, const uint8_t *addr,
-                       const uint8_t *data, uint8_t len)
-{
-    struct process_data rx = {
-        .pvt = pvt,
-        .data = data,
-        .len = len,
-        .info.instant = instant,
-        .info.addr = addr,
-        .info.chan = 7,
-        .info.rssi = rssi,
-    };
-
-    l_queue_foreach(pvt->io->rx_regs, process_rx_callbacks, &rx);
+                 0, NULL, NULL, io);
+    pvt->started = false;
 }
 
 
@@ -576,70 +603,7 @@ static void process_rx(struct mesh_io_private *pvt, int8_t rssi,
 /////////////////////////////////////////////////
 
 
-/* receive packet */
-
-typedef void (*nrf_serial_packet_handler_t)(const nrf_serial_packet_t *packet, void *user_data);
-
-typedef struct {
-    uint8_t opcode;
-    nrf_serial_packet_handler_t handler;
-} nrf_serial_packet_handler_entry_t;
-
-static void nrf_serial_handler_evt_device_started(const nrf_serial_packet_t *packet, void *user_data);
-static void nrf_serial_handler_evt_ble_ad_data_received(const nrf_serial_packet_t *packet, void *user_data);
-
-
-static nrf_serial_packet_handler_entry_t packet_handler_list[] = {
-    { SERIAL_OPCODE_EVT_DEVICE_STARTED, nrf_serial_handler_evt_device_started },
-    { SERIAL_OPCODE_EVT_BLE_AD_DATA_RECEIVED, nrf_serial_handler_evt_ble_ad_data_received },
-};
-
-static void nrf_serial_handler_evt_device_started(const nrf_serial_packet_t *packet, void *user_data)
-{
-    struct mesh_io *io = user_data;
-    struct mesh_io_private *pvt = io->pvt;
-
-    if (pvt == NULL)
-        return;
-
-    l_debug("EVT: DEVICE_STARTED, operating_mode=0x%x, hw_error=0x%x, data_credit_available=%d",
-        packet->payload.evt.started.operating_mode,
-        packet->payload.evt.started.hw_error,
-        packet->payload.evt.started.data_credit_available);
-
-    if (packet->payload.evt.started.operating_mode == SERIAL_DEVICE_OPERATING_MODE_APPLICATION && packet->payload.evt.started.hw_error == 0) {
-        pvt->data_credit_available = packet->payload.evt.started.data_credit_available;
-        stat_reset(io);
-        pvt->reset = false;
-
-        /* get protocol version */
-        (void)nrf_cmd_send_serial_version_get(io);
-        // TODO check result and call io->ready()
-    }
-}
-
-
-static void nrf_serial_handler_evt_ble_ad_data_received(const nrf_serial_packet_t *packet, void *user_data)
-{
-    struct mesh_io *io = user_data;
-    struct mesh_io_private *pvt = io->pvt;
-    uint32_t instant;
-    const uint8_t *adv;
-    uint8_t adv_len;
-    const uint8_t *addr;
-    int8_t rssi;
-
-    if (pvt == NULL)
-        return;
-
-    instant = get_instant();
-    adv = packet->payload.evt.ble_ad_data.data + 1;
-    adv_len = packet->payload.evt.ble_ad_data.data[0];
-    addr = pvt->deviceaddr;
-    rssi = 0;
-
-    process_rx(pvt, rssi, instant, addr, adv, adv_len);
-}
+/* receive packet fro mesh controller */
 
 static void nrf_serial_packet_rx(const nrf_serial_packet_t *packet, void *user_data)
 {
@@ -670,8 +634,6 @@ static void nrf_serial_packet_rx(const nrf_serial_packet_t *packet, void *user_d
 }
 
 
-/* nRF52 Serial Proxy section */
-
 static bool rx_worker(struct l_io *l_io, void *user_data)
 {
     struct mesh_io *io = user_data;
@@ -692,12 +654,67 @@ static bool rx_worker(struct l_io *l_io, void *user_data)
 
 
 
+/* processing received data packets */
+
+static void process_rx_callbacks(void *v_reg, void *v_rx)
+{
+    struct mesh_io_reg *rx_reg = v_reg;
+    struct process_data *rx = v_rx;
+
+    if (!memcmp(rx->data, rx_reg->filter, rx_reg->len))
+        rx_reg->cb(rx_reg->user_data, &rx->info, rx->data, rx->len);
+}
+
+
+static void process_rx(struct mesh_io_private *pvt, int8_t rssi,
+                       uint32_t instant, const uint8_t *addr,
+                       const uint8_t *data, uint8_t len)
+{
+    struct process_data rx = {
+        .pvt = pvt,
+        .data = data,
+        .len = len,
+        .info.instant = instant,
+        .info.addr = addr,
+        .info.chan = 7,
+        .info.rssi = rssi,
+    };
+
+    l_queue_foreach(pvt->io->rx_regs, process_rx_callbacks, &rx);
+}
+
+
+static void evt_ble_ad_data_received(const nrf_serial_packet_t *packet, void *user_data)
+{
+    struct mesh_io *io = user_data;
+    struct mesh_io_private *pvt = io->pvt;
+    uint32_t instant;
+    const uint8_t *adv;
+    uint8_t adv_len;
+    const uint8_t *addr;
+    int8_t rssi;
+
+    if (pvt == NULL)
+        return;
+
+    instant = get_instant();
+    adv = packet->payload.evt.ble_ad_data.data + 1;
+    adv_len = packet->payload.evt.ble_ad_data.data[0];
+    addr = pvt->deviceaddr;
+    rssi = 0;
+
+    process_rx(pvt, rssi, instant, addr, adv, adv_len);
+}
+
+
+
 ///////////////////////////////////////////////////////
 
 
 static void ad_data_send_cb(uint32_t token, const nrf_serial_packet_t *packet, void *user_data)
 {
-    struct mesh_io *io = user_data;
+    struct tx_pkt *tx = user_data;
+    struct mesh_io *io = tx->io;
     struct mesh_io_private *pvt = io->pvt;
 
     if (pvt == NULL)
@@ -706,16 +723,22 @@ static void ad_data_send_cb(uint32_t token, const nrf_serial_packet_t *packet, v
     if (packet == NULL) {
         l_debug("Sent packet not ACKed, token 0x%x", token);
         stat_report(io, STAT_TX_NO_ACK);
+        ad_data_send(io, tx);
         return;
     }
-
-    stat_report(io, STAT_TX_RSP);
 
     if (packet->payload.evt.cmd_rsp.status != SERIAL_STATUS_SUCCESS) {
         stat_report(io, STAT_TX_RSP_ERR);
 
         l_debug("Sent packet error: status 0x%x, token 0x%x",
             packet->payload.evt.cmd_rsp.status, token);
+        mc_reset(io);
+    }
+
+    if (tx->delete) {
+l_debug("------ DELETE: tx=%p, token=0x%x", tx, tx->token);
+tx_packets_alloc--;
+        l_free(tx);
     }
 }
 
@@ -731,20 +754,19 @@ static void ad_data_send(struct mesh_io *io, struct tx_pkt *tx)
 
     l_debug("Send CMD_BLE_AD_DATA_SEND: token=0x%x", tx->token);
 
-    packet.length = NRF_MESH_SERIAL_PACKET_OVERHEAD + NRF_MESH_SERIAL_CMD_OVERHEAD + tx->len + 1;
-    packet.opcode = SERIAL_OPCODE_CMD_BLE_AD_DATA_SEND;
-    packet.payload.cmd.token = tx->token;
-    packet.payload.cmd.payload.ble_ad_data.data[0] = tx->len;
-    memcpy(&packet.payload.cmd.payload.ble_ad_data.data[1], tx->pkt, tx->len);
+    pvt->tx_cur_packet.length = NRF_MESH_SERIAL_PACKET_OVERHEAD + NRF_MESH_SERIAL_CMD_OVERHEAD + tx->len + 1;
+    pvt->tx_cur_packet.opcode = SERIAL_OPCODE_CMD_BLE_AD_DATA_SEND;
+    pvt->tx_cur_packet.payload.cmd.token = tx->token;
+    pvt->tx_cur_packet.payload.cmd.payload.ble_ad_data.data[0] = tx->len;
+    memcpy(&pvt->tx_cur_packet.payload.cmd.payload.ble_ad_data.data[1], tx->pkt, tx->len);
 
     if (tx->delete) {
         l_queue_remove_if(pvt->tx_pkts, simple_match, tx);
-        l_free(tx);
     }
 
-    (void) nrf_packet_send(pvt->serial_fd, &packet);
+    (void) nrf_packet_send(pvt->serial_fd, &pvt->tx_cur_packet);
     cmd_rsp_add(io, SERIAL_OPCODE_CMD_BLE_AD_DATA_SEND, tx->token,
-                ad_data_send_cb, io);
+                ad_data_send_cb, tx);
 
     stat_report(io, STAT_TX);
 }
@@ -778,10 +800,7 @@ static void tx_to(struct l_timeout *timeout, void *user_data)
         count = 1;
     }
 
-//l_debug("tx=%p, count=%u, interval=%u", tx, count, ms);
-
     tx->delete = !!(count == 1);
-//l_debug("########## token=0x%x, count=%d, tx->delete=%d", tx->token, count, tx->delete);
 
     ad_data_send(io, tx);
 
@@ -822,7 +841,6 @@ static void tx_worker(void *user_data)
 
     switch (tx->info.type) {
     case MESH_IO_TIMING_TYPE_GENERAL:
-l_debug("##### MESH_IO_TIMING_TYPE_GENERAL: token=0x%x, count=%u, interval=%u", tx->token, tx->info.u.gen.cnt, tx->info.u.gen.interval);
         if (tx->info.u.gen.min_delay == tx->info.u.gen.max_delay)
             delay = tx->info.u.gen.min_delay;
         else {
@@ -865,8 +883,8 @@ l_debug("##### MESH_IO_TIMING_TYPE_GENERAL: token=0x%x, count=%u, interval=%u", 
 }
 
 
-///////////////////////////////////////////////////////////////////
 
+/* statistics and error checking  */
 
 static void nrf_cmd_resp_housekeeping_data_get_cb(uint32_t token, const nrf_serial_packet_t *packet, void *user_data)
 {
@@ -907,17 +925,13 @@ static void error_check_worker(struct l_timeout *timeout, void *user_data)
 
 static void serial_disconnect_cb(struct l_io *serial_io, void *user_data)
 {
-//    struct mesh_io *io = user_data;
-//    struct mesh_io_private *pvt = io->pvt;
-
     l_main_quit();
 }
 
 
 
-///////////////////////////////////////////////////////////////////
-
-static void nrf_start(void *user_data)
+/* initialize mesh controller */
+static void mc_initalize(void *user_data)
 {
     struct mesh_io *io = user_data;
     struct mesh_io_private *pvt = io->pvt;
@@ -944,41 +958,11 @@ static void nrf_start(void *user_data)
                                    error_check_worker, io, NULL);
 
         /* reset device */
-        result = nrf_cmd_send_reset(io);
+        mc_reset(io);
     }
 
-    if (!result && io->ready)
-        io->ready(io->user_data, false);
-}
-
-static void nrf_stop(struct mesh_io *io)
-{
-    struct mesh_io_private *pvt = io->pvt;
-    void *ptr;
-
-    if (pvt == NULL)
-        return;
-
-    pvt->started = false;
-    pvt->reset = false;
-
-    l_timeout_remove(pvt->tx_timeout);
-    pvt->tx_timeout = NULL;
-
-    while ((ptr = l_queue_pop_head(pvt->tx_pkts)) != NULL) {
-        l_free(ptr);
-    }
-    while ((ptr = l_queue_pop_head(pvt->tx_cmd_rsps)) != NULL) {
-        l_free(ptr);
-    }
-
-    l_io_destroy(pvt->serial_io);
-    pvt->serial_io = NULL;
-    l_timeout_remove(pvt->error_check_timeout);
-    pvt->error_check_timeout = NULL;
-
-    close(pvt->serial_fd);
-    pvt->serial_fd = -1;
+    if (io->ready)
+        io->ready(io->user_data, result);
 }
 
 
@@ -1021,7 +1005,7 @@ static bool dev_init(struct mesh_io *io, void *opts, void *user_data)
 
     stat_reset(io);
 
-    l_idle_oneshot(nrf_start, io, NULL);
+    l_idle_oneshot(mc_initalize, io, NULL);
 
     return true;
 }
@@ -1034,13 +1018,23 @@ static bool dev_destroy(struct mesh_io *io)
     if (pvt == NULL)
         return true;
 
-    nrf_stop(io);
+    pvt->started = false;
+    pvt->reset = false;
+
+    l_io_destroy(pvt->serial_io);
+    pvt->serial_io = NULL;
+
+    close(pvt->serial_fd);
+    pvt->serial_fd = -1;
 
     l_timeout_remove(pvt->tx_timeout);
+    pvt->tx_timeout = NULL;
     l_queue_destroy(pvt->tx_pkts, l_free);
     l_timeout_remove(pvt->tx_cmd_rsp_timeout);
     l_queue_destroy(pvt->tx_cmd_rsps, l_free);
 
+    l_timeout_remove(pvt->error_check_timeout);
+    pvt->error_check_timeout = NULL;
 
     l_free(pvt->serial_path);
     io->pvt = NULL;
@@ -1075,14 +1069,18 @@ static bool send_tx(struct mesh_io *io, struct mesh_io_send_info *info,
     if (pvt == NULL || info == NULL || data == NULL || len == 0 || len > sizeof(tx->pkt))
         return false;
 
+    if (!pvt->started)
+        return false;
 
     tx = l_new(struct tx_pkt, 1);
+tx_packets_alloc++;
+    tx->io = io;
     memcpy(&tx->info, info, sizeof(tx->info));
     memcpy(tx->pkt, data, len);
     tx->len = len;
     tx->token = get_next_token();
 
-l_debug("***** tx=%p, token=0x%x", tx, tx->token);
+l_debug("++++++ ALLOC: tx=%p, token=0x%x", tx, tx->token);
 
     if (info->type == MESH_IO_TIMING_TYPE_POLL_RSP)
         l_queue_push_head(pvt->tx_pkts, tx);
@@ -1106,10 +1104,17 @@ static bool tx_cancel(struct mesh_io *io, const uint8_t *data, uint8_t len)
     if (pvt == NULL || data == NULL)
         return false;
 
+    if (!pvt->started)
+        return false;
+
     if (len == 1) {
         do {
             tx = l_queue_remove_if(pvt->tx_pkts, find_by_ad_type,
                                    L_UINT_TO_PTR(data[0]));
+if (tx) {
+    l_debug("------ DELETE: tx=%p, token=0x%x", tx, tx->token);
+    tx_packets_alloc--;
+}
             l_free(tx);
         } while (tx);
     } else {
@@ -1121,6 +1126,10 @@ static bool tx_cancel(struct mesh_io *io, const uint8_t *data, uint8_t len)
         do {
             tx = l_queue_remove_if(pvt->tx_pkts, find_by_pattern,
                                    &pattern);
+if (tx) {
+    l_debug("------ DELETE: tx=%p, token=0x%x", tx, tx->token);
+    tx_packets_alloc--;
+}
             l_free(tx);
         } while (tx);
     }
@@ -1145,9 +1154,8 @@ static bool recv_register(struct mesh_io *io, const uint8_t *filter,
 
     already_started = l_queue_length(io->rx_regs) > 1;
 
-    if (!pvt->started && !already_started) {
-        (void)nrf_cmd_send_start(io);
-    }
+    if (!pvt->started && !already_started)
+        mc_start(io);
 
     return true;
 }
@@ -1164,9 +1172,8 @@ static bool recv_deregister(struct mesh_io *io, const uint8_t *filter,
 
     already_started = l_queue_length(io->rx_regs) > 1;
 
-    if (!already_started) {
-        (void)nrf_cmd_send_stop(io);
-    }
+    if (!already_started)
+        mc_stop(io);
 
     return true;
 }
