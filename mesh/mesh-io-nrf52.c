@@ -30,7 +30,7 @@
 
 
 
-#define DEFAULT_ADDR            "\x55\x55\x55\x55\x55\x55"
+//#define DEFAULT_ADDR            "\x55\x55\x55\x55\x55\x55"
 #define CMD_RSP_TIMEOUT         50
 #define ERROR_CHECK_PERIOD      10000
 
@@ -49,7 +49,7 @@ struct mesh_io_private {
     bool reset;
     bool started;
 
-    uint8_t uuid[NRF_MESH_UUID_SIZE];
+    uint8_t deviceaddr[DEVICEADDR_LEN];
 
     /* Rx packet */
     uint8_t rx_buffer[NRF_SERIAL_MAX_ENCODED_PACKET_SIZE];
@@ -124,7 +124,7 @@ static void nrf_cmd_send(struct mesh_io *io, uint8_t opcode, uint32_t token, siz
 static bool nrf_cmd_send_reset(struct mesh_io *io);
 static bool nrf_cmd_send_serial_version_get(struct mesh_io *io);
 static bool nrf_cmd_send_start(struct mesh_io *io);
-static void nrf_cmd_resp_uuid_get_cb(uint32_t token, const nrf_serial_packet_t *packet, void *user_data);
+static void nrf_cmd_resp_deviceaddr_get_cb(uint32_t token, const nrf_serial_packet_t *packet, void *user_data);
 static void ad_data_send_cb(uint32_t token, const nrf_serial_packet_t *packet, void *user_data);
 
 
@@ -426,8 +426,8 @@ static void nrf_cmd_resp_serial_version_get_cb(uint32_t token, const nrf_serial_
         l_debug("Serial protocol version: %u.%u", (api_ver >> 8), (api_ver & 0xff));
 
         if (packet->payload.evt.cmd_rsp.data.serial_version.serial_ver == SERIAL_API_VERSION) {
-            nrf_cmd_send(io, SERIAL_OPCODE_CMD_UUID_GET, get_next_token(),
-                         0, NULL, nrf_cmd_resp_uuid_get_cb, io);
+            nrf_cmd_send(io, SERIAL_OPCODE_CMD_DEVICEADDR_GET, get_next_token(),
+                         0, NULL, nrf_cmd_resp_deviceaddr_get_cb, io);
         } else {
             l_error("Invalid serial protocol version: %u.%u, expected: %u.%u",
                 (api_ver >> 8), (api_ver & 0xff),
@@ -452,7 +452,7 @@ static bool nrf_cmd_send_serial_version_get(struct mesh_io *io)
 }
 
 
-static void nrf_cmd_resp_uuid_get_cb(uint32_t token, const nrf_serial_packet_t *packet, void *user_data)
+static void nrf_cmd_resp_deviceaddr_get_cb(uint32_t token, const nrf_serial_packet_t *packet, void *user_data)
 {
     struct mesh_io *io = user_data;
     struct mesh_io_private *pvt = io->pvt;
@@ -461,8 +461,10 @@ static void nrf_cmd_resp_uuid_get_cb(uint32_t token, const nrf_serial_packet_t *
         return;
 
     if (packet != NULL && packet->payload.evt.cmd_rsp.status == SERIAL_STATUS_SUCCESS) {
-        memcpy(pvt->uuid, packet->payload.evt.cmd_rsp.data.device_uuid.device_uuid, sizeof(pvt->uuid));
-        print_packet("Device UUID", pvt->uuid, sizeof(pvt->uuid));
+        memcpy(pvt->deviceaddr, packet->payload.evt.cmd_rsp.data.deviceaddr.addr, sizeof(pvt->deviceaddr));
+        l_debug("Device address: %02x:%02x:%02x:%02x:%02x:%02x",
+            pvt->deviceaddr[0], pvt->deviceaddr[1], pvt->deviceaddr[2],
+            pvt->deviceaddr[3], pvt->deviceaddr[4], pvt->deviceaddr[5]);
 
         if (io->ready)
             io->ready(io->user_data, true);
@@ -627,7 +629,7 @@ static void nrf_serial_handler_evt_ble_ad_data_received(const nrf_serial_packet_
     instant = get_instant();
     adv = packet->payload.evt.ble_ad_data.data + 1;
     adv_len = packet->payload.evt.ble_ad_data.data[0];
-    addr = pvt->uuid;
+    addr = pvt->deviceaddr;
     rssi = 0;
 
     process_rx(pvt, rssi, instant, addr, adv, adv_len);

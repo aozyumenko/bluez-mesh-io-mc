@@ -7,8 +7,8 @@
 #endif
 
 #define FLOW_CTL        0x0001
-//#define BAUD_RATE       1000000
-#define BAUD_RATE       460800
+#define BAUD_RATE       1000000
+//#define BAUD_RATE       460800
 
 
 /* serial protocol version */
@@ -27,6 +27,9 @@
 #define NRF_SERIAL_MAX_ENCODED_PACKET_SIZE      (1UL + (NRF_SERIAL_MAX_PACKET_SIZE * 2) + 1UL)
 
 #define NRF_MESH_UUID_SIZE                      (16)
+
+#define DEVICEADDR_LEN                          (6)
+
 
 
 /** BLE Advertising command packet. */
@@ -79,8 +82,8 @@ typedef struct __attribute((packed))
 /* command response data with device UUID */
 typedef struct __attribute((packed))
 {
-    uint8_t device_uuid[NRF_MESH_UUID_SIZE];
-} serial_evt_cmd_rsp_data_device_uuid_t;
+    uint8_t addr[DEVICEADDR_LEN];
+} serial_evt_cmd_rsp_data_deviceaddr_t;
 
 /* serial interface housekeeping data. */
 typedef struct __attribute((packed))
@@ -111,7 +114,7 @@ typedef struct __attribute((packed))
 #define SERIAL_STATUS_ERROR_INVALID_KEY_DATA    0x98
     union __packed {
         nrf_serial_evt_cmd_rsp_data_serial_version_t    serial_version;
-        serial_evt_cmd_rsp_data_device_uuid_t           device_uuid;
+        serial_evt_cmd_rsp_data_deviceaddr_t           deviceaddr;
         nrf_serial_evt_cmd_rsp_data_housekeeping_t      hk_data;
     } data;
 } nrf_serial_evt_cmd_rsp_t;
@@ -148,7 +151,7 @@ typedef struct __packed {
 #define SERIAL_OPCODE_CMD_START                         (0x03)
 #define SERIAL_OPCODE_CMD_STOP                          (0x04)
 #define SERIAL_OPCODE_CMD_BLE_AD_DATA_SEND              (0x05)
-#define SERIAL_OPCODE_CMD_UUID_GET                      (0x06)
+#define SERIAL_OPCODE_CMD_DEVICEADDR_GET                (0x06)
 #define SERIAL_OPCODE_CMD_HOUSEKEEPING_DATA_GET         (0x7e)
 #define SERIAL_OPCODE_CMD_HOUSEKEEPING_DATA_CLEAR       (0x7f)
 
