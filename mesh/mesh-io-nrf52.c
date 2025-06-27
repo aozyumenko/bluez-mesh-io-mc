@@ -23,6 +23,7 @@
 #include "src/shared/mgmt.h"
 #include "util.h"
 
+#include "mesh/list.h"
 #include "mesh/mesh-defs.h"
 #include "mesh/mesh-mgmt.h"
 #include "mesh/mesh-io.h"
@@ -71,9 +72,9 @@ struct mesh_io_private {
     int rx_idx;
 
     /* Tx packet */
-    struct l_queue *tx_pkts;
+    struct list_head tx_pkts;
     struct l_timeout *tx_timeout;
-    struct l_queue *tx_cmd_rsps;
+    struct list_head tx_cmd_rsps;
     struct l_timeout *tx_cmd_rsp_timeout;
     nrf_serial_packet_t tx_cur_packet;
 
@@ -98,11 +99,7 @@ struct tx_pkt {
     uint32_t token;
     uint8_t len;
     uint8_t pkt[NRF_MESH_SERIAL_CMD_PAYLOAD_MAXLEN];
-};
-
-struct tx_pattern {
-    const uint8_t *data;
-    uint8_t len;
+    struct list_head list;
 };
 
 
@@ -115,6 +112,7 @@ struct cmd_rsp {
     unsigned long long instant;
     cmd_rsp_cb_t cb;
     void *user_data;
+    struct list_head list;
 };
 
 
@@ -201,43 +199,6 @@ static uint32_t get_next_token()
 }
 
 
-
-/* rx/tx queues helpers */
-
-static bool simple_match(const void *a, const void *b)
-{
-    return a == b;
-}
-
-static bool find_by_ad_type(const void *a, const void *b)
-{
-    const struct tx_pkt *tx = a;
-    uint8_t ad_type = L_PTR_TO_UINT(b);
-
-    return !ad_type || ad_type == tx->pkt[0];
-}
-
-static bool find_by_pattern(const void *a, const void *b)
-{
-    const struct tx_pkt *tx = a;
-    const struct tx_pattern *pattern = b;
-
-    if (tx->len < pattern->len)
-        return false;
-
-    return (!memcmp(tx->pkt, pattern->data, pattern->len));
-}
-
-static bool find_by_token(const void *a, const void *b)
-{
-    const struct tx_pkt *tx = a;
-    uint32_t token = L_PTR_TO_UINT(b);
-
-    return token == tx->token;
-}
-
-
-
 /* statictics */
 
 static void stat_reset(struct mesh_io *io)
@@ -298,15 +259,6 @@ static inline void stat_report_val(struct mesh_io *io, enum stat_e id, unsigned 
 
 /* send command */
 
-static bool cmd_rsp_find_by_instant(const void *a, const void *b)
-{
-    const struct cmd_rsp *rsp = a;
-    const unsigned long long *instant = b;
-
-    return rsp->instant <= *instant;
-}
-
-
 static bool cmd_rsp_find_by_packet(const void *a, const void *b)
 {
     const struct cmd_rsp *rsp = a;
@@ -317,6 +269,18 @@ static bool cmd_rsp_find_by_packet(const void *a, const void *b)
         rsp->token == packet->payload.evt.cmd_rsp.token;
 }
 
+
+static inline struct cmd_rsp *cmd_rsp_find_by_instant(struct mesh_io *io, unsigned long long instant)
+{
+    struct mesh_io_private *pvt = io->pvt;
+    struct cmd_rsp *rsp;
+
+    list_for_each_entry(rsp, &pvt->tx_cmd_rsps, list) {
+        if(rsp->instant <= instant)
+            return rsp;
+    }
+    return NULL;
+}
 
 static void cmd_rsp_worker(struct l_timeout *timeout, void *user_data)
 {
@@ -333,14 +297,11 @@ static void cmd_rsp_worker(struct l_timeout *timeout, void *user_data)
     instant = tm.tv_sec * 1000;
     instant += tm.tv_usec / 1000;
 
-    while ((rsp = l_queue_find(pvt->tx_cmd_rsps, cmd_rsp_find_by_instant,
-                               &instant)) != NULL) {
+    while ((rsp = cmd_rsp_find_by_instant(io, instant)) != NULL) {
         rsp->cb(rsp->token, NULL, rsp->user_data);
         stat_report(io, STAT_TX_NO_ACK);
-
-        l_queue_remove_if(pvt->tx_cmd_rsps, simple_match, rsp);
+        list_del(&rsp->list);
         l_free(rsp);
-
     }
 
     if (l_queue_length(io->rx_regs) == 0) {
@@ -374,7 +335,7 @@ static void cmd_rsp_add(struct mesh_io *io, uint8_t opcode, uint32_t token, cmd_
     rsp->user_data = user_data;
     rsp->cb = cb;
 
-    l_queue_push_tail(pvt->tx_cmd_rsps, rsp);
+    list_add_tail(&rsp->list, &pvt->tx_cmd_rsps);
 
     if (pvt->tx_cmd_rsp_timeout == NULL) {
         pvt->tx_cmd_rsp_timeout = l_timeout_create_ms(CMD_RSP_TIMEOUT,
@@ -391,14 +352,14 @@ static bool cmd_rsp_handle(struct mesh_io *io, const nrf_serial_packet_t *packet
     if (pvt == NULL)
         return false;
 
-    rsp = l_queue_find(pvt->tx_cmd_rsps, cmd_rsp_find_by_packet, packet);
-    if (rsp != NULL) {
-        rsp->cb(rsp->token, packet, rsp->user_data);
-        stat_report(io, STAT_TX_RSP);
-
-        l_queue_remove_if(pvt->tx_cmd_rsps, simple_match, rsp);
-        l_free(rsp);
-        return true;
+    list_for_each_entry(rsp, &pvt->tx_cmd_rsps, list) {
+        if (rsp->opcode == packet->payload.evt.cmd_rsp.opcode && rsp->token == packet->payload.evt.cmd_rsp.token) {
+            rsp->cb(rsp->token, packet, rsp->user_data);
+            stat_report(io, STAT_TX_RSP);
+            list_del(&rsp->list);
+            l_free(rsp);
+            return true;
+        }
     }
 
     stat_report(io, STAT_RX_DROP);
@@ -761,7 +722,7 @@ static void ad_data_send(struct mesh_io *io, struct tx_pkt *tx)
     memcpy(&pvt->tx_cur_packet.payload.cmd.payload.ble_ad_data.data[1], tx->pkt, tx->len);
 
     if (tx->delete) {
-        l_queue_remove_if(pvt->tx_pkts, simple_match, tx);
+        list_del(&tx->list);
     }
 
     (void) nrf_packet_send(pvt->serial_fd, &pvt->tx_cur_packet);
@@ -783,12 +744,13 @@ static void tx_to(struct l_timeout *timeout, void *user_data)
     if (pvt == NULL)
         return;
 
-    tx = l_queue_pop_head(pvt->tx_pkts);
-    if (tx == NULL) {
+    if (list_empty(&pvt->tx_pkts)) {
         l_timeout_remove(timeout);
         pvt->tx_timeout = NULL;
         return;
     }
+    tx = list_first_entry(&pvt->tx_pkts, struct tx_pkt, list);
+    list_del(&tx->list);
 
     if (tx->info.type == MESH_IO_TIMING_TYPE_GENERAL) {
         ms = tx->info.u.gen.interval;
@@ -805,16 +767,17 @@ static void tx_to(struct l_timeout *timeout, void *user_data)
     ad_data_send(io, tx);
 
     if (count == 1) {
-        /* Recalculate wakeup if we are responding to POLL */
-        tx = l_queue_peek_head(pvt->tx_pkts);
-
-        if (tx != NULL && tx->info.type == MESH_IO_TIMING_TYPE_POLL_RSP) {
-            ms = instant_remaining_ms(tx->info.u.poll_rsp.instant +
-                        tx->info.u.poll_rsp.delay);
+        if (!list_empty(&pvt->tx_pkts)) {
+            /* Recalculate wakeup if we are responding to POLL */
+            tx = list_first_entry(&pvt->tx_pkts, struct tx_pkt, list);
+            if (tx->info.type == MESH_IO_TIMING_TYPE_POLL_RSP) {
+                ms = instant_remaining_ms(tx->info.u.poll_rsp.instant +
+                    tx->info.u.poll_rsp.delay);
+            }
         }
     }
     else
-        l_queue_push_tail(pvt->tx_pkts, tx);
+        list_add_tail(&tx->list, &pvt->tx_pkts);
 
     if (timeout != NULL) {
         pvt->tx_timeout = timeout;
@@ -835,9 +798,10 @@ static void tx_worker(void *user_data)
     if (pvt == NULL)
         return;
 
-    tx = l_queue_peek_head(pvt->tx_pkts);
-    if (tx == NULL)
+    if (list_empty(&pvt->tx_pkts))
         return;
+
+    tx = list_first_entry(&pvt->tx_pkts, struct tx_pkt, list);
 
     switch (tx->info.type) {
     case MESH_IO_TIMING_TYPE_GENERAL:
@@ -996,9 +960,9 @@ static bool dev_init(struct mesh_io *io, void *opts, void *user_data)
     pvt->serial_io = NULL;
     pvt->rx_idx = 0;
 
-    pvt->tx_pkts = l_queue_new();
+    INIT_LIST_HEAD(&pvt->tx_pkts);
     pvt->tx_timeout = NULL;
-    pvt->tx_cmd_rsps = l_queue_new();
+    INIT_LIST_HEAD(&pvt->tx_cmd_rsps);
     pvt->tx_cmd_rsp_timeout = NULL;
 
     io->pvt = pvt;
@@ -1014,6 +978,8 @@ static bool dev_init(struct mesh_io *io, void *opts, void *user_data)
 static bool dev_destroy(struct mesh_io *io)
 {
     struct mesh_io_private *pvt = io->pvt;
+    struct cmd_rsp *rsp, *rsp_tmp;
+    struct tx_pkt *tx, *tx_tmp;
 
     if (pvt == NULL)
         return true;
@@ -1029,9 +995,15 @@ static bool dev_destroy(struct mesh_io *io)
 
     l_timeout_remove(pvt->tx_timeout);
     pvt->tx_timeout = NULL;
-    l_queue_destroy(pvt->tx_pkts, l_free);
+    list_for_each_entry_safe(tx, tx_tmp, &pvt->tx_pkts, list) {
+        list_del(&tx->list);
+        l_free(tx);
+    }
     l_timeout_remove(pvt->tx_cmd_rsp_timeout);
-    l_queue_destroy(pvt->tx_cmd_rsps, l_free);
+    list_for_each_entry_safe(rsp, rsp_tmp, &pvt->tx_cmd_rsps, list) {
+        list_del(&rsp->list);
+        l_free(rsp);
+    }
 
     l_timeout_remove(pvt->error_check_timeout);
     pvt->error_check_timeout = NULL;
@@ -1083,10 +1055,9 @@ tx_packets_alloc++;
 l_debug("++++++ ALLOC: tx=%p, token=0x%x", tx, tx->token);
 
     if (info->type == MESH_IO_TIMING_TYPE_POLL_RSP)
-        l_queue_push_head(pvt->tx_pkts, tx);
-    else {
-        l_queue_push_tail(pvt->tx_pkts, tx);
-    }
+        list_add(&tx->list, &pvt->tx_pkts);
+    else
+        list_add_tail(&tx->list, &pvt->tx_pkts);
 
     l_timeout_remove(pvt->tx_timeout);
     pvt->tx_timeout = NULL;
@@ -1099,7 +1070,7 @@ l_debug("++++++ ALLOC: tx=%p, token=0x%x", tx, tx->token);
 static bool tx_cancel(struct mesh_io *io, const uint8_t *data, uint8_t len)
 {
     struct mesh_io_private *pvt = io->pvt;
-    struct tx_pkt *tx;
+    struct tx_pkt *tx, *tx_tmp;
 
     if (pvt == NULL || data == NULL)
         return false;
@@ -1108,33 +1079,26 @@ static bool tx_cancel(struct mesh_io *io, const uint8_t *data, uint8_t len)
         return false;
 
     if (len == 1) {
-        do {
-            tx = l_queue_remove_if(pvt->tx_pkts, find_by_ad_type,
-                                   L_UINT_TO_PTR(data[0]));
-if (tx) {
+        list_for_each_entry_safe(tx, tx_tmp, &pvt->tx_pkts, list) {
+            if (!data[0] || data[0] == tx->pkt[0]) {
+                list_del(&tx->list);
+                l_free(tx);
     l_debug("------ DELETE: tx=%p, token=0x%x", tx, tx->token);
     tx_packets_alloc--;
-}
-            l_free(tx);
-        } while (tx);
+            }
+        }
     } else {
-        struct tx_pattern pattern = {
-            .data = data,
-            .len = len
-        };
-
-        do {
-            tx = l_queue_remove_if(pvt->tx_pkts, find_by_pattern,
-                                   &pattern);
-if (tx) {
+        list_for_each_entry_safe(tx, tx_tmp, &pvt->tx_pkts, list) {
+            if (tx->len >= len && !memcmp(tx->pkt, data, len)) {
+                list_del(&tx->list);
+                l_free(tx);
     l_debug("------ DELETE: tx=%p, token=0x%x", tx, tx->token);
     tx_packets_alloc--;
-}
-            l_free(tx);
-        } while (tx);
+            }
+        }
     }
 
-    if (l_queue_isempty(pvt->tx_pkts)) {
+    if (list_empty(&pvt->tx_pkts)) {
         l_timeout_remove(pvt->tx_timeout);
         pvt->tx_timeout = NULL;
     }
