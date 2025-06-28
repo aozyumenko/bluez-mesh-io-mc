@@ -25,6 +25,8 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <glib.h>
+
 #include "lib/bluetooth.h"
 #include "lib/hci.h"
 
@@ -45,6 +47,7 @@
 #define CIG_SIZE		3
 
 #define MAX_PA_DATA_LEN	252
+#define MAX_EXT_ADV_LEN 252
 
 #define has_bredr(btdev)	(!((btdev)->features[4] & 0x20))
 #define has_le(btdev)		(!!((btdev)->features[4] & 0x40))
@@ -99,9 +102,9 @@ struct le_ext_adv {
 	uint8_t filter_policy;		/* filter_policy */
 	uint8_t random_addr[6];
 	bool rpa;
-	uint8_t adv_data[252];
+	uint8_t adv_data[MAX_EXT_ADV_LEN];
 	uint8_t adv_data_len;
-	uint8_t scan_data[252];
+	uint8_t scan_data[MAX_EXT_ADV_LEN];
 	uint8_t scan_data_len;
 	unsigned int broadcast_id;
 	unsigned int timeout_id;
@@ -4950,7 +4953,7 @@ static int cmd_set_ext_adv_data(struct btdev *dev, const void *data,
 		return 0;
 	}
 
-	ext_adv->adv_data_len = cmd->data_len;
+	ext_adv->adv_data_len = MIN(cmd->data_len, MAX_EXT_ADV_LEN);
 	memcpy(ext_adv->adv_data, cmd->data, cmd->data_len);
 	cmd_complete(dev, BT_HCI_CMD_LE_SET_EXT_ADV_DATA, &status,
 						sizeof(status));
@@ -4974,7 +4977,7 @@ static int cmd_set_ext_scan_rsp_data(struct btdev *dev, const void *data,
 		return 0;
 	}
 
-	ext_adv->scan_data_len = cmd->data_len;
+	ext_adv->scan_data_len = MIN(cmd->data_len, MAX_EXT_ADV_LEN);
 	memcpy(ext_adv->scan_data, cmd->data, cmd->data_len);
 	cmd_complete(dev, BT_HCI_CMD_LE_SET_EXT_SCAN_RSP_DATA, &status,
 						sizeof(status));
@@ -5008,7 +5011,7 @@ static void send_ext_adv(struct btdev *btdev, const struct btdev *remote,
 		uint8_t num_reports;
 		union {
 			struct bt_hci_le_ext_adv_report lear;
-			uint8_t raw[24 + 31];
+			uint8_t raw[24 + MAX_EXT_ADV_LEN];
 		};
 	} meta_event;
 
@@ -5213,8 +5216,16 @@ exit_complete:
 static int cmd_read_max_adv_data_len(struct btdev *dev, const void *data,
 							uint8_t len)
 {
-	/* TODO */
-	return -ENOTSUP;
+	struct bt_hci_rsp_le_read_max_adv_data_len rsp;
+
+	memset(&rsp, 0, sizeof(rsp));
+
+	rsp.status = BT_HCI_ERR_SUCCESS;
+	rsp.max_len = MAX_EXT_ADV_LEN;
+	cmd_complete(dev, BT_HCI_CMD_LE_READ_MAX_ADV_DATA_LEN, &rsp,
+							sizeof(rsp));
+
+	return 0;
 }
 
 static int cmd_read_num_adv_sets(struct btdev *dev, const void *data,
@@ -5468,6 +5479,7 @@ static void le_pa_sync_estabilished(struct btdev *dev, struct btdev *remote,
 	per_adv->sync_handle = sync_handle;
 
 	ev.handle = cpu_to_le16(per_adv->sync_handle);
+	ev.sid = per_adv->sid;
 	ev.addr_type = per_adv->addr_type;
 	memcpy(ev.addr, per_adv->addr, sizeof(ev.addr));
 	ev.phy = 0x01;
@@ -6715,30 +6727,34 @@ done:
 static int cmd_remove_iso_path(struct btdev *dev, const void *data, uint8_t len)
 {
 	const struct bt_hci_cmd_le_remove_iso_path *cmd = data;
-	uint8_t status = BT_HCI_ERR_SUCCESS;
+	struct bt_hci_rsp_le_remove_iso_path rsp;
 	struct btdev_conn *conn;
+
+	memset(&rsp, 0, sizeof(rsp));
+
+	rsp.handle = cmd->handle;
 
 	conn = queue_find(dev->conns, match_handle,
 				UINT_TO_PTR(cpu_to_le16(cmd->handle)));
 	if (!conn) {
-		status = BT_HCI_ERR_UNKNOWN_CONN_ID;
+		rsp.status = BT_HCI_ERR_UNKNOWN_CONN_ID;
 		goto done;
 	}
 
-	switch (cmd->direction) {
-	case 0x00:
-		dev->le_iso_path[0] = 0x00;
-		break;
-	case 0x01:
-		dev->le_iso_path[1] = 0x00;
-		break;
-	default:
-		status = BT_HCI_ERR_INVALID_PARAMETERS;
+	if (cmd->direction > 0x3) {
+		rsp.status = BT_HCI_ERR_INVALID_PARAMETERS;
+		goto done;
 	}
 
+	if (cmd->direction & 0x1)
+		dev->le_iso_path[0] = 0x00;
+
+	if (cmd->direction & 0x2)
+		dev->le_iso_path[1] = 0x00;
+
 done:
-	cmd_complete(dev, BT_HCI_CMD_LE_REMOVE_ISO_PATH, &status,
-							sizeof(status));
+	cmd_complete(dev, BT_HCI_CMD_LE_REMOVE_ISO_PATH, &rsp,
+							sizeof(rsp));
 
 	return 0;
 }

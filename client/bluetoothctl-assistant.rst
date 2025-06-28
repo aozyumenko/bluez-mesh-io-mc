@@ -21,6 +21,20 @@ SYNOPSIS
 Assistant Commands
 ==================
 
+list
+----
+
+List available assistants.
+
+:Usage: **> list**
+
+show
+----
+
+Show assistant information.
+
+:Usage: **> show [assistant]**
+
 push
 ----
 
