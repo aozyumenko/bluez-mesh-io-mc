@@ -138,7 +138,6 @@ static void cmd_resp_reset_cb(uint32_t token, const nrf_serial_packet_t *packet,
 static void nrf_cmd_resp_serial_version_get_cb(uint32_t token, const nrf_serial_packet_t *packet, void *user_data);
 static void nrf_cmd_resp_deviceaddr_get_cb(uint32_t token, const nrf_serial_packet_t *packet, void *user_data);
 
-//static void ad_data_send_cb(uint32_t token, const nrf_serial_packet_t *packet, void *user_data);
 static void ad_data_send(struct mesh_io *io, struct tx_pkt *tx);
 static void evt_ble_ad_data_received(const nrf_serial_packet_t *packet, void *user_data);
 
@@ -167,6 +166,7 @@ static nrf_serial_packet_handler_entry_t packet_handler_list[] = {
 };
 
 
+// FIXME: for debug only - drop in future
 static int tx_packets_alloc = 0;
 
 
@@ -222,7 +222,7 @@ static void stat_print(struct mesh_io *io)
     for (int i = 0; i < STAT_MAX; i++) {
         l_debug("    %s: %llu", stat_str[i], pvt->stat[i]);
     }
-l_debug("    TX alloc: %d", tx_packets_alloc);
+    l_debug("    TX alloc: %d", tx_packets_alloc);
 }
 
 
@@ -492,6 +492,8 @@ static void nrf_cmd_resp_deviceaddr_get_cb(uint32_t token, const nrf_serial_pack
             pvt->deviceaddr[0], pvt->deviceaddr[1], pvt->deviceaddr[2],
             pvt->deviceaddr[3], pvt->deviceaddr[4], pvt->deviceaddr[5]);
 
+    l_info("Started Mesh Controller");
+
     if (io->ready)
         io->ready(io->user_data, true);
 }
@@ -697,8 +699,8 @@ static void ad_data_send_cb(uint32_t token, const nrf_serial_packet_t *packet, v
     }
 
     if (tx->delete) {
-l_debug("------ DELETE: tx=%p, token=0x%x", tx, tx->token);
-tx_packets_alloc--;
+//        l_debug("------ DELETE: tx=%p, token=0x%x", tx, tx->token);
+        tx_packets_alloc--;
         l_free(tx);
     }
 }
@@ -720,10 +722,6 @@ static void ad_data_send(struct mesh_io *io, struct tx_pkt *tx)
     pvt->tx_cur_packet.payload.cmd.token = tx->token;
     pvt->tx_cur_packet.payload.cmd.payload.ble_ad_data.data[0] = tx->len;
     memcpy(&pvt->tx_cur_packet.payload.cmd.payload.ble_ad_data.data[1], tx->pkt, tx->len);
-
-    if (tx->delete) {
-        list_del(&tx->list);
-    }
 
     (void) nrf_packet_send(pvt->serial_fd, &pvt->tx_cur_packet);
     cmd_rsp_add(io, SERIAL_OPCODE_CMD_BLE_AD_DATA_SEND, tx->token,
@@ -749,6 +747,7 @@ static void tx_to(struct l_timeout *timeout, void *user_data)
         pvt->tx_timeout = NULL;
         return;
     }
+
     tx = list_first_entry(&pvt->tx_pkts, struct tx_pkt, list);
     list_del(&tx->list);
 
@@ -1045,14 +1044,14 @@ static bool send_tx(struct mesh_io *io, struct mesh_io_send_info *info,
         return false;
 
     tx = l_new(struct tx_pkt, 1);
-tx_packets_alloc++;
     tx->io = io;
     memcpy(&tx->info, info, sizeof(tx->info));
     memcpy(tx->pkt, data, len);
     tx->len = len;
     tx->token = get_next_token();
 
-l_debug("++++++ ALLOC: tx=%p, token=0x%x", tx, tx->token);
+//    l_debug("++++++ ALLOC: tx=%p, token=0x%x", tx, tx->token);
+    tx_packets_alloc++;
 
     if (info->type == MESH_IO_TIMING_TYPE_POLL_RSP)
         list_add(&tx->list, &pvt->tx_pkts);
@@ -1083,8 +1082,8 @@ static bool tx_cancel(struct mesh_io *io, const uint8_t *data, uint8_t len)
             if (!data[0] || data[0] == tx->pkt[0]) {
                 list_del(&tx->list);
                 l_free(tx);
-    l_debug("------ DELETE: tx=%p, token=0x%x", tx, tx->token);
-    tx_packets_alloc--;
+//                l_debug("------ DELETE: tx=%p, token=0x%x", tx, tx->token);
+                tx_packets_alloc--;
             }
         }
     } else {
@@ -1092,8 +1091,8 @@ static bool tx_cancel(struct mesh_io *io, const uint8_t *data, uint8_t len)
             if (tx->len >= len && !memcmp(tx->pkt, data, len)) {
                 list_del(&tx->list);
                 l_free(tx);
-    l_debug("------ DELETE: tx=%p, token=0x%x", tx, tx->token);
-    tx_packets_alloc--;
+//                l_debug("------ DELETE: tx=%p, token=0x%x", tx, tx->token);
+                tx_packets_alloc--;
             }
         }
     }
