@@ -28,7 +28,7 @@
 /* List of Mesh-IO Type headers */
 #include "mesh/mesh-io-mgmt.h"
 #include "mesh/mesh-io-generic.h"
-#include "mesh/mesh-io-nrf52.h"
+#include "mesh/mesh-io-mc.h"
 #include "mesh/mesh-io-unit.h"
 
 struct loop_data {
@@ -40,7 +40,7 @@ struct loop_data {
 static const struct mesh_io_table table[] = {
 	{MESH_IO_TYPE_MGMT,	&mesh_io_mgmt},
 	{MESH_IO_TYPE_GENERIC,	&mesh_io_generic},
-	{MESH_IO_TYPE_NRF52,	&mesh_io_nrf52},
+	{MESH_IO_TYPE_MC,	&mesh_io_mc},
 	{MESH_IO_TYPE_UNIT_TEST, &mesh_io_unit},
 };
 

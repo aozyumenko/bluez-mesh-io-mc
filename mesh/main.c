@@ -187,7 +187,7 @@ static bool parse_io(const char *optarg, enum mesh_io_type *type, void **opts)
 	} else if (strstr(optarg, "nrf52") == optarg) {
 		char *serial_path;
 
-		*type = MESH_IO_TYPE_NRF52;
+		*type = MESH_IO_TYPE_MC;
 
 		optarg += strlen("nrf52");
 		if (!*optarg || *optarg != ':')

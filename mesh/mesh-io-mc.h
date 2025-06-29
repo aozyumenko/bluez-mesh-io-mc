@@ -8,4 +8,4 @@
  *
  */
 
-extern const struct mesh_io_api mesh_io_nrf52;
+extern const struct mesh_io_api mesh_io_mc;
