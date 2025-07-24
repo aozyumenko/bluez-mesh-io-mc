@@ -628,6 +628,7 @@ static void cmd_resp_version_get_cb(uint32_t token, const mc_packet_t *packet, v
     struct mesh_io *io = user_data;
 
     if (packet == NULL) {
+        /* if no response received, try to sync with the device using reset */
         mc_reset(io);
         return;
     }
@@ -665,7 +666,8 @@ static void cmd_resp_deviceaddr_get_cb(uint32_t token, const mc_packet_t *packet
         return;
 
     if (packet == NULL) {
-        mc_reset(io);
+        if (io->ready)
+            io->ready(io->user_data, false);
         return;
     }
 
@@ -747,7 +749,7 @@ static void mc_stop(struct mesh_io *io)
 
     l_debug("send Stop Mesh Controller command");
     cmd_send(io, MC_OPCODE_CMD_STOP, get_next_token(),
-             0, NULL, NULL, io);
+             0, NULL, NULL, NULL);
     pvt->started = false;
 }
 
@@ -880,7 +882,6 @@ static void ad_data_send_cb(uint32_t token, const mc_packet_t *packet, void *use
 
         l_debug("Sent packet error: status 0x%x, token 0x%x",
             packet->payload.evt.cmd_rsp.status, token);
-        mc_reset(io);
     }
 
     if (tx->delete) {
@@ -1075,36 +1076,34 @@ static void serial_disconnect_cb(struct l_io *serial_io, void *user_data)
 
 
 /* initialize mesh controller */
-static void mc_initalize(void *user_data)
+static void mc_initialize(void *user_data)
 {
     struct mesh_io *io = user_data;
     struct mesh_io_private *pvt = io->pvt;
-    bool result = true;
     int fd;
 
     if (pvt == NULL)
         return;
 
     fd = serial_init(pvt->serial_path, pvt->serial_speed, pvt->serial_flags);
-    if (fd < 0)
-        result = false;
-
-    if (result) {
-        pvt->serial_fd = fd;
-
-        pvt->serial_io = l_io_new(pvt->serial_fd);
-        (void)l_io_set_read_handler(pvt->serial_io, rx_worker, io, NULL);
-        (void)l_io_set_disconnect_handler(pvt->serial_io, serial_disconnect_cb, io, NULL);
-
-        pvt->error_check_timeout = l_timeout_create_ms(ERROR_CHECK_PERIOD,
-                                   error_check_worker, io, NULL);
-
-        /* reset device */
-        mc_reset(io);
+    if (fd < 0) {
+        if (io->ready)
+            io->ready(io->user_data, false);
+        return;
     }
 
-    if (io->ready)
-        io->ready(io->user_data, result);
+    pvt->serial_fd = fd;
+
+    pvt->serial_io = l_io_new(pvt->serial_fd);
+    (void)l_io_set_read_handler(pvt->serial_io, rx_worker, io, NULL);
+    (void)l_io_set_disconnect_handler(pvt->serial_io, serial_disconnect_cb, io, NULL);
+
+    pvt->error_check_timeout = l_timeout_create_ms(ERROR_CHECK_PERIOD,
+                                                   error_check_worker, io, NULL);
+
+    /* start initialization sequence */
+    cmd_send(io, MC_OPCODE_CMD_VERSION_GET, get_next_token(),
+             0, NULL, cmd_resp_version_get_cb, io);
 }
 
 
@@ -1145,7 +1144,7 @@ static bool dev_init(struct mesh_io *io, void *opts, void *user_data)
 
     stat_reset(io);
 
-    l_idle_oneshot(mc_initalize, io, NULL);
+    l_idle_oneshot(mc_initialize, io, NULL);
 
     return true;
 }
