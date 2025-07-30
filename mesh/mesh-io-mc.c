@@ -157,7 +157,7 @@ static void evt_ble_ad_data_received(const mc_packet_t *packet, void *user_data)
 
 
 
-/* global varoables */
+/* global variables */
 
 static const char *stat_str[STAT_MAX] = {
     [STAT_TX] = "tx",
@@ -861,6 +861,8 @@ static void evt_ble_ad_data_received(const mc_packet_t *packet, void *user_data)
 
 /* send data packets */
 
+static bool send_progress = false;
+
 static void ad_data_send_cb(uint32_t token, const mc_packet_t *packet, void *user_data)
 {
     struct tx_pkt *tx = user_data;
@@ -888,6 +890,8 @@ static void ad_data_send_cb(uint32_t token, const mc_packet_t *packet, void *use
         tx_packets_alloc--;
         l_free(tx);
     }
+
+    send_progress = false;
 }
 
 
@@ -946,6 +950,8 @@ static void tx_to(struct l_timeout *timeout, void *user_data)
 
     tx->delete = !!(count == 1);
 
+send_progress = true;
+
     ad_data_send(io, tx);
 
     if (count == 1) {
@@ -977,6 +983,9 @@ static void tx_worker(void *user_data)
     uint32_t delay;
 
     if (pvt == NULL)
+        return;
+
+    if (send_progress)
         return;
 
     if (list_empty(&pvt->tx_pkts))
