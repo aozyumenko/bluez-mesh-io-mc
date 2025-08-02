@@ -42,9 +42,11 @@
 #define SLIP_ESC_ESC            0xdd
 
 #define CMD_RSP_TIMEOUT         50
+#define TX_AD_DATA_WINDOW       1
 #define ERROR_CHECK_PERIOD      10000
 
 #define SERIAL_FLOW_CTL         0x0001
+
 
 
 
@@ -86,7 +88,8 @@ struct mesh_io_private {
     struct l_timeout *tx_timeout;
     struct list_head tx_cmd_rsps;
     struct l_timeout *tx_cmd_rsp_timeout;
-    mc_packet_t tx_cur_packet;
+    int tx_pkts_cnt;
+    bool tx_skip_timeout;
 
     /* error checking */
     struct l_timeout *error_check_timeout;
@@ -154,6 +157,7 @@ static void cmd_resp_deviceaddr_get_cb(uint32_t token, const mc_packet_t *packet
 
 static void ad_data_send(struct mesh_io *io, struct tx_pkt *tx);
 static void evt_ble_ad_data_received(const mc_packet_t *packet, void *user_data);
+static void tx_to(struct l_timeout *timeout, void *user_data);
 
 
 
@@ -182,6 +186,19 @@ static int tx_packets_alloc = 0;
 
 
 /* statictics */
+
+long long get_period_ms() {
+    static long long int prev_time = 0;
+    static long long int cur_time;
+    static long long int period;
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    cur_time = ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
+    period = cur_time - prev_time;
+    prev_time = cur_time;
+    return period;
+}
 
 static void stat_reset(struct mesh_io *io)
 {
@@ -572,8 +589,8 @@ static void cmd_send(struct mesh_io *io, uint8_t opcode, uint32_t token, size_t 
         memcpy(&packet.payload.cmd.payload, payload, length);
     }
 
-    (void)serial_packet_send(pvt->serial_fd, &packet);
     cmd_rsp_add(io, opcode, token, cb, user_data);
+    (void)serial_packet_send(pvt->serial_fd, &packet);
 
     stat_report(io, STAT_TX);
 }
@@ -861,19 +878,19 @@ static void evt_ble_ad_data_received(const mc_packet_t *packet, void *user_data)
 
 /* send data packets */
 
-static bool send_progress = false;
-
 static void ad_data_send_cb(uint32_t token, const mc_packet_t *packet, void *user_data)
 {
     struct tx_pkt *tx = user_data;
     struct mesh_io *io = tx->io;
     struct mesh_io_private *pvt = io->pvt;
 
-    if (pvt == NULL)
+    if (pvt == NULL || pvt->tx_pkts_cnt <= 0)
         return;
 
+    pvt->tx_pkts_cnt--;
+
     if (packet == NULL) {
-        l_debug("Sent packet not ACKed, token 0x%x", token);
+        l_error("Sent packet not ACKed, token 0x%x", token);
         stat_report(io, STAT_TX_NO_ACK);
         ad_data_send(io, tx);
         return;
@@ -881,17 +898,18 @@ static void ad_data_send_cb(uint32_t token, const mc_packet_t *packet, void *use
 
     if (packet->payload.evt.cmd_rsp.status != MC_STATUS_SUCCESS) {
         stat_report(io, STAT_TX_RSP_ERR);
-
-        l_debug("Sent packet error: status 0x%x, token 0x%x",
-            packet->payload.evt.cmd_rsp.status, token);
+        l_error("Sent packet error: status 0x%x, token 0x%x",
+                packet->payload.evt.cmd_rsp.status, token);
     }
 
     if (tx->delete) {
-        tx_packets_alloc--;
         l_free(tx);
+        tx_packets_alloc--;
     }
 
-    send_progress = false;
+    if (pvt->tx_skip_timeout) {
+        tx_to(pvt->tx_timeout, io);
+    }
 }
 
 
@@ -904,15 +922,16 @@ static void ad_data_send(struct mesh_io *io, struct tx_pkt *tx)
     if (pvt == NULL)
         return;
 
-    pvt->tx_cur_packet.length = MC_PACKET_OVERHEAD + MC_CMD_OVERHEAD + tx->len + 1;
-    pvt->tx_cur_packet.opcode = MC_OPCODE_CMD_BLE_AD_DATA_SEND;
-    pvt->tx_cur_packet.payload.cmd.token = tx->token;
-    pvt->tx_cur_packet.payload.cmd.payload.ble_ad_data.data[0] = tx->len;
-    memcpy(&pvt->tx_cur_packet.payload.cmd.payload.ble_ad_data.data[1], tx->pkt, tx->len);
+    packet.length = MC_PACKET_OVERHEAD + MC_CMD_OVERHEAD + tx->len + 1;
+    packet.opcode = MC_OPCODE_CMD_BLE_AD_DATA_SEND;
+    packet.payload.cmd.token = tx->token;
+    packet.payload.cmd.payload.ble_ad_data.data[0] = tx->len;
+    memcpy(&packet.payload.cmd.payload.ble_ad_data.data[1], tx->pkt, tx->len);
 
-    (void)serial_packet_send(pvt->serial_fd, &pvt->tx_cur_packet);
+    pvt->tx_pkts_cnt++;
     cmd_rsp_add(io, MC_OPCODE_CMD_BLE_AD_DATA_SEND, tx->token,
                 ad_data_send_cb, tx);
+    (void)serial_packet_send(pvt->serial_fd, &packet);
 
     stat_report(io, STAT_TX);
 }
@@ -929,6 +948,13 @@ static void tx_to(struct l_timeout *timeout, void *user_data)
     if (pvt == NULL)
         return;
 
+    if (pvt->tx_pkts_cnt >= TX_AD_DATA_WINDOW) {
+        pvt->tx_skip_timeout = true;
+        return;
+    }
+
+    pvt->tx_skip_timeout = false;
+
     if (list_empty(&pvt->tx_pkts)) {
         l_timeout_remove(timeout);
         pvt->tx_timeout = NULL;
@@ -939,7 +965,9 @@ static void tx_to(struct l_timeout *timeout, void *user_data)
     list_del(&tx->list);
 
     if (tx->info.type == MESH_IO_TIMING_TYPE_GENERAL) {
-        ms = tx->info.u.gen.interval;
+        l_getrandom(&ms, sizeof(ms));
+        ms %= 10;
+        ms += tx->info.u.gen.interval;
         count = tx->info.u.gen.cnt;
         if (count != MESH_IO_TX_COUNT_UNLIMITED)
             tx->info.u.gen.cnt--;
@@ -949,8 +977,6 @@ static void tx_to(struct l_timeout *timeout, void *user_data)
     }
 
     tx->delete = !!(count == 1);
-
-send_progress = true;
 
     ad_data_send(io, tx);
 
@@ -983,9 +1009,6 @@ static void tx_worker(void *user_data)
     uint32_t delay;
 
     if (pvt == NULL)
-        return;
-
-    if (send_progress)
         return;
 
     if (list_empty(&pvt->tx_pkts))
@@ -1145,6 +1168,8 @@ static bool dev_init(struct mesh_io *io, void *opts, void *user_data)
     pvt->rx_idx = 0;
 
     INIT_LIST_HEAD(&pvt->tx_pkts);
+    pvt->tx_pkts_cnt = 0;
+    pvt->tx_skip_timeout = false;
     pvt->tx_timeout = NULL;
     INIT_LIST_HEAD(&pvt->tx_cmd_rsps);
     pvt->tx_cmd_rsp_timeout = NULL;
@@ -1242,9 +1267,12 @@ static bool send_tx(struct mesh_io *io, struct mesh_io_send_info *info,
     else
         list_add_tail(&tx->list, &pvt->tx_pkts);
 
-    l_timeout_remove(pvt->tx_timeout);
-    pvt->tx_timeout = NULL;
-    l_idle_oneshot(tx_worker, io, NULL);
+    /* if not already sending, schedule the tx worker */
+    if (pvt->tx_pkts_cnt < TX_AD_DATA_WINDOW) {
+        l_timeout_remove(pvt->tx_timeout);
+        pvt->tx_timeout = NULL;
+        l_idle_oneshot(tx_worker, io, NULL);
+    }
 
     return true;
 }
