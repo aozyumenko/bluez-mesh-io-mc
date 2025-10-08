@@ -24,10 +24,10 @@
 #include <dbus/dbus.h>
 #include <glib.h>
 
-#include "lib/bluetooth.h"
-#include "lib/sdp.h"
-#include "lib/sdp_lib.h"
-#include "lib/uuid.h"
+#include "bluetooth/bluetooth.h"
+#include "bluetooth/sdp.h"
+#include "bluetooth/sdp_lib.h"
+#include "bluetooth/uuid.h"
 
 #include "gdbus/gdbus.h"
 
@@ -156,6 +156,73 @@ struct a2dp_channel {
 static GSList *servers = NULL;
 static GSList *setups = NULL;
 static unsigned int cb_id = 0;
+
+struct a2dp_error {
+	const char *error_name;
+	uint8_t error_code;
+};
+
+#define A2DP_ERROR_PREFIX ERROR_INTERFACE ".A2DP."
+
+static struct a2dp_error config_errors[] = {
+	{"InvalidCodecType", A2DP_INVALID_CODEC_TYPE},
+	{"NotSupportedCodecType", A2DP_NOT_SUPPORTED_CODEC_TYPE},
+	{"InvalidSamplingFrequency", A2DP_INVALID_SAMPLING_FREQUENCY},
+	{"NotSupportedSamplingFrequency",
+				A2DP_NOT_SUPPORTED_SAMPLING_FREQUENCY},
+	{"InvalidChannelMode", A2DP_INVALID_CHANNEL_MODE},
+	{"NotSupportedChannelMode", A2DP_NOT_SUPPORTED_CHANNEL_MODE},
+	{"InvalidSubbands", A2DP_INVALID_SUBBANDS},
+	{"NotSupportedSubbands", A2DP_NOT_SUPPORTED_SUBBANDS},
+	{"InvalidAllocationMethod", A2DP_INVALID_ALLOCATION_METHOD},
+	{"NotSupportedAllocationMethod", A2DP_NOT_SUPPORTED_ALLOCATION_METHOD},
+	{"InvalidMinimumBitpoolValue",
+				A2DP_INVALID_MINIMUM_BITPOOL_VALUE},
+	{"NotSupportedMinimumBitpoolValue",
+				A2DP_NOT_SUPPORTED_MINIMUM_BITPOOL_VALUE},
+	{"InvalidMaximumBitpoolValue", A2DP_INVALID_MAXIMUM_BITPOOL_VALUE},
+	{"NotSupportedMaximumBitpoolValue",
+				A2DP_NOT_SUPPORTED_MAXIMUM_BITPOOL_VALUE},
+	{"InvalidLayer", A2DP_INVALID_LAYER},
+	{"NotSupportedLayer", A2DP_NOT_SUPPORTED_LAYER},
+	{"NotSupportedCRC", A2DP_NOT_SUPPORTED_CRC},
+	{"NotSupportedMPF", A2DP_NOT_SUPPORTED_MPF},
+	{"NotSupportedVBR", A2DP_NOT_SUPPORTED_VBR},
+	{"InvalidBitRate", A2DP_INVALID_BIT_RATE},
+	{"NotSupportedBitRate", A2DP_NOT_SUPPORTED_BIT_RATE},
+	{"InvalidObjectType", A2DP_INVALID_OBJECT_TYPE},
+	{"NotSupportedObjectType", A2DP_NOT_SUPPORTED_OBJECT_TYPE},
+	{"InvalidChannels", A2DP_INVALID_CHANNELS},
+	{"NotSupportedChannels", A2DP_NOT_SUPPORTED_CHANNELS},
+	{"InvalidVersion", A2DP_INVALID_VERSION},
+	{"NotSupportedVersion", A2DP_NOT_SUPPORTED_VERSION},
+	{"NotSupportedMaximumSUL", A2DP_NOT_SUPPORTED_MAXIMUM_SUL},
+	{"InvalidBlockLength", A2DP_INVALID_BLOCK_LENGTH},
+	{"InvalidCPType", A2DP_INVALID_CP_TYPE},
+	{"InvalidCPFormat", A2DP_INVALID_CP_FORMAT},
+	{"InvalidCodecParameter", A2DP_INVALID_CODEC_PARAMETER},
+	{"NotSupportedCodecParameter", A2DP_NOT_SUPPORTED_CODEC_PARAMETER},
+	{"InvalidDRC", A2DP_INVALID_DRC},
+	{"NotSupportedDRC", A2DP_NOT_SUPPORTED_DRC}
+};
+
+uint8_t a2dp_parse_config_error(const char *error_name)
+{
+	size_t prefix_length;
+	size_t i;
+
+	prefix_length = strlen(A2DP_ERROR_PREFIX);
+	if (strncmp(A2DP_ERROR_PREFIX, error_name, prefix_length))
+		return AVDTP_UNSUPPORTED_CONFIGURATION;
+
+	error_name += prefix_length;
+	for (i = 0; i < ARRAY_SIZE(config_errors); i++) {
+		if (strcmp(config_errors[i].error_name, error_name) == 0)
+			return config_errors[i].error_code;
+	}
+
+	return AVDTP_UNSUPPORTED_CONFIGURATION;
+}
 
 static struct a2dp_setup *setup_ref(struct a2dp_setup *setup)
 {
@@ -333,8 +400,8 @@ static int error_to_errno(struct avdtp_error *err)
 	case ECONNREFUSED:
 		return -perr;
 	default:
-		/*
-		 * An unexpect error has occurred setup may be attempted again.
+		/* An unexpected error has occurred setup may be attempted
+		 * again.
 		 */
 		return -EAGAIN;
 	}
@@ -569,6 +636,11 @@ static void a2dp_stream_free(void *data)
 {
 	struct a2dp_stream *stream = data;
 
+	if (stream->suspend_timer) {
+		timeout_remove(stream->suspend_timer);
+		stream->suspend_timer = 0;
+	}
+
 	avdtp_unref(stream->session);
 	free(stream);
 }
@@ -646,6 +718,18 @@ static gboolean auto_config(gpointer data)
 	struct btd_service *service;
 	struct a2dp_stream *stream;
 
+	dev = avdtp_get_device(setup->session);
+
+	if (setup->sep->type == AVDTP_SEP_TYPE_SOURCE)
+		service = btd_device_get_service(dev, A2DP_SINK_UUID);
+	else
+		service = btd_device_get_service(dev, A2DP_SOURCE_UUID);
+
+	if (service == NULL) {
+		error("Unable to find btd service");
+		return FALSE;
+	}
+
 	/* Check if configuration was aborted */
 	stream = queue_find(setup->sep->streams, match_stream, setup->stream);
 	if (!stream)
@@ -654,16 +738,12 @@ static gboolean auto_config(gpointer data)
 	if (setup->err != NULL)
 		goto done;
 
-	dev = avdtp_get_device(setup->session);
-
 	avdtp_stream_add_cb(setup->session, setup->stream,
 				stream_state_changed, setup->sep);
 
 	if (setup->sep->type == AVDTP_SEP_TYPE_SOURCE) {
-		service = btd_device_get_service(dev, A2DP_SINK_UUID);
 		sink_new_stream(service, setup->session, setup->stream);
 	} else {
-		service = btd_device_get_service(dev, A2DP_SOURCE_UUID);
 		source_new_stream(service, setup->session, setup->stream);
 	}
 
@@ -680,11 +760,10 @@ done:
 	return FALSE;
 }
 
-static void endpoint_setconf_cb(struct a2dp_setup *setup, gboolean ret)
+static void endpoint_setconf_cb(struct a2dp_setup *setup, uint8_t error_code)
 {
-	if (ret == FALSE)
-		setup_error_init(setup, AVDTP_MEDIA_CODEC,
-					AVDTP_UNSUPPORTED_CONFIGURATION);
+	if (error_code != 0)
+		setup_error_init(setup, AVDTP_MEDIA_CODEC, error_code);
 
 	auto_config(setup);
 	setup_unref(setup);
@@ -857,11 +936,11 @@ static gboolean endpoint_getcap_ind(struct avdtp *session,
 	return TRUE;
 }
 
-static void endpoint_open_cb(struct a2dp_setup *setup, gboolean ret)
+static void endpoint_open_cb(struct a2dp_setup *setup, uint8_t error_code)
 {
 	int err = error_to_errno(setup->err);
 
-	if (ret == FALSE) {
+	if (error_code != 0) {
 		setup->stream = NULL;
 		finalize_setup_errno(setup, -EPERM, finalize_config, NULL);
 		goto done;
@@ -995,10 +1074,20 @@ static void setconf_cfm(struct avdtp *session, struct avdtp_local_sep *sep,
 	struct btd_service *service;
 	int ret;
 
-	if (a2dp_sep->type == AVDTP_SEP_TYPE_SINK)
+	dev = avdtp_get_device(session);
+
+	if (a2dp_sep->type == AVDTP_SEP_TYPE_SINK) {
 		DBG("Sink %p: Set_Configuration_Cfm", sep);
-	else
+		service = btd_device_get_service(dev, A2DP_SOURCE_UUID);
+	} else {
 		DBG("Source %p: Set_Configuration_Cfm", sep);
+		service = btd_device_get_service(dev, A2DP_SINK_UUID);
+	}
+
+	if (service == NULL) {
+		error("Unable to find btd service");
+		return;
+	}
 
 	setup = find_setup_by_session(session);
 
@@ -1024,14 +1113,10 @@ static void setconf_cfm(struct avdtp *session, struct avdtp_local_sep *sep,
 	if (!setup)
 		return;
 
-	dev = avdtp_get_device(session);
-
 	/* Notify D-Bus interface of the new stream */
 	if (a2dp_sep->type == AVDTP_SEP_TYPE_SOURCE) {
-		service = btd_device_get_service(dev, A2DP_SINK_UUID);
 		sink_new_stream(service, session, setup->stream);
 	} else {
-		service = btd_device_get_service(dev, A2DP_SOURCE_UUID);
 		source_new_stream(service, session, setup->stream);
 	}
 

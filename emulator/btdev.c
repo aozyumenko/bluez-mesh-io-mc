@@ -27,8 +27,8 @@
 
 #include <glib.h>
 
-#include "lib/bluetooth.h"
-#include "lib/hci.h"
+#include "bluetooth/bluetooth.h"
+#include "bluetooth/hci.h"
 
 #include "src/shared/util.h"
 #include "src/shared/timeout.h"
@@ -273,7 +273,7 @@ struct inquiry_data {
 	int iter;
 };
 
-#define DEFAULT_INQUIRY_INTERVAL 100 /* 100 miliseconds */
+#define DEFAULT_INQUIRY_INTERVAL 100 /* 100 milliseconds */
 
 #define MAX_BTDEV_ENTRIES 16
 
@@ -4273,7 +4273,7 @@ static int cmd_set_rl_enable(struct btdev *dev, const void *data, uint8_t len)
 	 * • an HCI_LE_Create_Connection, HCI_LE_Extended_Create_Connection,
 	 * or HCI_LE_Periodic_Advertising_Create_Sync command is outstanding.
 	 */
-	if (dev->le_adv_enable || dev->le_scan_enable)
+	if ((dev->le_adv_enable && !dev->le_pa_enable) || dev->le_scan_enable)
 		return -EPERM;
 
 	/* Valid range for address resolution enable is 0x00 to 0x01 */
@@ -4789,9 +4789,17 @@ static bool match_ext_adv_handle(const void *data, const void *match_data)
 	return ext_adv->handle == handle;
 }
 
+static bool match_ext_adv_enable(const void *data, const void *match_data)
+{
+	const struct le_ext_adv *ext_adv = data;
+
+	return ext_adv->enable;
+}
+
 static void ext_adv_disable(void *data, void *user_data)
 {
 	struct le_ext_adv *ext_adv = data;
+	struct btdev *btdev = ext_adv->dev;
 	uint8_t handle = PTR_TO_UINT(user_data);
 
 	if (handle && ext_adv->handle != handle)
@@ -4807,6 +4815,13 @@ static void ext_adv_disable(void *data, void *user_data)
 	}
 
 	ext_adv->enable = 0x00;
+
+	/* Consider le_adv_enable disabled if all advertising sets are
+	 * disabled.
+	 */
+	ext_adv = queue_find(btdev->le_ext_adv, match_ext_adv_enable, NULL);
+	if (!ext_adv)
+		btdev->le_adv_enable = 0x00;
 }
 
 static bool ext_adv_is_connectable(struct le_ext_adv *ext_adv)
@@ -6417,9 +6432,51 @@ static int cmd_reject_cis(struct btdev *dev, const void *data, uint8_t len)
 
 static int cmd_create_big(struct btdev *dev, const void *data, uint8_t len)
 {
-	cmd_status(dev, BT_HCI_ERR_SUCCESS, BT_HCI_CMD_LE_CREATE_BIG);
+	const struct bt_hci_cmd_le_big_create_sync *cmd = data;
+	uint8_t status = BT_HCI_ERR_SUCCESS;
+
+	/* If the Advertising_Handle does not identify a periodic advertising
+	 * train,, the Controller shall return the error code Unknown
+	 * Advertising Identifier (0x42).
+	 */
+	if (!dev->le_pa_enable) {
+		status = BT_HCI_ERR_UNKNOWN_ADVERTISING_ID;
+		goto done;
+	}
+
+	/* If the Host sends this command with a BIG_Handle that is already
+	 * allocated, the Controller shall return the error code Command
+	 * Disallowed (0x0C).
+	 */
+	if (queue_find(dev->le_big, match_big_handle,
+				UINT_TO_PTR(cmd->handle))) {
+		status = BT_HCI_ERR_COMMAND_DISALLOWED;
+		goto done;
+	}
+
+done:
+	cmd_status(dev, status, BT_HCI_CMD_LE_CREATE_BIG);
 
 	return 0;
+}
+
+static struct le_big *le_big_new(struct btdev *btdev, uint8_t handle)
+{
+	struct le_big *big;
+
+	big = new0(struct le_big, 1);
+
+	big->dev = btdev;
+	big->handle = handle;
+	big->bis = queue_new();
+
+	/* Add to queue */
+	if (!queue_push_tail(btdev->le_big, big)) {
+		le_big_free(big);
+		return NULL;
+	}
+
+	return big;
 }
 
 static int cmd_create_big_complete(struct btdev *dev, const void *data,
@@ -6427,6 +6484,7 @@ static int cmd_create_big_complete(struct btdev *dev, const void *data,
 {
 	const struct bt_hci_cmd_le_create_big *cmd = data;
 	const struct bt_hci_bis *bis = &cmd->bis;
+	struct le_big *big;
 	int i;
 	struct bt_hci_evt_le_big_complete evt;
 	uint16_t *bis_handle;
@@ -6439,6 +6497,16 @@ static int cmd_create_big_complete(struct btdev *dev, const void *data,
 	if (!pdu)
 		return -ENOMEM;
 
+	/* If the Controller cannot create all BISes of the BIG or if Num_BIS
+	 * exceeds the maximum value supported by the Controller, then it shall
+	 * return the error code Rejected due to Limited Resources (0x0D).
+	 */
+	big = le_big_new(dev, cmd->handle);
+	if (!big) {
+		evt.status = BT_HCI_ERR_MEM_CAPACITY_EXCEEDED;
+		goto done;
+	}
+
 	bis_handle = (uint16_t *)(pdu + sizeof(evt));
 
 	memset(&evt, 0, sizeof(evt));
@@ -6448,10 +6516,13 @@ static int cmd_create_big_complete(struct btdev *dev, const void *data,
 
 		conn = conn_add_bis(dev, ISO_HANDLE + i, bis);
 		if (!conn) {
+			queue_remove(dev->le_big, big);
+			le_big_free(big);
 			evt.status = BT_HCI_ERR_MEM_CAPACITY_EXCEEDED;
 			goto done;
 		}
 
+		queue_push_tail(big->bis, conn);
 		*bis_handle = cpu_to_le16(conn->handle);
 		bis_handle++;
 	}
@@ -6482,9 +6553,35 @@ static int cmd_create_big_test(struct btdev *dev, const void *data, uint8_t len)
 
 static int cmd_term_big(struct btdev *dev, const void *data, uint8_t len)
 {
-	cmd_status(dev, BT_HCI_ERR_SUCCESS, BT_HCI_CMD_LE_TERM_BIG);
+	const struct bt_hci_cmd_le_term_big *cmd = data;
+	struct le_big *big;
+	uint8_t status = BT_HCI_ERR_SUCCESS;
+
+	/* If the BIG_Handle does not identify a BIG, the Controller shall
+	 * return the error code Unknown Advertising Identifier (0x42).
+	 */
+	big = queue_find(dev->le_big, match_big_handle,
+			UINT_TO_PTR(cmd->handle));
+	if (!big) {
+		status = BT_HCI_ERR_UNKNOWN_ADVERTISING_ID;
+		goto done;
+	}
+
+done:
+	cmd_status(dev, status, BT_HCI_CMD_LE_TERM_BIG);
+
+	if (status)
+		return -EALREADY;
 
 	return 0;
+}
+
+static bool match_bis(const void *data, const void *match_data)
+{
+	const struct le_big *big = data;
+	const struct btdev_conn *conn = match_data;
+
+	return queue_find(big->bis, NULL, conn);
 }
 
 static int cmd_term_big_complete(struct btdev *dev, const void *data,
@@ -6492,12 +6589,53 @@ static int cmd_term_big_complete(struct btdev *dev, const void *data,
 {
 	const struct bt_hci_cmd_le_term_big *cmd = data;
 	struct bt_hci_evt_le_big_terminate rsp;
+	struct le_big *big;
+	struct btdev_conn *conn;
+	struct btdev *remote = NULL;
 
 	memset(&rsp, 0, sizeof(rsp));
 	rsp.reason = cmd->reason;
 	rsp.handle = cmd->handle;
 
 	le_meta_event(dev, BT_HCI_EVT_LE_BIG_TERMINATE, &rsp, sizeof(rsp));
+
+	big = queue_find(dev->le_big, match_big_handle,
+			UINT_TO_PTR(cmd->handle));
+
+	if (!big)
+		return 0;
+
+	/* Cleanup existing connections */
+	while ((conn = queue_pop_head(big->bis))) {
+		if (!conn->link) {
+			conn_remove(conn);
+			continue;
+		}
+
+		/* Send BIG Sync Lost event once per remote device */
+		if (conn->link->dev != remote) {
+			struct bt_hci_evt_le_big_sync_lost evt;
+
+			remote = conn->link->dev;
+
+			big = queue_find(remote->le_big, match_bis, conn->link);
+			if (big) {
+				memset(&evt, 0, sizeof(evt));
+				evt.big_handle = big->handle;
+				evt.reason = cmd->reason;
+				le_meta_event(remote,
+						BT_HCI_EVT_LE_BIG_SYNC_LOST,
+						&evt, sizeof(evt));
+			}
+		}
+
+		/* Unlink conn from remote BIS */
+		conn_unlink(conn, conn->link);
+		conn_remove(conn);
+	}
+
+	queue_remove(dev->le_big, big);
+	le_big_free(big);
 
 	return 0;
 }
@@ -6538,25 +6676,6 @@ done:
 	cmd_status(dev, status, BT_HCI_CMD_LE_BIG_CREATE_SYNC);
 
 	return 0;
-}
-
-static struct le_big *le_big_new(struct btdev *btdev, uint8_t handle)
-{
-	struct le_big *big;
-
-	big = new0(struct le_big, 1);
-
-	big->dev = btdev;
-	big->handle = handle;
-	big->bis = queue_new();
-
-	/* Add to queue */
-	if (!queue_push_tail(btdev->le_big, big)) {
-		le_big_free(big);
-		return NULL;
-	}
-
-	return big;
 }
 
 static int cmd_big_create_sync_complete(struct btdev *dev, const void *data,
@@ -7550,6 +7669,8 @@ static const struct btdev_cmd *run_cmd(struct btdev *btdev,
 	case -ENOENT:
 		status = BT_HCI_ERR_UNKNOWN_CONN_ID;
 		break;
+	case -EALREADY:
+		return NULL;
 	default:
 		status = BT_HCI_ERR_UNSPECIFIED_ERROR;
 		break;

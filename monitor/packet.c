@@ -28,10 +28,10 @@
 #include <sys/socket.h>
 #include <limits.h>
 
-#include "lib/bluetooth.h"
-#include "lib/uuid.h"
-#include "lib/hci.h"
-#include "lib/hci_lib.h"
+#include "bluetooth/bluetooth.h"
+#include "bluetooth/uuid.h"
+#include "bluetooth/hci.h"
+#include "bluetooth/hci_lib.h"
 
 #include "src/shared/util.h"
 #include "src/shared/btsnoop.h"
@@ -240,6 +240,14 @@ static struct index_buf_pool *get_pool(uint16_t index, uint8_t type)
 	return NULL;
 }
 
+static void print_unacked_frame(void *data, void *user_data)
+{
+	struct packet_frame *frame = data;
+	int *i = user_data;
+
+	print_field("[%d]#%zu unacked", (*i)++, frame->num);
+}
+
 static struct packet_conn_data *release_handle(uint16_t handle)
 {
 	int i;
@@ -254,8 +262,13 @@ static struct packet_conn_data *release_handle(uint16_t handle)
 				conn->destroy(conn, conn->data);
 
 			pool = get_pool(conn->index, conn->type);
-			if (pool)
+			if (pool) {
+				int i = 0;
+
+				queue_foreach(conn->tx_q, print_unacked_frame,
+						&i);
 				pool->tx -= queue_length(conn->tx_q);
+			}
 
 			queue_destroy(conn->tx_q, free);
 			queue_destroy(conn->chan_q, free);
@@ -3184,7 +3197,7 @@ static const struct bitfield_data events_le_table[] = {
 	{ 25, "LE CIS Request"				},
 	{ 26, "LE Create BIG Complete"			},
 	{ 27, "LE Terminate BIG Complete"		},
-	{ 28, "LE BIG Sync Estabilished Complete"	},
+	{ 28, "LE BIG Sync Established Complete"	},
 	{ 29, "LE BIG Sync Lost"			},
 	{ 30, "LE Request Peer SCA Complete"},
 	{ 31, "LE Path Loss Threshold"		},
@@ -3486,7 +3499,7 @@ static void print_base_annoucement(const uint8_t *data, uint8_t data_len)
 		goto done;
 
 	/* Level 1 - BASE */
-	print_field("  Presetation Delay: %u", get_le24(base_data->pd));
+	print_field("  Presentation Delay: %u", get_le24(base_data->pd));
 	print_field("  Number of Subgroups: %u", base_data->num_subgroups);
 
 	/* Level 2 - Subgroups*/
@@ -9776,7 +9789,7 @@ static const struct opcode_data opcode_table[] = {
 	{ 0x043b, 174, "Logical Link Cancel",
 				logic_link_cancel_cmd, 2, true,
 				logic_link_cancel_rsp, 3, true },
-	{ 0x043c, 175, "Flow Specifcation Modify",
+	{ 0x043c, 175, "Flow Specification Modify",
 				flow_spec_modify_cmd, 34, true },
 	{ 0x043d, 235, "Enhanced Setup Synchronous Connection",
 				enhanced_setup_sync_conn_cmd, 59, true },
@@ -11209,8 +11222,10 @@ static void packet_dequeue_tx(struct timeval *tv, uint16_t handle)
 	}
 
 	frame = queue_pop_head(conn->tx_q);
-	if (!frame)
+	if (!frame) {
+		print_field("#(frame not found)");
 		return;
+	}
 
 	timersub(tv, &frame->tv, &delta);
 
@@ -11599,7 +11614,7 @@ static void keypress_notify_evt(struct timeval *tv, uint16_t index,
 		str = "Passkey digit erased";
 		break;
 	case 0x03:
-		str = "Passkey clared";
+		str = "Passkey cleared";
 		break;
 	case 0x04:
 		str = "Passkey entry completed";
@@ -13290,7 +13305,7 @@ static const struct subevent_data le_meta_event_table[] = {
 				sizeof(struct bt_hci_evt_le_big_terminate) },
 	{ BT_HCI_EVT_LE_BIG_SYNC_ESTABILISHED,
 				"LE Broadcast Isochronous Group Sync "
-				"Estabilished", le_big_sync_estabilished_evt,
+				"Established", le_big_sync_estabilished_evt,
 				sizeof(struct bt_hci_evt_le_big_sync_lost) },
 	{ BT_HCI_EVT_LE_BIG_SYNC_LOST,
 				"LE Broadcast Isochronous Group Sync Lost",
@@ -14050,9 +14065,10 @@ void packet_hci_isodata(struct timeval *tv, struct ucred *cred, uint16_t index,
 				bool in, const void *data, uint16_t size)
 {
 	const struct bt_hci_iso_hdr *hdr = data;
+	const struct bt_hci_iso_data_start *start;
 	uint16_t handle = le16_to_cpu(hdr->handle);
 	uint8_t flags = acl_flags(handle);
-	char handle_str[22], extra_str[32];
+	char handle_str[36], extra_str[33];
 	struct index_buf_pool *pool = &index_list[index].iso;
 
 	if (index >= MAX_INDEX) {
@@ -14062,27 +14078,32 @@ void packet_hci_isodata(struct timeval *tv, struct ucred *cred, uint16_t index,
 
 	index_list[index].frame++;
 
-	if (size < sizeof(*hdr)) {
-		if (in)
-			print_packet(tv, cred, '*', index, NULL, COLOR_ERROR,
-				"Malformed ISO Data RX packet", NULL, NULL);
-		else
-			print_packet(tv, cred, '*', index, NULL, COLOR_ERROR,
-				"Malformed ISO Data TX packet", NULL, NULL);
-		packet_hexdump(data, size);
-		return;
-	}
+	if (size < sizeof(*hdr))
+		goto malformed;
 
 	data += sizeof(*hdr);
 	size -= sizeof(*hdr);
 
-	if (!in && pool->total)
-		sprintf(handle_str, "Handle %d [%u/%u]", acl_handle(handle),
-			++pool->tx, pool->total);
-	else
-		sprintf(handle_str, "Handle %d", acl_handle(handle));
+	/* Detect if timestamp field is preset */
+	if (iso_flags_ts(flags)) {
+		if (size < sizeof(uint32_t))
+			goto malformed;
 
-	sprintf(extra_str, "flags 0x%2.2x dlen %d", flags, hdr->dlen);
+		data += sizeof(uint32_t);
+		size -= sizeof(uint32_t);
+	}
+
+	start = data;
+
+	if (!in && pool->total)
+		sprintf(handle_str, "Handle %d [%u/%u] SN %u",
+			acl_handle(handle), ++pool->tx, pool->total, start->sn);
+	else
+		sprintf(handle_str, "Handle %u SN %u", acl_handle(handle),
+			start->sn);
+
+	sprintf(extra_str, "flags 0x%2.2x dlen %u slen %u", flags, hdr->dlen,
+		start->slen);
 
 	print_packet(tv, cred, in ? '>' : '<', index, NULL, COLOR_HCI_ISODATA,
 				in ? "ISO Data RX" : "ISO Data TX",
@@ -14101,6 +14122,17 @@ void packet_hci_isodata(struct timeval *tv, struct ucred *cred, uint16_t index,
 
 	if (filter_mask & PACKET_FILTER_SHOW_ISO_DATA)
 		packet_hexdump(data, size);
+
+	return;
+
+malformed:
+	if (in)
+		print_packet(tv, cred, '*', index, NULL, COLOR_ERROR,
+				"Malformed ISO Data RX packet", NULL, NULL);
+	else
+		print_packet(tv, cred, '*', index, NULL, COLOR_ERROR,
+				"Malformed ISO Data TX packet", NULL, NULL);
+	packet_hexdump(data, size);
 }
 
 void packet_ctrl_open(struct timeval *tv, struct ucred *cred, uint16_t index,

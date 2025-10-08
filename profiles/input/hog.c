@@ -24,9 +24,9 @@
 
 #include <glib.h>
 
-#include "lib/bluetooth.h"
-#include "lib/sdp.h"
-#include "lib/uuid.h"
+#include "bluetooth/bluetooth.h"
+#include "bluetooth/sdp.h"
+#include "bluetooth/uuid.h"
 
 #include "src/log.h"
 #include "src/adapter.h"
@@ -259,7 +259,7 @@ static void hog_read_config(void)
 	if (!err) {
 		DBG("input.conf: UserspaceHID=%s", uhid_enabled);
 		uhid_state_persist = strcasecmp(uhid_enabled, "persist") == 0;
-		free(uhid_enabled);
+		g_free(uhid_enabled);
 	} else
 		g_clear_error(&err);
 

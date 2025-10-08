@@ -16,10 +16,10 @@
 #include <stdbool.h>
 #include <stdlib.h>
 
-#include "lib/bluetooth.h"
-#include "lib/sdp.h"
-#include "lib/sdp_lib.h"
-#include "lib/uuid.h"
+#include "bluetooth/bluetooth.h"
+#include "bluetooth/sdp.h"
+#include "bluetooth/sdp_lib.h"
+#include "bluetooth/uuid.h"
 
 #include "src/log.h"
 #include "src/plugin.h"
@@ -101,7 +101,7 @@ static int input_init(void)
 		if (!err) {
 			DBG("input.conf: UserspaceHID=%s", uhid_enabled);
 			input_set_userspace_hid(uhid_enabled);
-			free(uhid_enabled);
+			g_free(uhid_enabled);
 		} else
 			g_clear_error(&err);
 

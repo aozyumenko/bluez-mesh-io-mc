@@ -21,8 +21,8 @@
 
 #include <glib.h>
 
-#include "lib/bluetooth.h"
-#include "lib/uuid.h"
+#include "bluetooth/bluetooth.h"
+#include "bluetooth/uuid.h"
 #include "src/shared/util.h"
 #include "src/shared/io.h"
 #include "src/shared/tester.h"
@@ -419,7 +419,7 @@ static void gatt_notify_cb(struct gatt_db_attribute *attrib,
 }
 
 static void gatt_ccc_read_cb(struct gatt_db_attribute *attrib,
-					unsigned int id, uint16_t offest,
+					unsigned int id, uint16_t offset,
 					uint8_t opcode, struct bt_att *att,
 					void *user_data)
 {

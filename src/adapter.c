@@ -34,8 +34,8 @@
 #include "bluetooth/hci_lib.h"
 #include "bluetooth/sdp.h"
 #include "bluetooth/sdp_lib.h"
-#include "lib/uuid.h"
-#include "lib/mgmt.h"
+#include "bluetooth/uuid.h"
+#include "bluetooth/mgmt.h"
 
 #include "gdbus/gdbus.h"
 
@@ -238,7 +238,7 @@ struct service_auth {
 
 struct btd_adapter_pin_cb_iter {
 	GSList *it;			/* current callback function */
-	unsigned int attempt;		/* numer of times it() was called */
+	unsigned int attempt;		/* number of times it() was called */
 	/* When the iterator reaches the end, it is NULL and attempt is 0 */
 };
 
@@ -1655,7 +1655,8 @@ static void stop_passive_scanning(struct btd_adapter *adapter)
 	DBG("");
 
 	/* If there are any normal discovery clients passive scanning
-	 * wont be running */
+	 * won't be running
+	 */
 	if (adapter->discovery_list)
 		return;
 
@@ -2267,7 +2268,7 @@ static int merge_discovery_filters(struct btd_adapter *adapter, int *rssi,
 		*rssi = HCI_RSSI_INVALID;
 
 	/*
-	 * Empty_uuid variable determines wether there was any filter with no
+	 * Empty_uuid variable determines whether there was any filter with no
 	 * uuids. In this case someone might be looking for all devices in
 	 * certain proximity, and we need to have empty uuids in kernel filter.
 	 */
@@ -2282,7 +2283,7 @@ static int merge_discovery_filters(struct btd_adapter *adapter, int *rssi,
 
 		/*
 		 * It there is both regular and filtered scan running, then
-		 * clear whole fitler to report all devices.
+		 * clear whole filter to report all devices.
 		 */
 		*transport = adapter_scan_type;
 		*rssi = HCI_RSSI_INVALID;
@@ -2314,7 +2315,7 @@ static void populate_mgmt_filter_uuids(uint8_t (*mgmt_uuids)[16], GSList *uuids)
 /*
  * This method merges all adapter filters into one that will be send to kernel.
  * cp_ptr is set to null when regular non-filtered discovery is needed,
- * otherwise it's pointing to filter. Returns 0 on succes, -1 on error
+ * otherwise it's pointing to filter. Returns 0 on success, -1 on error
  */
 static int discovery_filter_to_mgmt_cp(struct btd_adapter *adapter,
 		       struct mgmt_cp_start_service_discovery **cp_ptr)
@@ -4325,7 +4326,7 @@ static void set_privacy_complete(uint8_t status, uint16_t length,
 		return;
 	}
 
-	DBG("Successfuly set privacy for index %u", adapter->dev_id);
+	DBG("Successfully set privacy for index %u", adapter->dev_id);
 }
 
 static int set_privacy(struct btd_adapter *adapter, uint8_t privacy)
@@ -5090,7 +5091,7 @@ static void load_devices(struct btd_adapter *adapter)
 			goto free;
 
 		if (irk_info)
-			device_set_rpa(device, true);
+			device_set_privacy(device, true, irk_info->val);
 
 		btd_device_set_temporary(device, false);
 		adapter_add_device(adapter, device);
@@ -5706,7 +5707,7 @@ void adapter_auto_connect_add(struct btd_adapter *adapter,
 	bdaddr_type = btd_device_get_bdaddr_type(device);
 
 	if (bdaddr_type == BDADDR_BREDR) {
-		DBG("auto-connection feature is not avaiable for BR/EDR");
+		DBG("auto-connection feature is not available for BR/EDR");
 		return;
 	}
 
@@ -5751,7 +5752,7 @@ void adapter_set_device_flags(struct btd_adapter *adapter,
 
 	/* Set Address Resolution if it has not been set the flag yet. */
 	if (ll_privacy && btd_opts.defaults.le.addr_resolution &&
-			device_address_is_private(device) &&
+			device_get_privacy(device) &&
 			!(flags & DEVICE_FLAG_ADDRESS_RESOLUTION))
 		flags |= DEVICE_FLAG_ADDRESS_RESOLUTION & supported & ~pending;
 
@@ -5838,7 +5839,7 @@ void adapter_auto_connect_remove(struct btd_adapter *adapter,
 	bdaddr_type = btd_device_get_bdaddr_type(device);
 
 	if (bdaddr_type == BDADDR_BREDR) {
-		DBG("auto-connection feature is not avaiable for BR/EDR");
+		DBG("auto-connection feature is not available for BR/EDR");
 		return;
 	}
 
@@ -7238,8 +7239,10 @@ static bool device_is_discoverable(struct btd_adapter *adapter,
 
 	if (bdaddr_type == BDADDR_BREDR || adapter->filtered_discovery)
 		discoverable = true;
-	else
+	else if (btd_opts.filter_discoverable)
 		discoverable = eir->flags & (EIR_LIM_DISC | EIR_GEN_DISC);
+	else
+		discoverable = true;
 
 	/*
 	 * Mark as not discoverable if no client has requested discovery and
@@ -8457,7 +8460,7 @@ static void bonding_attempt_complete(struct btd_adapter *adapter,
 		device = btd_adapter_find_device(adapter, bdaddr, addr_type);
 
 	if (status == MGMT_STATUS_AUTH_FAILED && adapter->pincode_requested) {
-		/* On faliure, issue a bonding_retry if possible. */
+		/* On failure, issue a bonding_retry if possible. */
 		if (device != NULL) {
 			if (device_bonding_attempt_retry(device) == 0)
 				return;
@@ -8618,7 +8621,8 @@ static void disconnect_complete(uint8_t status, uint16_t length,
 	const struct mgmt_rp_disconnect *rp = param;
 	struct btd_adapter *adapter = user_data;
 
-	if (status == MGMT_STATUS_NOT_CONNECTED) {
+	if (status == MGMT_STATUS_NOT_CONNECTED ||
+		status == MGMT_STATUS_DISCONNECTED) {
 		btd_warn(adapter->dev_id,
 				"Disconnecting failed: already disconnected");
 	} else if (status != MGMT_STATUS_SUCCESS) {
@@ -9020,7 +9024,7 @@ static void new_irk_callback(uint16_t index, uint16_t length,
 		return;
 	}
 
-	device_update_addr(device, &addr->bdaddr, addr->type);
+	device_update_addr(device, &addr->bdaddr, addr->type, irk->val);
 
 	if (duplicate)
 		device_merge_duplicate(device, duplicate);
@@ -10017,7 +10021,7 @@ static void exp_debug_func(struct btd_adapter *adapter, uint8_t action)
 	cp.action = action;
 
 	if (exp_mgmt_send(adapter, MGMT_OP_SET_EXP_FEATURE,
-			adapter->dev_id, sizeof(cp), &cp,
+			MGMT_INDEX_NONE, sizeof(cp), &cp,
 			set_exp_debug_complete))
 		return;
 
@@ -10322,7 +10326,7 @@ static void read_info_complete(uint8_t status, uint16_t length,
 	case BT_MODE_BREDR:
 		if (!(adapter->supported_settings & MGMT_SETTING_BREDR)) {
 			btd_error(adapter->dev_id,
-				"Ignoring adapter withouth BR/EDR support");
+				"Ignoring adapter without BR/EDR support");
 			goto failed;
 		}
 
@@ -10336,7 +10340,7 @@ static void read_info_complete(uint8_t status, uint16_t length,
 	case BT_MODE_LE:
 		if (!(adapter->supported_settings & MGMT_SETTING_LE)) {
 			btd_error(adapter->dev_id,
-				"Ignoring adapter withouth LE support");
+				"Ignoring adapter without LE support");
 			goto failed;
 		}
 
@@ -10514,7 +10518,7 @@ failed:
 	 * Remove adapter from list in case of a failure.
 	 *
 	 * Leaving an adapter structure around for a controller that can
-	 * not be initilized makes no sense at the moment.
+	 * not be initialized makes no sense at the moment.
 	 *
 	 * This is a simplification to avoid constant checks if the
 	 * adapter is ready to do anything.

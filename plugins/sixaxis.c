@@ -26,9 +26,9 @@
 #include <glib.h>
 #include <libudev.h>
 
-#include "lib/bluetooth.h"
-#include "lib/sdp.h"
-#include "lib/uuid.h"
+#include "bluetooth/bluetooth.h"
+#include "bluetooth/sdp.h"
+#include "bluetooth/uuid.h"
 
 #include "src/adapter.h"
 #include "src/device.h"
@@ -300,11 +300,11 @@ static void agent_auth_cb(DBusError *derr, void *user_data)
 	if (closure->type == CABLE_PAIRING_SIXAXIS) {
 		btd_device_set_record(closure->device, HID_UUID,
 						 SIXAXIS_HID_SDP_RECORD);
-
-		device_set_cable_pairing(closure->device, true);
-
-		server_set_cable_pairing(adapter_bdaddr, true);
 	}
+
+	device_set_cable_pairing(closure->device, true);
+
+	server_set_cable_pairing(adapter_bdaddr, true);
 
 	ba2str(&closure->bdaddr, device_addr);
 	ba2str(&central_bdaddr, central_addr);

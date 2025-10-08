@@ -25,11 +25,11 @@
 
 #include <glib.h>
 
-#include "lib/bluetooth.h"
-#include "lib/l2cap.h"
-#include "lib/rfcomm.h"
-#include "lib/sco.h"
-#include "lib/iso.h"
+#include "bluetooth/bluetooth.h"
+#include "bluetooth/l2cap.h"
+#include "bluetooth/rfcomm.h"
+#include "bluetooth/sco.h"
+#include "bluetooth/iso.h"
 
 #include "btio.h"
 
@@ -471,6 +471,12 @@ static gboolean set_sec_level(int sock, BtIOType type, int level, GError **err)
 
 	if (errno != ENOPROTOOPT) {
 		ERROR_FAILED(err, "setsockopt(BT_SECURITY)", errno);
+		return FALSE;
+	}
+
+	if (level == BT_SECURITY_FIPS) {
+		g_set_error(err, BT_IO_ERROR, EINVAL, "setsockopt(LM): "
+				"FIPS security level is not supported");
 		return FALSE;
 	}
 
@@ -1659,9 +1665,13 @@ static bool get_bc_sid(int sock, uint8_t *sid, GError **err)
 
 	olen = sizeof(addr);
 	memset(&addr, 0, olen);
-	if (getpeername(sock, (void *)&addr, &olen) < 0 ||
-				olen != sizeof(addr)) {
+	if (getpeername(sock, (void *)&addr, &olen) < 0) {
 		ERROR_FAILED(err, "getpeername", errno);
+		return false;
+	}
+
+	if (olen != sizeof(addr)) {
+		ERROR_FAILED(err, "getpeername: size mismatch", EINVAL);
 		return false;
 	}
 

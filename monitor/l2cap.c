@@ -19,8 +19,8 @@
 #include <string.h>
 #include <inttypes.h>
 
-#include "lib/bluetooth.h"
-#include "lib/uuid.h"
+#include "bluetooth/bluetooth.h"
+#include "bluetooth/uuid.h"
 
 #include "src/shared/util.h"
 #include "src/shared/queue.h"
@@ -2283,7 +2283,7 @@ static void smp_pairing_confirm(const struct l2cap_frame *frame)
 {
 	const struct bt_l2cap_smp_pairing_confirm *pdu = frame->data;
 
-	print_hex_field("Confim value", pdu->value, 16);
+	print_hex_field("Confirm value", pdu->value, 16);
 }
 
 static void smp_pairing_random(const struct l2cap_frame *frame)

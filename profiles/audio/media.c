@@ -31,10 +31,10 @@
 
 #include <glib.h>
 
-#include "lib/bluetooth.h"
-#include "lib/sdp.h"
-#include "lib/uuid.h"
-#include "lib/mgmt.h"
+#include "bluetooth/bluetooth.h"
+#include "bluetooth/sdp.h"
+#include "bluetooth/uuid.h"
+#include "bluetooth/mgmt.h"
 
 #include "gdbus/gdbus.h"
 
@@ -142,7 +142,6 @@ struct media_player {
 	char			*status;
 	uint32_t		position;
 	uint32_t		duration;
-	int8_t			volume;
 	GTimer			*timer;
 	bool			play;
 	bool			pause;
@@ -334,7 +333,7 @@ static void endpoint_reply(DBusPendingCall *call, void *user_data)
 	DBusMessage *reply;
 	DBusMessageIter args, props;
 	DBusError err;
-	gboolean value;
+	uint8_t error_code;
 	void *ret = NULL;
 	int size = -1;
 
@@ -357,8 +356,12 @@ static void endpoint_reply(DBusPendingCall *call, void *user_data)
 
 		if (dbus_message_is_method_call(request->msg,
 					MEDIA_ENDPOINT_INTERFACE,
-					"SetConfiguration"))
+					"SetConfiguration")) {
 			endpoint_remove_transport(endpoint, request->transport);
+			error_code = a2dp_parse_config_error(err.name);
+			ret = &error_code;
+			size = 1;
+		}
 
 		dbus_error_free(&err);
 		goto done;
@@ -391,8 +394,8 @@ static void endpoint_reply(DBusPendingCall *call, void *user_data)
 	}
 
 	size = 1;
-	value = TRUE;
-	ret = &value;
+	error_code = 0;
+	ret = &error_code;
 
 done:
 	dbus_message_unref(reply);
@@ -499,37 +502,6 @@ struct a2dp_config_data {
 	a2dp_endpoint_config_t cb;
 };
 
-int8_t media_player_get_device_volume(struct btd_device *device)
-{
-#ifdef HAVE_AVRCP
-	struct avrcp_player *target_player;
-	struct media_adapter *adapter;
-	GSList *l;
-
-	if (!device)
-		return -1;
-
-	target_player = avrcp_get_target_player_by_device(device);
-	if (!target_player)
-		goto done;
-
-	adapter = find_adapter(device);
-	if (!adapter)
-		goto done;
-
-	for (l = adapter->players; l; l = l->next) {
-		struct media_player *mp = l->data;
-
-		if (mp->player == target_player)
-			return mp->volume;
-	}
-
-done:
-#endif /* HAVE_AVRCP */
-	/* If media_player doesn't exists use device_volume */
-	return btd_device_get_volume(device);
-}
-
 static gboolean set_configuration(struct media_endpoint *endpoint,
 					uint8_t *configuration, size_t size,
 					media_endpoint_cb_t cb,
@@ -556,7 +528,7 @@ static gboolean set_configuration(struct media_endpoint *endpoint,
 	if (transport == NULL)
 		return FALSE;
 
-	init_volume = media_player_get_device_volume(device);
+	init_volume = btd_device_get_volume(device);
 	media_transport_update_volume(transport, init_volume);
 
 	msg = dbus_message_new_method_call(endpoint->sender, endpoint->path,
@@ -666,9 +638,9 @@ static void config_cb(struct media_endpoint *endpoint, void *ret, int size,
 							void *user_data)
 {
 	struct a2dp_config_data *data = user_data;
-	gboolean *ret_value = ret;
+	uint8_t *ret_value = ret;
 
-	data->cb(data->setup, ret_value ? *ret_value : FALSE);
+	data->cb(data->setup, ret_value ? *ret_value : 1);
 }
 
 static int set_config(struct a2dp_sep *sep, uint8_t *configuration,
@@ -1063,8 +1035,11 @@ static int pac_select(struct bt_bap_pac *lpac, struct bt_bap_pac *rpac,
 
 	dbus_message_iter_close_container(&iter, &dict);
 
-	return media_endpoint_async_call(msg, endpoint, NULL, pac_select_cb,
-								data, free);
+	if (!media_endpoint_async_call(msg, endpoint, NULL, pac_select_cb,
+								data, free))
+		return -EIO;
+
+	return 0;
 }
 
 static void pac_cancel_select(struct bt_bap_pac *lpac, bt_bap_pac_select_t cb,
@@ -1127,7 +1102,7 @@ static void pac_config_cb(struct media_endpoint *endpoint, void *ret, int size,
 							void *user_data)
 {
 	struct pac_config_data *data = user_data;
-	gboolean *ret_value = ret;
+	uint8_t *error_code = ret;
 	struct media_transport *transport;
 
 	/* If transport was cleared, configuration was cancelled */
@@ -1135,7 +1110,7 @@ static void pac_config_cb(struct media_endpoint *endpoint, void *ret, int size,
 	if (!transport)
 		return;
 
-	data->cb(data->stream, ret_value ? 0 : -EINVAL);
+	data->cb(data->stream, (error_code && *error_code == 0) ? 0 : -EINVAL);
 }
 
 static struct media_transport *pac_ucast_config(struct bt_bap_stream *stream,
@@ -1205,22 +1180,25 @@ static int pac_config(struct bt_bap_stream *stream, struct iovec *cfg,
 	DBG("endpoint %p stream %p", endpoint, stream);
 
 	transport = find_transport(endpoint, stream);
-	if (!transport) {
-		switch (bt_bap_stream_get_type(stream)) {
-		case BT_BAP_STREAM_TYPE_UCAST:
-			transport = pac_ucast_config(stream, cfg, endpoint);
-			break;
-		case BT_BAP_STREAM_TYPE_BCAST:
-			transport = pac_bcast_config(stream, cfg, endpoint);
-			break;
-		}
+	if (transport)
+		clear_configuration(endpoint, transport);
 
-		if (!transport)
-			return -EINVAL;
-
-		endpoint->transports = g_slist_append(endpoint->transports,
-								transport);
+	switch (bt_bap_stream_get_type(stream)) {
+	case BT_BAP_STREAM_TYPE_UCAST:
+		transport = pac_ucast_config(stream, cfg, endpoint);
+		break;
+	case BT_BAP_STREAM_TYPE_BCAST:
+		transport = pac_bcast_config(stream, cfg, endpoint);
+		break;
+	default:
+		transport = NULL;
+		break;
 	}
+
+	if (!transport)
+		return -EINVAL;
+
+	endpoint->transports = g_slist_append(endpoint->transports, transport);
 
 	msg = dbus_message_new_method_call(endpoint->sender, endpoint->path,
 						MEDIA_ENDPOINT_INTERFACE,
@@ -1228,7 +1206,7 @@ static int pac_config(struct bt_bap_stream *stream, struct iovec *cfg,
 	if (msg == NULL) {
 		error("Couldn't allocate D-Bus message");
 		endpoint_remove_transport(endpoint, transport);
-		return FALSE;
+		return -ENOMEM;
 	}
 
 	data = new0(struct pac_config_data, 1);
@@ -1243,8 +1221,11 @@ static int pac_config(struct bt_bap_stream *stream, struct iovec *cfg,
 
 	g_dbus_get_properties(conn, path, "org.bluez.MediaTransport1", &iter);
 
-	return media_endpoint_async_call(msg, endpoint, transport,
-					pac_config_cb, data, free);
+	if (!media_endpoint_async_call(msg, endpoint, transport,
+						pac_config_cb, data, free))
+		return -EIO;
+
+	return 0;
 }
 
 static void pac_clear(struct bt_bap_stream *stream, void *user_data)
@@ -2067,17 +2048,6 @@ static uint32_t media_player_get_duration(void *user_data)
 	return mp->duration;
 }
 
-static void media_player_set_volume(int8_t volume, struct btd_device *dev,
-				    void *user_data)
-{
-	struct media_player *mp = user_data;
-
-	if (mp->volume == volume)
-		return;
-
-	mp->volume = volume;
-}
-
 static bool media_player_send(struct media_player *mp, const char *name)
 {
 	DBusMessage *msg;
@@ -2165,7 +2135,6 @@ static struct avrcp_player_cb player_cb = {
 	.get_duration = media_player_get_duration,
 	.get_status = media_player_get_status,
 	.get_name = media_player_get_player_name,
-	.set_volume = media_player_set_volume,
 	.play = media_player_play,
 	.stop = media_player_stop,
 	.pause = media_player_pause,
@@ -2648,7 +2617,6 @@ static struct media_player *media_player_create(struct media_adapter *adapter,
 	mp->sender = g_strdup(sender);
 	mp->path = g_strdup(path);
 	mp->timer = g_timer_new();
-	mp->volume = -1;
 
 	mp->watch = g_dbus_add_disconnect_watch(conn, sender,
 						media_player_exit, mp,

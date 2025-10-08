@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0
 AC_PREREQ(2.60)
-AC_INIT(bluez, 5.83)
+AC_INIT(bluez, 5.84)
 
 AM_INIT_AUTOMAKE([foreign subdir-objects color-tests silent-rules
 					tar-pax no-dist-gzip dist-xz])
@@ -83,14 +83,6 @@ AC_CHECK_DECLS([basename], [],
 
 
 PKG_CHECK_MODULES(GLIB, glib-2.0 >= 2.36)
-
-if (test "${enable_threads}" = "yes"); then
-	AC_DEFINE(NEED_THREADS, 1, [Define if threading support is required])
-	PKG_CHECK_MODULES(GTHREAD, gthread-2.0 >= 2.16)
-	GLIB_CFLAGS="$GLIB_CFLAGS $GTHREAD_CFLAGS"
-	GLIB_LIBS="$GLIB_LIBS $GTHREAD_LIBS"
-fi
-
 PKG_CHECK_MODULES(DBUS, dbus-1 >= 1.10)
 
 AC_ARG_WITH([dbusconfdir], AS_HELP_STRING([--with-dbusconfdir=DIR],
@@ -167,7 +159,7 @@ AC_ARG_ENABLE(test, AS_HELP_STRING([--enable-test],
 AM_CONDITIONAL(TEST, test "${enable_test}" = "yes")
 
 AC_ARG_ENABLE(nfc, AS_HELP_STRING([--enable-nfc],
-		[enable NFC paring]), [enable_nfc=${enableval}])
+		[enable NFC pairing]), [enable_nfc=${enableval}])
 AM_CONDITIONAL(NFC, test "${enable_nfc}" = "yes")
 
 AC_ARG_ENABLE(sap, AS_HELP_STRING([--enable-sap],
@@ -223,6 +215,9 @@ AM_CONDITIONAL(CCP, test "${enable_ccp}" != "no")
 AC_ARG_ENABLE(vcp, AS_HELP_STRING([--disable-vcp],
 		[disable VCP profile]), [enable_vcp=${enableval}])
 AM_CONDITIONAL(VCP, test "${enable_vcp}" != "no")
+if test "${enable_vcp}" != "no"; then
+	AC_DEFINE(HAVE_VCP, 1, [Define to 1 if you have VCP support.])
+fi
 
 AC_ARG_ENABLE(micp, AS_HELP_STRING([--disable-micp],
 		[disable MICP profile]), [enable_micp=${enableval}])
@@ -490,22 +485,6 @@ AC_SUBST(CONFIGDIR, "${configdir}")
 AC_DEFINE_UNQUOTED(MESH_STORAGEDIR, "${storagedir}/mesh",
 			[Directory for the mesh daemon storage files])
 AC_SUBST(MESH_STORAGEDIR, "${storagedir}/mesh")
-
-AC_ARG_ENABLE(android, AS_HELP_STRING([--enable-android],
-			[enable BlueZ for Android]),
-					[enable_android=${enableval}])
-AM_CONDITIONAL(ANDROID, test "${enable_android}" = "yes")
-
-if (test "${enable_android}" = "yes"); then
-	PKG_CHECK_MODULES(SBC, sbc >= 1.2)
-fi
-
-if (test "${enable_android}" = "yes"); then
-	PKG_CHECK_MODULES(SPEEXDSP, speexdsp >= 1.2)
-fi
-
-AC_DEFINE_UNQUOTED(ANDROID_STORAGEDIR, "${storagedir}/android",
-			[Directory for the Android daemon storage files])
 
 AC_ARG_WITH([phonebook], AS_HELP_STRING([--with-phonebook=PLUGIN],
 			[obexd phonebook plugin (default=dummy)]),

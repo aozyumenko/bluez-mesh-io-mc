@@ -19,6 +19,11 @@
 #include "src/shared/tester.h"
 #include "src/shared/util.h"
 
+struct session {
+	bool completed;
+	guint step;
+};
+
 struct context {
 	guint watch_id;
 	int fd_server;
@@ -27,6 +32,7 @@ struct context {
 	struct hfp_hf *hfp_hf;
 	const struct test_data *data;
 	unsigned int pdu_offset;
+	struct session session;
 };
 
 struct test_pdu {
@@ -104,6 +110,14 @@ struct test_data {
 		data.test_handler = test_hf_handler;			\
 	} while (0)
 
+static void print_debug(const char *str, void *user_data)
+{
+	const char *prefix = user_data;
+
+	if (tester_use_debug())
+		tester_debug("%s%s", prefix, str);
+}
+
 static void test_free(gconstpointer user_data)
 {
 	const struct test_data *data = user_data;
@@ -122,13 +136,13 @@ static void destroy_context(struct context *context)
 	if (context->watch_id)
 		g_source_remove(context->watch_id);
 
-	test_free(context->data);
-
 	if (context->hfp)
 		hfp_gw_unref(context->hfp);
 
 	if (context->hfp_hf)
 		hfp_hf_unref(context->hfp_hf);
+
+	test_free(context->data);
 
 	g_free(context);
 }
@@ -168,14 +182,19 @@ static gboolean send_pdu(gpointer user_data)
 	ssize_t len;
 
 	pdu = &context->data->pdu_list[context->pdu_offset++];
-	if (!pdu || !pdu->valid)
+	if (!pdu)
 		return FALSE;
+
+	if (!pdu->valid) {
+		context->data->response_func(HFP_RESULT_OK, 0, context);
+		return FALSE;
+	}
 
 	len = write(context->fd_server, pdu->data, pdu->size);
 	g_assert_cmpint(len, ==, pdu->size);
 
 	pdu = &context->data->pdu_list[context->pdu_offset];
-	if (pdu->fragmented)
+	if (pdu->fragmented || (!pdu->valid && context->data->response_func))
 		g_idle_add(send_pdu, context);
 
 	return FALSE;
@@ -680,6 +699,281 @@ static void test_hf_robustness(gconstpointer data)
 	context_quit(context);
 }
 
+#define MINIMAL_SLC_SESSION(service, call, callsetup, callheld) \
+	raw_pdu('\r', '\n', '+', 'B', 'R', 'S', 'F', ':', \
+		' ', '0', '\r', '\n'), \
+	frg_pdu('\r', '\n', 'O', 'K', '\r', '\n'), \
+	raw_pdu('\r', '\n', '+', 'C', 'I', 'N', 'D', ':', ' '), \
+	frg_pdu('(', '\"', 's', 'e', 'r', 'v', 'i', 'c', 'e'), \
+	frg_pdu('\"', ',', '(', '0', ',', '1', ')', ')', ','), \
+	frg_pdu('(', '\"', 'c', 'a', 'l', 'l', '\"', ','), \
+	frg_pdu('(', '0', ',', '1', ')', ')', ','), \
+	frg_pdu('(', '\"', 'c', 'a', 'l', 'l', 's', 'e', 't'), \
+	frg_pdu('u', 'p', '\"', ',', '(', '0', '-', '3', ')'), \
+	frg_pdu(')', ','), \
+	frg_pdu('(', '\"', 'c', 'a', 'l', 'l', 'h', 'e', 'l'), \
+	frg_pdu('d', '\"', ',', '(', '0', '-', '2', ')', ')'), \
+	frg_pdu(',', '(', '\"', 's', 'i', 'g', 'n', 'a', 'l'), \
+	frg_pdu('\"', ',', '(', '0', '-', '5', ')', ')', ','), \
+	frg_pdu('(', '\"', 'r', 'o', 'a', 'm', '\"', ',', '('), \
+	frg_pdu('0', ',', '1', ')', ')', ','), \
+	frg_pdu('(', '\"', 'b', 'a', 't', 't', 'c', 'h', 'g'), \
+	frg_pdu('\"', ',', '(', '0', '-', '5', ')', ')', ','), \
+	frg_pdu('\r', '\n'), \
+	frg_pdu('\r', '\n', 'O', 'K', '\r', '\n'), \
+	raw_pdu('\r', '\n', '+', 'C', 'I', 'N', 'D', ':', ' '), \
+	frg_pdu(service, ',', call, ',', callsetup, ',', callheld, ','), \
+	frg_pdu('5', ',', '0', ',', '5', '\r', '\n'), \
+	frg_pdu('\r', '\n', 'O', 'K', '\r', '\n'), \
+	raw_pdu('\r', '\n', 'O', 'K', '\r', '\n'), \
+	raw_pdu('\r', '\n', 'O', 'K', '\r', '\n'), \
+	raw_pdu('\r', '\n', '+', 'C', 'O', 'P', 'S', ':', ' '), \
+	frg_pdu('0', ',', '0', ',', '\"', 'T', 'E', 'S', 'T'), \
+	frg_pdu('\"', '\r', '\n'), \
+	frg_pdu('\r', '\n', 'O', 'K', '\r', '\n'), \
+	raw_pdu('\r', '\n', 'O', 'K', '\r', '\n')
+
+static void hf_cmd_complete(enum hfp_result res, enum hfp_error cme_err,
+							void *user_data)
+{
+	g_assert_cmpint(res, ==, HFP_RESULT_OK);
+}
+
+static void hf_session_ready_cb(enum hfp_result res, enum hfp_error cme_err,
+							void *user_data)
+{
+	struct context *context = user_data;
+
+	g_assert_cmpint(res, ==, HFP_RESULT_OK);
+	context->session.completed = true;
+}
+
+static void hf_update_indicator(enum hfp_indicator indicator, uint32_t val,
+							void *user_data)
+{
+	struct context *context = user_data;
+	const char *test_name = context->data->test_name;
+
+	if (!context->session.completed) {
+		switch (indicator) {
+		case HFP_INDICATOR_SERVICE:
+			if (g_str_equal(test_name, "/HFP/HF/PSI/BV-03-C") ||
+				g_str_equal(test_name, "/HFP/HF/TRS/BV-01-C") ||
+				g_str_equal(test_name,
+						"/hfp_hf/test_session_minimal"))
+				g_assert_cmpint(val, ==, 0);
+			else
+				g_assert_cmpint(val, ==, 1);
+			break;
+		case HFP_INDICATOR_CALL:
+			g_assert_cmpint(val, ==, 0);
+			break;
+		case HFP_INDICATOR_CALLSETUP:
+			g_assert_cmpint(val, ==, 0);
+			break;
+		case HFP_INDICATOR_CALLHELD:
+			g_assert_cmpint(val, ==, 0);
+			break;
+		case HFP_INDICATOR_SIGNAL:
+			g_assert_cmpint(val, ==, 5);
+			break;
+		case HFP_INDICATOR_ROAM:
+			g_assert_cmpint(val, ==, 0);
+			break;
+		case HFP_INDICATOR_BATTCHG:
+			g_assert_cmpint(val, ==, 5);
+			break;
+		case HFP_INDICATOR_LAST:
+		default:
+			tester_test_failed();
+		}
+		return;
+	}
+
+	if (g_str_equal(test_name, "/HFP/HF/PSI/BV-01-C")) {
+		g_assert_cmpint(indicator, ==, HFP_INDICATOR_SIGNAL);
+		g_assert_cmpint(val, ==, 3);
+	} else if (g_str_equal(test_name, "/HFP/HF/PSI/BV-02-C")) {
+		context->session.step++;
+		g_assert_cmpint(indicator, ==, HFP_INDICATOR_ROAM);
+		g_assert_cmpint(val, ==, context->session.step % 2);
+	} else if (g_str_equal(test_name, "/HFP/HF/PSI/BV-03-C")) {
+		g_assert_cmpint(indicator, ==, HFP_INDICATOR_BATTCHG);
+		g_assert_cmpint(val, ==, 3);
+	} else if (g_str_equal(test_name, "/HFP/HF/TRS/BV-01-C")) {
+		context->session.step++;
+		g_assert_cmpint(indicator, ==, HFP_INDICATOR_SERVICE);
+		g_assert_cmpint(val, ==, context->session.step % 2);
+	}
+}
+
+static void hf_update_operator(const char *operator_name, void *user_data)
+{
+	struct context *context = user_data;
+	const char *test_name = context->data->test_name;
+
+	if (tester_use_debug())
+		tester_debug("operator updated: %s", operator_name);
+
+	if (g_str_equal(test_name, "/HFP/HF/PSI/BV-04-C"))
+		g_assert_cmpstr(operator_name, ==, "TEST");
+}
+
+static void hf_call_added(uint id, enum hfp_call_status status,
+							void *user_data)
+{
+	struct context *context = user_data;
+	const char *test_name = context->data->test_name;
+
+	if (tester_use_debug())
+		tester_debug("call %d added: status %u", id, status);
+
+	if (g_str_equal(test_name, "/HFP/HF/CLI/BV-01-C") ||
+		g_str_equal(test_name, "/HFP/HF/ICA/BV-04-C") ||
+		g_str_equal(test_name, "/HFP/HF/ICA/BV-06-C") ||
+		g_str_equal(test_name, "/HFP/HF/ICR/BV-01-C") ||
+		g_str_equal(test_name, "/HFP/HF/TCA/BV-01-C") ||
+		g_str_equal(test_name, "/HFP/HF/TCA/BV-02-C")) {
+		g_assert_cmpint(id, ==, 1);
+		g_assert_cmpint(status, ==, CALL_STATUS_INCOMING);
+	} else if (g_str_equal(test_name, "/HFP/HF/TCA/BV-04-C")) {
+		bool ret;
+
+		g_assert_cmpint(id, ==, 1);
+		g_assert_cmpint(status, ==, CALL_STATUS_DIALING);
+
+		if (tester_use_debug())
+			tester_debug("call %d: ending call", id);
+		ret = hfp_hf_call_hangup(context->hfp_hf, id, hf_cmd_complete,
+							context);
+		g_assert(ret);
+	}
+}
+
+static void hf_call_line_id_updated(uint id, const char *number,
+							unsigned int type,
+							void *user_data)
+{
+	struct context *context = user_data;
+	const char *test_name = context->data->test_name;
+	const char *str;
+
+	if (tester_use_debug())
+		tester_debug("call %d line id updated: %s, %u", id, number,
+									type);
+	g_assert_cmpint(id, ==, 1);
+	g_assert_cmpstr(number, ==, "1234567");
+	g_assert_cmpint(type, ==, 129);
+	str = hfp_hf_call_get_number(context->hfp_hf, id);
+	g_assert_cmpstr(number, ==, str);
+
+	if (g_str_equal(test_name, "/HFP/HF/ICA/BV-04-C") ||
+		g_str_equal(test_name, "/HFP/HF/TCA/BV-01-C") ||
+		g_str_equal(test_name, "/HFP/HF/TCA/BV-02-C")) {
+		bool ret;
+
+		if (tester_use_debug())
+			tester_debug("call %d: answering call", id);
+		ret = hfp_hf_call_answer(context->hfp_hf, id, hf_cmd_complete,
+								context);
+		g_assert(ret);
+	} else if (g_str_equal(test_name, "/HFP/HF/ICR/BV-01-C")) {
+		bool ret;
+
+		if (tester_use_debug())
+			tester_debug("call %d: rejecting call", id);
+		ret = hfp_hf_call_hangup(context->hfp_hf, id, hf_cmd_complete,
+							context);
+		g_assert(ret);
+	}
+}
+
+static void hf_call_removed(uint id, void *user_data)
+{
+	if (tester_use_debug())
+		tester_debug("call %d removed", id);
+	g_assert_cmpint(id, ==, 1);
+}
+
+static void hf_call_status_updated(uint id, enum hfp_call_status status,
+							void *user_data)
+{
+	struct context *context = user_data;
+	const char *test_name = context->data->test_name;
+
+	if (tester_use_debug())
+		tester_debug("call %d updated: status %u", id, status);
+
+	if (g_str_equal(test_name, "/HFP/HF/ICA/BV-04-C") ||
+		g_str_equal(test_name, "/HFP/HF/ICA/BV-06-C") ||
+		g_str_equal(test_name, "/HFP/HF/TCA/BV-02-C")) {
+		const char *number;
+
+		g_assert_cmpint(id, ==, 1);
+		g_assert_cmpint(status, ==, CALL_STATUS_ACTIVE);
+		number = hfp_hf_call_get_number(context->hfp_hf, id);
+		g_assert_cmpstr(number, ==, "1234567");
+	} else if (g_str_equal(test_name, "/HFP/HF/ICR/BV-01-C")) {
+		if (tester_use_debug())
+			tester_debug("Error: unexpected update");
+		tester_test_failed();
+	} else if (g_str_equal(test_name, "/HFP/HF/TCA/BV-01-C")) {
+		const char *number;
+		bool ret;
+
+		g_assert_cmpint(id, ==, 1);
+		g_assert_cmpint(status, ==, CALL_STATUS_ACTIVE);
+		number = hfp_hf_call_get_number(context->hfp_hf, id);
+		g_assert_cmpstr(number, ==, "1234567");
+
+		if (tester_use_debug())
+			tester_debug("call %d: ending call", id);
+		ret = hfp_hf_call_hangup(context->hfp_hf, id, hf_cmd_complete,
+							context);
+		g_assert(ret);
+	}
+}
+
+static struct hfp_hf_callbacks hf_session_callbacks = {
+	.session_ready = hf_session_ready_cb,
+	.update_indicator = hf_update_indicator,
+	.update_operator = hf_update_operator,
+	.call_added = hf_call_added,
+	.call_removed = hf_call_removed,
+	.call_status_updated = hf_call_status_updated,
+	.call_line_id_updated = hf_call_line_id_updated,
+};
+
+static void test_hf_session_done(enum hfp_result res, enum hfp_error cme_err,
+							void *user_data)
+{
+	struct context *context = user_data;
+
+	hfp_hf_disconnect(context->hfp_hf);
+}
+
+static void test_hf_session(gconstpointer data)
+{
+	struct context *context = create_context(data);
+	bool ret;
+
+	context->hfp_hf = hfp_hf_new(context->fd_client);
+	g_assert(context->hfp_hf);
+
+	ret = hfp_hf_set_debug(context->hfp_hf, print_debug, "hfp-hf:", NULL);
+	g_assert(ret);
+
+	ret = hfp_hf_set_close_on_unref(context->hfp_hf, true);
+	g_assert(ret);
+
+	ret = hfp_hf_session_register(context->hfp_hf, &hf_session_callbacks,
+								context);
+	g_assert(ret);
+
+	ret = hfp_hf_session(context->hfp_hf);
+	g_assert(ret);
+}
+
 int main(int argc, char *argv[])
 {
 	tester_init(&argc, &argv);
@@ -848,6 +1142,189 @@ int main(int argc, char *argv[])
 			raw_pdu('+', 'C', 'H', 'L', 'D', '\0'),
 			frg_pdu('+', 'C', 'H', 'L', 'D', ':'),
 			frg_pdu('1', ',', '2', 'x', '\r', '\n'),
+			data_end());
+
+	define_hf_test("/hfp_hf/test_session_minimal", test_hf_session,
+			NULL, test_hf_session_done,
+			MINIMAL_SLC_SESSION('0', '0', '0', '0'),
+			data_end());
+
+	/* Calling Line Identification - HF */
+	define_hf_test("/HFP/HF/CLI/BV-01-C", test_hf_session,
+			NULL, test_hf_session_done,
+			MINIMAL_SLC_SESSION('1', '0', '0', '0'),
+			frg_pdu('\r', '\n', '+', 'C', 'I', 'E', 'V', ':', ' ',
+				'3', ',', '1', '\r', '\n'),
+			frg_pdu('\r', '\n', 'R', 'I', 'N', 'G', '\r', '\n'),
+			frg_pdu('\r', '\n', '+', 'C', 'L', 'I', 'P', ':',
+				'\"', '1', '2', '3', '4', '5', '6', '7', '\"',
+				',', '1', '2', '9', ',', ',', '\r', '\n'),
+			data_end());
+
+	/* Answer Incoming call on HF, no in-band ring - HF */
+	define_hf_test("/HFP/HF/ICA/BV-04-C", test_hf_session,
+			NULL, test_hf_session_done,
+			MINIMAL_SLC_SESSION('1', '0', '0', '0'),
+			frg_pdu('\r', '\n', '+', 'C', 'I', 'E', 'V', ':', ' ',
+				'3', ',', '1', '\r', '\n'),
+			frg_pdu('\r', '\n', 'R', 'I', 'N', 'G', '\r', '\n'),
+			frg_pdu('\r', '\n', '+', 'C', 'L', 'I', 'P', ':',
+				'\"', '1', '2', '3', '4', '5', '6', '7', '\"',
+				',', '1', '2', '9', ',', ',', '\r', '\n'),
+			raw_pdu('\r', '\n', 'O', 'K', '\r', '\n'),
+			frg_pdu('\r', '\n', '+', 'C', 'I', 'E', 'V', ':', ' ',
+				'2', ',', '1', '\r', '\n'),
+			frg_pdu('\r', '\n', '+', 'C', 'I', 'E', 'V', ':', ' ',
+				'3', ',', '0', '\r', '\n'),
+			frg_pdu('\r', '\n', '+', 'C', 'I', 'E', 'V', ':', ' ',
+				'2', ',', '0', '\r', '\n'),
+			data_end());
+
+	/* Answer Incoming call on AG, no in-band ring - HF */
+	define_hf_test("/HFP/HF/ICA/BV-06-C", test_hf_session,
+			NULL, test_hf_session_done,
+			MINIMAL_SLC_SESSION('1', '0', '0', '0'),
+			frg_pdu('\r', '\n', '+', 'C', 'I', 'E', 'V', ':', ' ',
+				'3', ',', '1', '\r', '\n'),
+			frg_pdu('\r', '\n', 'R', 'I', 'N', 'G', '\r', '\n'),
+			frg_pdu('\r', '\n', '+', 'C', 'L', 'I', 'P', ':',
+				'\"', '1', '2', '3', '4', '5', '6', '7', '\"',
+				',', '1', '2', '9', ',', ',', '\r', '\n'),
+			frg_pdu('\r', '\n', 'R', 'I', 'N', 'G', '\r', '\n'),
+			frg_pdu('\r', '\n', '+', 'C', 'L', 'I', 'P', ':',
+				'\"', '1', '2', '3', '4', '5', '6', '7', '\"',
+				',', '1', '2', '9', ',', ',', '\r', '\n'),
+			frg_pdu('\r', '\n', '+', 'C', 'I', 'E', 'V', ':', ' ',
+				'2', ',', '1', '\r', '\n'),
+			frg_pdu('\r', '\n', '+', 'C', 'I', 'E', 'V', ':', ' ',
+				'3', ',', '0', '\r', '\n'),
+			frg_pdu('\r', '\n', '+', 'C', 'I', 'E', 'V', ':', ' ',
+				'2', ',', '0', '\r', '\n'),
+			data_end());
+
+	/* Initiate rejection of incoming call - HF */
+	define_hf_test("/HFP/HF/ICR/BV-01-C", test_hf_session,
+			NULL, test_hf_session_done,
+			MINIMAL_SLC_SESSION('1', '0', '0', '0'),
+			frg_pdu('\r', '\n', '+', 'C', 'I', 'E', 'V', ':', ' ',
+				'3', ',', '1', '\r', '\n'),
+			frg_pdu('\r', '\n', 'R', 'I', 'N', 'G', '\r', '\n'),
+			frg_pdu('\r', '\n', '+', 'C', 'L', 'I', 'P', ':',
+				'\"', '1', '2', '3', '4', '5', '6', '7', '\"',
+				',', '1', '2', '9', ',', ',', '\r', '\n'),
+			raw_pdu('\r', '\n', 'O', 'K', '\r', '\n'),
+			frg_pdu('\r', '\n', '+', 'C', 'I', 'E', 'V', ':', ' ',
+				'3', ',', '0', '\r', '\n'),
+			data_end());
+
+	/* Accept AG rejection of incoming call - HF */
+	define_hf_test("/HFP/HF/ICR/BV-02-C", test_hf_session,
+			NULL, test_hf_session_done,
+			MINIMAL_SLC_SESSION('1', '0', '0', '0'),
+			frg_pdu('\r', '\n', '+', 'C', 'I', 'E', 'V', ':', ' ',
+				'3', ',', '1', '\r', '\n'),
+			frg_pdu('\r', '\n', 'R', 'I', 'N', 'G', '\r', '\n'),
+			frg_pdu('\r', '\n', '+', 'C', 'L', 'I', 'P', ':',
+				'\"', '1', '2', '3', '4', '5', '6', '7', '\"',
+				',', '1', '2', '9', ',', ',', '\r', '\n'),
+			frg_pdu('\r', '\n', '+', 'C', 'I', 'E', 'V', ':', ' ',
+				'3', ',', '0', '\r', '\n'),
+			data_end());
+
+	/* Transfer Signal Strength Indication - HF */
+	define_hf_test("/HFP/HF/PSI/BV-01-C", test_hf_session,
+			NULL, test_hf_session_done,
+			MINIMAL_SLC_SESSION('1', '0', '0', '0'),
+			frg_pdu('\r', '\n', '+', 'C', 'I', 'E', 'V', ':'),
+			frg_pdu(' ', '5', ',', '3', '\r', '\n'),
+			data_end());
+
+	/* Transfer Roaming Status Indication - HF */
+	define_hf_test("/HFP/HF/PSI/BV-02-C", test_hf_session,
+			NULL, test_hf_session_done,
+			MINIMAL_SLC_SESSION('1', '0', '0', '0'),
+			frg_pdu('\r', '\n', '+', 'C', 'I', 'E', 'V', ':'),
+			frg_pdu(' ', '6', ',', '1', '\r', '\n'),
+			frg_pdu('\r', '\n', '+', 'C', 'I', 'E', 'V', ':'),
+			frg_pdu(' ', '6', ',', '0', '\r', '\n'),
+			data_end());
+
+	/* Transfer Battery Level Indication - HF */
+	define_hf_test("/HFP/HF/PSI/BV-03-C", test_hf_session,
+			NULL, test_hf_session_done,
+			MINIMAL_SLC_SESSION('0', '0', '0', '0'),
+			frg_pdu('\r', '\n', '+', 'C', 'I', 'E', 'V', ':'),
+			frg_pdu(' ', '7', ',', '3', '\r', '\n'),
+			data_end());
+
+	/* Transfer Operator name - HF */
+	define_hf_test("/HFP/HF/PSI/BV-04-C", test_hf_session,
+			NULL, test_hf_session_done,
+			MINIMAL_SLC_SESSION('1', '0', '0', '0'),
+			data_end());
+
+	/* Terminate ongoing call - HF */
+	define_hf_test("/HFP/HF/TCA/BV-01-C", test_hf_session,
+			NULL, test_hf_session_done,
+			MINIMAL_SLC_SESSION('1', '0', '0', '0'),
+			frg_pdu('\r', '\n', '+', 'C', 'I', 'E', 'V', ':', ' ',
+				'3', ',', '1', '\r', '\n'),
+			frg_pdu('\r', '\n', 'R', 'I', 'N', 'G', '\r', '\n'),
+			frg_pdu('\r', '\n', '+', 'C', 'L', 'I', 'P', ':',
+				'\"', '1', '2', '3', '4', '5', '6', '7', '\"',
+				',', '1', '2', '9', ',', ',', '\r', '\n'),
+			raw_pdu('\r', '\n', 'O', 'K', '\r', '\n'),
+			frg_pdu('\r', '\n', '+', 'C', 'I', 'E', 'V', ':', ' ',
+				'2', ',', '1', '\r', '\n'),
+			frg_pdu('\r', '\n', '+', 'C', 'I', 'E', 'V', ':', ' ',
+				'3', ',', '0', '\r', '\n'),
+			raw_pdu('\r', '\n', 'O', 'K', '\r', '\n'),
+			frg_pdu('\r', '\n', '+', 'C', 'I', 'E', 'V', ':', ' ',
+				'2', ',', '0', '\r', '\n'),
+			data_end());
+
+	/* Terminate ongoing call on AG - HF
+	 * idem for /HFP/HF/TCA/BV-03-C Remote party terminates the call
+	 */
+	define_hf_test("/HFP/HF/TCA/BV-02-C", test_hf_session,
+			NULL, test_hf_session_done,
+			MINIMAL_SLC_SESSION('1', '0', '0', '0'),
+			frg_pdu('\r', '\n', '+', 'C', 'I', 'E', 'V', ':', ' ',
+				'3', ',', '1', '\r', '\n'),
+			frg_pdu('\r', '\n', 'R', 'I', 'N', 'G', '\r', '\n'),
+			frg_pdu('\r', '\n', '+', 'C', 'L', 'I', 'P', ':',
+				'\"', '1', '2', '3', '4', '5', '6', '7', '\"',
+				',', '1', '2', '9', ',', ',', '\r', '\n'),
+			raw_pdu('\r', '\n', 'O', 'K', '\r', '\n'),
+			frg_pdu('\r', '\n', '+', 'C', 'I', 'E', 'V', ':', ' ',
+				'2', ',', '1', '\r', '\n'),
+			frg_pdu('\r', '\n', '+', 'C', 'I', 'E', 'V', ':', ' ',
+				'3', ',', '0', '\r', '\n'),
+			frg_pdu('\r', '\n', '+', 'C', 'I', 'E', 'V', ':', ' ',
+				'2', ',', '0', '\r', '\n'),
+			data_end());
+
+	/* Abandon outgoing call - HF */
+	define_hf_test("/HFP/HF/TCA/BV-04-C", test_hf_session,
+			NULL, test_hf_session_done,
+			MINIMAL_SLC_SESSION('1', '0', '0', '0'),
+			frg_pdu('\r', '\n', '+', 'C', 'I', 'E', 'V', ':', ' ',
+				'3', ',', '2', '\r', '\n'),
+			raw_pdu('\r', '\n', 'O', 'K', '\r', '\n'),
+			frg_pdu('\r', '\n', '+', 'C', 'I', 'E', 'V', ':', ' ',
+				'3', ',', '0', '\r', '\n'),
+			data_end());
+
+	/* Transfer Registration Status - HF */
+	define_hf_test("/HFP/HF/TRS/BV-01-C", test_hf_session,
+			NULL, test_hf_session_done,
+			MINIMAL_SLC_SESSION('0', '0', '0', '0'),
+			frg_pdu('\r', '\n', '+', 'C', 'I', 'E', 'V', ':'),
+			frg_pdu(' ', '1', ',', '1', '\r', '\n'),
+			frg_pdu('\r', '\n', '+', 'C', 'I', 'E', 'V', ':'),
+			frg_pdu(' ', '1', ',', '0', '\r', '\n'),
+			frg_pdu('\r', '\n', '+', 'C', 'I', 'E', 'V', ':'),
+			frg_pdu(' ', '1', ',', '1', '\r', '\n'),
 			data_end());
 
 	return tester_run();

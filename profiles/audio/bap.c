@@ -30,11 +30,11 @@
 
 #include "gdbus/gdbus.h"
 
-#include "lib/bluetooth.h"
-#include "lib/hci.h"
-#include "lib/sdp.h"
-#include "lib/uuid.h"
-#include "lib/iso.h"
+#include "bluetooth/bluetooth.h"
+#include "bluetooth/hci.h"
+#include "bluetooth/sdp.h"
+#include "bluetooth/uuid.h"
+#include "bluetooth/iso.h"
 
 #include "src/btd.h"
 #include "src/dbus-common.h"
@@ -189,9 +189,6 @@ static void bap_data_free(struct bap_data *data)
 	if (data->io_id)
 		g_source_remove(data->io_id);
 
-	if (data->cig_update_id)
-		g_source_remove(data->cig_update_id);
-
 	if (data->service && btd_service_get_user_data(data->service) == data)
 		btd_service_set_user_data(data->service, NULL);
 
@@ -204,6 +201,10 @@ static void bap_data_free(struct bap_data *data)
 	bt_bap_state_unregister(data->bap, data->state_id);
 	bt_bap_pac_unregister(data->bap, data->pac_id);
 	bt_bap_unref(data->bap);
+
+	if (data->cig_update_id)
+		g_source_remove(data->cig_update_id);
+
 	free(data);
 }
 
@@ -856,8 +857,9 @@ static bool release_stream(struct bt_bap_stream *stream)
 
 	switch (bt_bap_stream_get_state(stream)) {
 	case BT_BAP_STREAM_STATE_IDLE:
-	case BT_BAP_STREAM_STATE_RELEASING:
 		return true;
+	case BT_BAP_STREAM_STATE_RELEASING:
+		return false;
 	default:
 		bt_bap_stream_release(stream, NULL, NULL);
 		return false;
@@ -990,6 +992,7 @@ static struct bap_setup *setup_new(struct bap_ep *ep)
 static void setup_free(void *data)
 {
 	struct bap_setup *setup = data;
+	bool closing = setup->closing;
 
 	DBG("%p", setup);
 
@@ -997,7 +1000,7 @@ static void setup_free(void *data)
 
 	setup_ready(setup, -ECANCELED, 0);
 
-	if (setup->closing && setup->close_cb)
+	if (closing && setup->close_cb)
 		setup->close_cb(setup, setup->close_cb_data);
 
 	if (setup->stream && setup->id) {
@@ -1019,9 +1022,13 @@ static void setup_free(void *data)
 
 	bt_bap_stream_unlock(setup->stream);
 
-	release_stream(setup->stream);
+	if (!closing) {
+		/* Release if not already done */
+		release_stream(setup->stream);
+	}
 
-	bap_update_cigs(setup->ep->data);
+	if (setup->ep)
+		bap_update_cigs(setup->ep->data);
 
 	free(setup);
 }
@@ -1782,6 +1789,10 @@ static int setup_config(struct bap_setup *setup, bap_setup_ready_func_t cb,
 	if (setup->metadata && setup->metadata->iov_len)
 		bt_bap_stream_metadata(setup->stream, setup->metadata, NULL,
 								NULL);
+
+	/* Don't set ready* field if there is no callback pending */
+	if (!setup->id)
+		return 0;
 
 	setup->readying = true;
 	setup->ready_cb = cb;
@@ -2740,6 +2751,8 @@ static void setup_create_ucast_io(struct bap_data *data,
 						qos[1]->ucast.cig_id;
 	iso_qos.ucast.cis = qos[0] ? qos[0]->ucast.cis_id :
 						qos[1]->ucast.cis_id;
+	iso_qos.ucast.framing = qos[0] ? qos[0]->ucast.framing :
+						qos[1]->ucast.framing;
 
 	bap_iso_qos(qos[0], &iso_qos.ucast.in);
 	bap_iso_qos(qos[1], &iso_qos.ucast.out);
@@ -2953,7 +2966,7 @@ static uint8_t get_streams_nb_by_state(struct bap_setup *setup)
 				entry; entry = entry->next) {
 		ent_setup = entry->data;
 
-		/* Skip the curent stream form testing */
+		/* Skip the current stream form testing */
 		if (ent_setup == setup) {
 			stream_cnt++;
 			continue;
@@ -3595,31 +3608,35 @@ static int bap_bcast_probe(struct btd_service *service)
 	struct btd_adapter *adapter = device_get_adapter(device);
 	struct btd_gatt_database *database = btd_adapter_get_database(adapter);
 	struct bap_data *data;
+	struct bt_bap *bap;
 
 	if (!btd_adapter_has_exp_feature(adapter, EXP_FEAT_ISO_SOCKET)) {
 		error("BAP requires ISO Socket which is not enabled");
 		return -ENOTSUP;
 	}
 
+	bap = bt_bap_new(btd_gatt_database_get_db(database),
+			btd_gatt_database_get_db(database));
+
+	if (!bap) {
+		error("Unable to create BAP instance");
+		return -EINVAL;
+	}
+
+	bt_bap_set_user_data(bap, service);
+
+	if (!bt_bap_attach(bap, NULL)) {
+		error("BAP unable to attach");
+		bt_bap_unref(bap);
+		return -EINVAL;
+	}
+
 	data = bap_data_new(device);
 	data->service = service;
 	data->adapter = adapter;
 	data->device = device;
-	data->bap = bt_bap_new(btd_gatt_database_get_db(database),
-			btd_gatt_database_get_db(database));
-	if (!data->bap) {
-		error("Unable to create BAP instance");
-		free(data);
-		return -EINVAL;
-	}
+	data->bap = bap;
 	data->bcast_snks = queue_new();
-
-	bt_bap_set_user_data(data->bap, service);
-
-	if (!bt_bap_attach(data->bap, NULL)) {
-		error("BAP unable to attach");
-		return -EINVAL;
-	}
 
 	bap_data_add(data);
 
@@ -3751,6 +3768,9 @@ static int bap_disconnect(struct btd_service *service)
 
 	queue_remove_all(data->snks, ep_remove, NULL, NULL);
 	queue_remove_all(data->srcs, ep_remove, NULL, NULL);
+
+	queue_destroy(data->server_streams, NULL);
+	data->server_streams = NULL;
 
 	bt_bap_detach(data->bap);
 

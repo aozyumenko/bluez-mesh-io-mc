@@ -35,11 +35,11 @@
 #include <sys/wait.h>
 #include <poll.h>
 
-#include "lib/bluetooth.h"
-#include "lib/hci.h"
-#include "lib/hci_lib.h"
-#include "lib/mgmt.h"
-#include "lib/iso.h"
+#include "bluetooth/bluetooth.h"
+#include "bluetooth/hci.h"
+#include "bluetooth/hci_lib.h"
+#include "bluetooth/mgmt.h"
+#include "bluetooth/iso.h"
 
 #include "src/shared/util.h"
 
@@ -684,9 +684,9 @@ static void recv_mode(int fd, int sk, char *peer)
 
 			r = recv(sk, buf, data_size, 0);
 			if (r < 0) {
-				if (r < 0)
-					syslog(LOG_ERR, "Read failed: %s (%d)",
-							strerror(errno), errno);
+				syslog(LOG_ERR, "Read failed: %s (%d)",
+						strerror(errno), errno);
+
 				if (errno != ENOTCONN)
 					return;
 

@@ -16,8 +16,8 @@
 #include <unistd.h>
 #include <errno.h>
 
-#include "lib/bluetooth.h"
-#include "lib/uuid.h"
+#include "bluetooth/bluetooth.h"
+#include "bluetooth/uuid.h"
 
 #include "src/shared/io.h"
 #include "src/shared/queue.h"
@@ -1033,7 +1033,7 @@ static void stream_notify_config(struct bt_bap_stream *stream)
 	status->id = ep->id;
 	status->state = ep->state;
 
-	/* Initialize preffered settings if not set */
+	/* Initialize preferred settings if not set */
 	if (!lpac->qos.phy)
 		lpac->qos.phy = 0x02;
 
@@ -1055,7 +1055,7 @@ static void stream_notify_config(struct bt_bap_stream *stream)
 	if (!lpac->qos.ppd_max)
 		lpac->qos.ppd_max = lpac->qos.pd_max;
 
-	/* TODO:Add support for setting preffered settings on bt_bap_pac */
+	/* TODO:Add support for setting preferred settings on bt_bap_pac */
 	config = (void *)status->params;
 	config->framing = lpac->qos.framing;
 	config->phy = lpac->qos.phy;
@@ -1357,6 +1357,12 @@ static void bap_ucast_detach(struct bt_bap_stream *stream)
 	bap_stream_clear_cfm(stream);
 
 	ep->stream = NULL;
+
+	if (!stream->client) {
+		ep->state = BT_ASCS_ASE_STATE_IDLE;
+		ep->old_state = BT_ASCS_ASE_STATE_IDLE;
+	}
+
 	bt_bap_stream_unref(stream);
 }
 
@@ -2124,6 +2130,7 @@ static unsigned int bap_ucast_start(struct bt_bap_stream *stream,
 static uint8_t stream_disable(struct bt_bap_stream *stream, struct iovec *rsp)
 {
 	if (!stream || stream->ep->state == BT_BAP_STREAM_STATE_QOS ||
+			stream->ep->state == BT_BAP_STREAM_STATE_CONFIG ||
 			stream->ep->state == BT_BAP_STREAM_STATE_IDLE)
 		return 0;
 
@@ -2606,10 +2613,12 @@ static uint8_t bap_ucast_io_dir(struct bt_bap_stream *stream)
 static uint8_t bap_bcast_io_dir(struct bt_bap_stream *stream)
 {
 	uint8_t dir;
-	uint8_t pac_type = bt_bap_pac_get_type(stream->lpac);
+	uint8_t pac_type;
 
 	if (!stream)
 		return 0x00;
+
+	pac_type = bt_bap_pac_get_type(stream->lpac);
 
 	if (pac_type == BT_BAP_BCAST_SINK)
 		dir = BT_BAP_BCAST_SOURCE;
@@ -3090,7 +3099,7 @@ static uint8_t ep_config(struct bt_bap_endpoint *ep, struct bt_bap *bap,
 	cc.iov_base = util_iov_pull_mem(iov, req->cc_len);
 	cc.iov_len = req->cc_len;
 
-	if (!bt_bap_debug_caps(cc.iov_base, cc.iov_len, bap->debug_func,
+	if (!bt_bap_debug_config(cc.iov_base, cc.iov_len, bap->debug_func,
 						bap->debug_data)) {
 		ascs_ase_rsp_add(rsp, req->ase,
 				BT_ASCS_RSP_CONF_INVALID,
@@ -3681,7 +3690,7 @@ static void ascs_ase_cp_write(struct gatt_db_attribute *attrib,
 		DBG(bap, "%s", handler->str);
 
 		/* Set in_cp_write so ASE notification are not sent ahead of
-		 * CP notifcation.
+		 * CP notification.
 		 */
 		bap->in_cp_write = true;
 
@@ -4884,7 +4893,7 @@ static void read_pac_supported_context(bool success, uint8_t att_ecode,
 	const struct bt_pacs_context *ctx = (void *)value;
 
 	if (!success) {
-		DBG(bap, "Unable to read PAC Supproted Context: error 0x%02x",
+		DBG(bap, "Unable to read PAC Supported Context: error 0x%02x",
 								att_ecode);
 		return;
 	}
@@ -6171,7 +6180,7 @@ static struct bt_bap_stream *bap_bcast_stream_new(struct bt_bap *bap,
 	struct bt_bap_endpoint *ep = NULL;
 	struct match_pac match;
 
-	if (!bap)
+	if (!bap || !lpac)
 		return NULL;
 
 	if (lpac->type == BT_BAP_BCAST_SOURCE) {
@@ -6180,7 +6189,7 @@ static struct bt_bap_stream *bap_bcast_stream_new(struct bt_bap *bap,
 		memset(&match.codec, 0, sizeof(match.codec));
 
 		bt_bap_foreach_pac(bap, BT_BAP_BCAST_SINK, match_pac, &match);
-		if ((!match.lpac) || (!lpac))
+		if (!match.lpac)
 			return NULL;
 
 		lpac = match.lpac;
@@ -6219,6 +6228,15 @@ static bool find_ep_ucast(const void *data, const void *user_data)
 		default:
 			return false;
 		}
+	}
+
+	switch (ep->state) {
+	case BT_ASCS_ASE_STATE_IDLE:
+	case BT_ASCS_ASE_STATE_CONFIG:
+	case BT_ASCS_ASE_STATE_QOS:
+		break;
+	default:
+		return false;
 	}
 
 	if (ep->dir != match->rpac->type)
@@ -6502,10 +6520,12 @@ unsigned int bt_bap_stream_release(struct bt_bap_stream *stream,
 					void *user_data)
 {
 	unsigned int id;
-	struct bt_bap *bap = stream->bap;
+	struct bt_bap *bap;
 
 	if (!stream || !stream->ops || !stream->ops->release)
 		return 0;
+
+	bap = stream->bap;
 
 	if (!bt_bap_ref_safe(bap))
 		return 0;
@@ -6583,6 +6603,15 @@ static bool stream_io_disconnected(struct io *io, void *user_data)
 	struct bt_bap_stream *stream = user_data;
 
 	DBG(stream->bap, "stream %p io disconnected", stream);
+
+	/* If the IO is for a broadcast sink has been disconnected both BIG Sync
+	 * and PA Sync have been lost so switch to idle state to cleanup the
+	 * stream.
+	 */
+	if (stream->lpac->type == BT_BAP_BCAST_SINK) {
+		stream_set_state(stream, BT_BAP_STREAM_STATE_IDLE);
+		return false;
+	}
 
 	if (stream->ep->state == BT_ASCS_ASE_STATE_RELEASING)
 		stream_set_state(stream, BT_BAP_STREAM_STATE_CONFIG);
@@ -7006,13 +7035,14 @@ static void add_new_subgroup(struct bt_base *base,
 			struct bt_bap_stream *stream)
 {
 	struct bt_bap_pac *lpac = stream->lpac;
-	struct bt_subgroup *sgrp = new0(
-				struct bt_subgroup, 1);
+	struct bt_subgroup *sgrp;
 	uint16_t cid = 0;
 	uint16_t vid = 0;
 
 	if (!lpac)
 		return;
+
+	sgrp = new0(struct bt_subgroup, 1);
 
 	bt_bap_pac_get_vendor_codec(lpac, &sgrp->codec.id, &cid,
 			&vid, NULL, NULL);
@@ -7553,6 +7583,11 @@ bool bt_bap_parse_base(uint8_t sid, struct iovec *iov,
 
 		codec = util_iov_pull_mem(iov, sizeof(*codec));
 
+		if (!codec) {
+			ret = false;
+			goto done;
+		}
+
 		util_debug(func, NULL, "Codec: ID %d CID 0x%2.2x VID 0x%2.2x",
 				codec->id, codec->cid, codec->vid);
 
@@ -7564,6 +7599,12 @@ bool bt_bap_parse_base(uint8_t sid, struct iovec *iov,
 		}
 
 		l2_cc.iov_base = util_iov_pull_mem(iov, l2_cc_len);
+
+		if (!l2_cc.iov_base) {
+			ret = false;
+			goto done;
+		}
+
 		l2_cc.iov_len = l2_cc_len;
 
 		/* Print Codec Specific Configuration */
@@ -7578,6 +7619,12 @@ bool bt_bap_parse_base(uint8_t sid, struct iovec *iov,
 		}
 
 		meta.iov_base = util_iov_pull_mem(iov, meta_len);
+
+		if (!meta.iov_base) {
+			ret = false;
+			goto done;
+		}
+
 		meta.iov_len = meta_len;
 
 		/* Print Metadata */
@@ -7608,6 +7655,12 @@ bool bt_bap_parse_base(uint8_t sid, struct iovec *iov,
 
 			l3_cc.iov_base = util_iov_pull_mem(iov,
 							l3_cc_len);
+
+			if (!l3_cc.iov_base) {
+				ret = false;
+				goto done;
+			}
+
 			l3_cc.iov_len = l3_cc_len;
 
 			/* Print Codec Specific Configuration */

@@ -23,10 +23,10 @@
 
 #include <glib.h>
 
-#include "lib/bluetooth.h"
-#include "lib/sdp.h"
-#include "lib/sdp_lib.h"
-#include "lib/uuid.h"
+#include "bluetooth/bluetooth.h"
+#include "bluetooth/sdp.h"
+#include "bluetooth/sdp_lib.h"
+#include "bluetooth/uuid.h"
 
 #include "btio/btio.h"
 #include "src/btd.h"
@@ -751,6 +751,8 @@ static void transport_cb(int cond, void *data)
 {
 	struct avdtp_stream *stream = data;
 	struct avdtp_local_sep *sep = stream->lsep;
+
+	DBG("");
 
 	if (stream->close_int && sep->cfm && sep->cfm->close)
 		sep->cfm->close(stream->session, sep, stream, NULL,
@@ -1494,8 +1496,8 @@ static void setconf_cb(struct avdtp *session, struct avdtp_stream *stream,
 	struct conf_rej rej;
 
 	if (err != NULL) {
-		rej.error = AVDTP_UNSUPPORTED_CONFIGURATION;
-		rej.category = err->err.error_code;
+		rej.error = err->err.error_code;
+		rej.category = AVDTP_UNSUPPORTED_CONFIGURATION;
 		avdtp_send(session, session->in_cmd.transaction,
 			   AVDTP_MSG_TYPE_REJECT, AVDTP_SET_CONFIGURATION,
 			   &rej, sizeof(rej));
@@ -2922,7 +2924,14 @@ static gboolean avdtp_close_resp(struct avdtp *session,
 {
 	avdtp_stream_set_state(stream, AVDTP_STATE_CLOSING);
 
-	close_stream(stream);
+	/* Delay CLOSING->IDLE until remote acknowledges L2CAP channel closure.
+	 *
+	 * It is not explicitly stated in AVDTP v1.3 Sec. 6.13, but some devices
+	 * refuse commands sent immediately after L2CAP Disconnect Req, so wait
+	 * until Rsp.
+	 */
+	if (stream->io)
+		shutdown(g_io_channel_unix_get_fd(stream->io), SHUT_WR);
 
 	return TRUE;
 }
@@ -3575,10 +3584,7 @@ int avdtp_set_configuration(struct avdtp *session,
 	DBG("%p: int_seid=%u, acp_seid=%u", session,
 			lsep->info.seid, rsep->seid);
 
-	new_stream = g_new0(struct avdtp_stream, 1);
-	new_stream->session = session;
-	new_stream->lsep = lsep;
-	new_stream->rseid = rsep->seid;
+	new_stream = stream_new(session, lsep, rsep->seid);
 
 	if (rsep->delay_reporting && lsep->delay_reporting) {
 		struct avdtp_service_capability *delay_reporting;

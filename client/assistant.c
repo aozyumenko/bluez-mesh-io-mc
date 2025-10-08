@@ -26,8 +26,8 @@
 
 #include "gdbus/gdbus.h"
 
-#include "lib/bluetooth.h"
-#include "lib/uuid.h"
+#include "bluetooth/bluetooth.h"
+#include "bluetooth/uuid.h"
 
 #include "src/shared/util.h"
 #include "src/shared/shell.h"
@@ -261,7 +261,7 @@ static void assistant_set_bcode_cfg(const char *input, void *user_data)
 	if (!strcasecmp(input, "a") || !strcasecmp(input, "auto")) {
 		memset(cfg->qos.bcast.bcode, 0, BCODE_LEN);
 	} else {
-		if (strlen(input) > BCODE_LEN) {
+		if (strnlen(input, BCODE_LEN + 1) > BCODE_LEN) {
 			bt_shell_printf("Input string too long %s\n", input);
 			goto fail;
 		}

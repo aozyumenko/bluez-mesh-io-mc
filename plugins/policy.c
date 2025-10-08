@@ -19,10 +19,10 @@
 
 #include <glib.h>
 
-#include "lib/bluetooth.h"
-#include "lib/sdp.h"
-#include "lib/uuid.h"
-#include "lib/mgmt.h"
+#include "bluetooth/bluetooth.h"
+#include "bluetooth/sdp.h"
+#include "bluetooth/uuid.h"
+#include "bluetooth/mgmt.h"
 
 #include "src/log.h"
 #include "src/plugin.h"
@@ -322,7 +322,7 @@ static void sink_cb(struct btd_service *service, btd_service_state_t old_state,
 			policy_set_hs_timer(data);
 
 		/* Check if service initiate the connection then proceed
-		 * immediatelly otherwise set timer
+		 * immediately otherwise set timer
 		 */
 		if (btd_service_is_initiator(service))
 			policy_connect(data, controller);
@@ -498,7 +498,7 @@ static void source_cb(struct btd_service *service,
 		data->source_retries = 0;
 
 		/* Check if service initiate the connection then proceed
-		 * immediatelly otherwise set timer
+		 * immediately otherwise set timer
 		 */
 		if (btd_service_is_initiator(service))
 			policy_connect(data, target);

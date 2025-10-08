@@ -24,10 +24,10 @@
 
 #include <glib.h>
 
-#include "lib/bluetooth.h"
-#include "lib/iso.h"
-#include "lib/mgmt.h"
-#include "lib/uuid.h"
+#include "bluetooth/bluetooth.h"
+#include "bluetooth/iso.h"
+#include "bluetooth/mgmt.h"
+#include "bluetooth/uuid.h"
 
 #include "monitor/bt.h"
 #include "emulator/vhci.h"
@@ -474,9 +474,10 @@ struct test_data {
 	unsigned int io_id[4];
 	uint8_t client_num;
 	int step;
-	bool reconnect;
+	uint8_t reconnect;
 	bool suspending;
 	struct tx_tstamp_data tx_ts;
+	int seqnum;
 };
 
 struct iso_client_data {
@@ -500,6 +501,9 @@ struct iso_client_data {
 	bool pa_bind;
 	bool big;
 
+	/* Enable BT_PKT_SEQNUM for RX packet sequence numbers */
+	bool pkt_seqnum;
+
 	/* Enable SO_TIMESTAMPING with these flags */
 	uint32_t so_timestamping;
 
@@ -515,9 +519,6 @@ struct iso_client_data {
 	 * Used for testing TX timestamping OPT_ID.
 	 */
 	unsigned int repeat_send;
-
-	/* Disable BT_POLL_ERRQUEUE before enabling TX timestamping */
-	bool no_poll_errqueue;
 };
 
 typedef bool (*iso_defer_accept_t)(struct test_data *data, GIOChannel *io,
@@ -654,18 +655,6 @@ static const uint8_t reset_iso_socket_param[] = {
 	0x00,						/* Action - disable */
 };
 
-static const uint8_t set_poll_errqueue_param[] = {
-	0x33, 0x57, 0x7b, 0xb4, 0x21, 0xc0, 0xc1, 0x8b, /* UUID */
-	0x79, 0x46, 0x9f, 0xb6, 0x4c, 0x8c, 0x51, 0x69,
-	0x01,						/* Action - enable */
-};
-
-static const uint8_t reset_poll_errqueue_param[] = {
-	0x33, 0x57, 0x7b, 0xb4, 0x21, 0xc0, 0xc1, 0x8b, /* UUID */
-	0x79, 0x46, 0x9f, 0xb6, 0x4c, 0x8c, 0x51, 0x69,
-	0x00,						/* Action - disable */
-};
-
 static void set_iso_socket_callback(uint8_t status, uint16_t length,
 					const void *param, void *user_data)
 {
@@ -677,26 +666,9 @@ static void set_iso_socket_callback(uint8_t status, uint16_t length,
 	tester_print("ISO socket feature is enabled");
 }
 
-static void set_poll_errqueue_callback(uint8_t status, uint16_t length,
-					const void *param, void *user_data)
-{
-	if (status != MGMT_STATUS_SUCCESS) {
-		tester_print("Poll Errqueue feature could not be enabled");
-		return;
-	}
-
-	tester_print("Poll Errqueue feature is enabled");
-}
-
 static void test_pre_setup(const void *test_data)
 {
 	struct test_data *data = tester_get_data();
-	const struct iso_client_data *isodata = test_data;
-
-	if (isodata && isodata->no_poll_errqueue) {
-		if (tester_pre_setup_skip_by_default())
-			return;
-	}
 
 	data->mgmt = mgmt_new_default();
 	if (!data->mgmt) {
@@ -712,13 +684,6 @@ static void test_pre_setup(const void *test_data)
 		  sizeof(set_iso_socket_param), set_iso_socket_param,
 		  set_iso_socket_callback, NULL, NULL);
 
-	if (isodata && isodata->no_poll_errqueue) {
-		mgmt_send(data->mgmt, MGMT_OP_SET_EXP_FEATURE, MGMT_INDEX_NONE,
-			  sizeof(set_poll_errqueue_param),
-			  set_poll_errqueue_param,
-			  set_poll_errqueue_callback, NULL, NULL);
-	}
-
 	mgmt_send(data->mgmt, MGMT_OP_READ_INDEX_LIST, MGMT_INDEX_NONE, 0, NULL,
 					read_index_list_callback, NULL, NULL);
 }
@@ -726,18 +691,10 @@ static void test_pre_setup(const void *test_data)
 static void test_post_teardown(const void *test_data)
 {
 	struct test_data *data = tester_get_data();
-	const struct iso_client_data *isodata = test_data;
 
 	mgmt_send(data->mgmt, MGMT_OP_SET_EXP_FEATURE, MGMT_INDEX_NONE,
 		  sizeof(reset_iso_socket_param), reset_iso_socket_param,
 		  NULL, NULL, NULL);
-
-	if (isodata && isodata->no_poll_errqueue) {
-		mgmt_send(data->mgmt, MGMT_OP_SET_EXP_FEATURE, MGMT_INDEX_NONE,
-			  sizeof(reset_poll_errqueue_param),
-			  reset_poll_errqueue_param,
-			  NULL, NULL, NULL);
-	}
 
 	hciemu_unref(data->hciemu);
 	data->hciemu = NULL;
@@ -1056,6 +1013,12 @@ static const struct iovec send_48_2_1 = {
 	.iov_len = sizeof(data_48_2_1),
 };
 
+static const uint8_t data_large[512] = { [0 ... 511] = 0xff };
+static const struct iovec send_large = {
+	.iov_base = (void *)data_large,
+	.iov_len = sizeof(data_large),
+};
+
 static const struct iso_client_data connect_16_2_1_send = {
 	.qos = QOS_16_2_1,
 	.expect_err = 0,
@@ -1085,20 +1048,17 @@ static const struct iso_client_data connect_send_tx_cmsg_timestamping = {
 	.cmsg_timestamping = true,
 };
 
-static const struct iso_client_data connect_send_tx_no_poll_timestamping = {
-	.qos = QOS_16_2_1,
-	.expect_err = 0,
-	.send = &send_16_2_1,
-	.so_timestamping = (SOF_TIMESTAMPING_SOFTWARE |
-					SOF_TIMESTAMPING_TX_COMPLETION),
-	.repeat_send = 1,
-	.no_poll_errqueue = true,
-};
-
 static const struct iso_client_data listen_16_2_1_recv = {
 	.qos = QOS_16_2_1,
 	.expect_err = 0,
 	.recv = &send_16_2_1,
+	.server = true,
+};
+
+static const struct iso_client_data listen_16_2_1_recv_frag = {
+	.qos = QOS_16_2_1,
+	.expect_err = 0,
+	.recv = &send_large,
 	.server = true,
 };
 
@@ -1118,6 +1078,14 @@ static const struct iso_client_data listen_16_2_1_recv_pkt_status = {
 	.pkt_status = 0x02,
 };
 
+static const struct iso_client_data listen_16_2_1_recv_pkt_seqnum = {
+	.qos = QOS_16_2_1,
+	.expect_err = 0,
+	.recv = &send_16_2_1,
+	.server = true,
+	.pkt_seqnum = true,
+};
+
 static const struct iso_client_data listen_16_2_1_recv_rx_timestamping = {
 	.qos = QOS_16_2_1,
 	.expect_err = 0,
@@ -1125,6 +1093,26 @@ static const struct iso_client_data listen_16_2_1_recv_rx_timestamping = {
 	.server = true,
 	.so_timestamping = (SOF_TIMESTAMPING_SOFTWARE |
 					SOF_TIMESTAMPING_RX_SOFTWARE),
+};
+
+static const struct iso_client_data listen_16_2_1_recv_hw_timestamping = {
+	.qos = QOS_16_2_1,
+	.expect_err = 0,
+	.recv = &send_16_2_1,
+	.server = true,
+	.ts = true,
+	.so_timestamping = (SOF_TIMESTAMPING_RAW_HARDWARE |
+					SOF_TIMESTAMPING_RX_HARDWARE),
+};
+
+static const struct iso_client_data listen_16_2_1_recv_frag_hw_timestamping = {
+	.qos = QOS_16_2_1,
+	.expect_err = 0,
+	.recv = &send_large,
+	.server = true,
+	.ts = true,
+	.so_timestamping = (SOF_TIMESTAMPING_RAW_HARDWARE |
+					SOF_TIMESTAMPING_RX_HARDWARE),
 };
 
 static const struct iso_client_data defer_16_2_1 = {
@@ -1198,6 +1186,14 @@ static const struct iso_client_data suspend_16_2_1 = {
 static const struct iso_client_data reconnect_16_2_1 = {
 	.qos = QOS_16_2_1,
 	.expect_err = 0,
+	.disconnect = true,
+};
+
+static const struct iso_client_data reconnect_16_2_1_send_recv = {
+	.qos = QOS_16_2_1,
+	.expect_err = 0,
+	.send = &send_16_2_1,
+	.recv = &send_16_2_1,
 	.disconnect = true,
 };
 
@@ -1432,6 +1428,15 @@ static const struct iso_client_data bcast_16_2_1_send_sid1 = {
 	.sid = 0x01,
 };
 
+static const struct iso_client_data bcast_16_2_1_reconnect = {
+	.qos = QOS_OUT_16_2_1,
+	.expect_err = 0,
+	.bcast = true,
+	.base = base_lc3_16_2_1,
+	.base_len = sizeof(base_lc3_16_2_1),
+	.disconnect = true,
+};
+
 static const struct iso_client_data bcast_16_2_1_recv = {
 	.qos = QOS_IN_16_2_1,
 	.expect_err = 0,
@@ -1619,9 +1624,8 @@ static void bthost_recv_data(const void *buf, uint16_t len, void *user_data)
 			memcmp(isodata->send->iov_base, buf, len))) {
 		if (!isodata->recv->iov_base)
 			tester_test_failed();
-	} else if (!data->step) {
+	} else if (!data->step)
 		tester_test_passed();
-	}
 }
 
 static void bthost_iso_disconnected(void *user_data)
@@ -2201,6 +2205,71 @@ static bool check_bcast_qos(const struct bt_iso_qos *qos1,
 	return true;
 }
 
+static void test_connect(const void *test_data);
+static gboolean iso_connect_cb(GIOChannel *io, GIOCondition cond,
+							gpointer user_data);
+static gboolean iso_accept_cb(GIOChannel *io, GIOCondition cond,
+							gpointer user_data);
+static bool iso_defer_accept_bcast(struct test_data *data, GIOChannel *io,
+						uint8_t num, GIOFunc func);
+
+static gboolean iso_disconnected(GIOChannel *io, GIOCondition cond,
+							gpointer user_data)
+{
+	struct test_data *data = user_data;
+	const struct iso_client_data *isodata = data->test_data;
+
+	data->io_id[0] = 0;
+
+	if (cond & G_IO_HUP) {
+		if (!isodata->bcast && data->handle)
+			tester_test_failed();
+
+		tester_print("Successfully disconnected");
+
+		if (data->reconnect) {
+			tester_print("Reconnecting #%u...", data->reconnect);
+
+			data->reconnect--;
+
+			if (!isodata->server)
+				test_connect(data->test_data);
+			else {
+				GIOChannel *parent =
+					queue_peek_head(data->io_queue);
+
+				data->step++;
+
+				iso_defer_accept_bcast(data,
+					parent, 0, iso_accept_cb);
+			}
+
+			return FALSE;
+		}
+
+		tester_test_passed();
+	} else
+		tester_test_failed();
+
+	return FALSE;
+}
+
+static void iso_shutdown(struct test_data *data, GIOChannel *io)
+{
+	int sk;
+
+	sk = g_io_channel_unix_get_fd(io);
+
+	data->io_id[0] = g_io_add_watch(io, G_IO_HUP, iso_disconnected, data);
+
+	/* Shutdown using SHUT_WR as SHUT_RDWR cause the socket to HUP
+	 * immediately instead of waiting for Disconnect Complete event.
+	 */
+	shutdown(sk, SHUT_WR);
+
+	tester_print("Disconnecting...");
+}
+
 static gboolean iso_recv_data(GIOChannel *io, GIOCondition cond,
 							gpointer user_data)
 {
@@ -2261,11 +2330,55 @@ static gboolean iso_recv_data(GIOChannel *io, GIOCondition cond,
 		return FALSE;
 	}
 
-	if (isodata->so_timestamping & SOF_TIMESTAMPING_RX_SOFTWARE)
-		rx_timestamp_check(&msg);
+	if (isodata->pkt_seqnum) {
+		struct cmsghdr *cmsg;
+		uint16_t pkt_seqnum = 0;
+
+		for (cmsg = CMSG_FIRSTHDR(&msg); cmsg != NULL;
+					cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+			if (cmsg->cmsg_level != SOL_BLUETOOTH)
+				continue;
+
+			if (cmsg->cmsg_type == BT_SCM_PKT_SEQNUM) {
+				memcpy(&pkt_seqnum, CMSG_DATA(cmsg),
+						sizeof(pkt_seqnum));
+				tester_debug("BT_SCM_PKT_SEQNUM = 0x%2.2x",
+							pkt_seqnum);
+				break;
+			}
+		}
+
+		if (data->seqnum < 0)
+			data->seqnum = pkt_seqnum;
+		else
+			data->seqnum++;
+
+		if (pkt_seqnum != data->seqnum) {
+			tester_warn("isodata->pkt_seqnum 0x%2.2x != 0x%2.2x "
+					"pkt_seqnum", pkt_seqnum, data->seqnum);
+			tester_test_failed();
+			return FALSE;
+		}
+	}
+
+	if (rx_timestamp_check(&msg, isodata->so_timestamping, 1000) < 0) {
+		tester_test_failed();
+		return FALSE;
+	}
+
+	if (data->step) {
+		data->step--;
+	} else {
+		tester_test_failed();
+		return FALSE;
+	}
 
 	if (memcmp(buf, isodata->recv->iov_base, ret))
 		tester_test_failed();
+	else if (data->step)
+		return TRUE;
+	else if (isodata->disconnect)
+		iso_shutdown(data, io);
 	else
 		tester_test_passed();
 
@@ -2277,6 +2390,7 @@ static void iso_recv(struct test_data *data, GIOChannel *io)
 	const struct iso_client_data *isodata = data->test_data;
 	struct bthost *host;
 	static uint16_t sn;
+	int j, count;
 
 	tester_print("Receive %zu bytes of data", isodata->recv->iov_len);
 
@@ -2291,8 +2405,13 @@ static void iso_recv(struct test_data *data, GIOChannel *io)
 		return;
 
 	host = hciemu_client_get_host(data->hciemu);
-	bthost_send_iso(host, data->handle, isodata->ts, sn++, 0,
-				isodata->pkt_status, isodata->recv, 1);
+
+	count = isodata->pkt_seqnum ? 2 : 1;
+	for (j = 0; j < count; ++j) {
+		bthost_send_iso(host, data->handle, isodata->ts, sn++, j + 1,
+					isodata->pkt_status, isodata->recv, 1);
+		data->step++;
+	}
 
 	data->io_id[0] = g_io_add_watch(io, G_IO_IN, iso_recv_data, data);
 }
@@ -2319,37 +2438,6 @@ static gboolean iso_recv_errqueue(GIOChannel *io, GIOCondition cond,
 	return FALSE;
 }
 
-static gboolean iso_fail_errqueue(GIOChannel *io, GIOCondition cond,
-							gpointer user_data)
-{
-	struct test_data *data = user_data;
-
-	tester_warn("Unexpected POLLERR");
-	tester_test_failed();
-
-	data->io_id[3] = 0;
-	return FALSE;
-}
-
-static gboolean iso_timer_errqueue(gpointer user_data)
-{
-	struct test_data *data = user_data;
-	GIOChannel *io;
-	gboolean ret;
-
-	io = queue_peek_head(data->io_queue);
-	g_assert(io);
-
-	ret = iso_recv_errqueue(io, G_IO_IN, data);
-	if (!ret) {
-		if (data->io_id[3])
-			g_source_remove(data->io_id[3]);
-		data->io_id[3] = 0;
-	}
-
-	return ret;
-}
-
 static void iso_tx_timestamping(struct test_data *data, GIOChannel *io)
 {
 	const struct iso_client_data *isodata = data->test_data;
@@ -2370,39 +2458,7 @@ static void iso_tx_timestamping(struct test_data *data, GIOChannel *io)
 
 	sk = g_io_channel_unix_get_fd(io);
 
-	if (isodata->no_poll_errqueue) {
-		uint32_t flag = 0;
-
-		err = setsockopt(sk, SOL_BLUETOOTH, BT_POLL_ERRQUEUE,
-							&flag, sizeof(flag));
-		if (err < 0) {
-			tester_warn("setsockopt BT_POLL_ERRQUEUE: %s (%d)",
-						strerror(errno), errno);
-			tester_test_failed();
-			return;
-		}
-
-		if (!data->io_queue)
-			data->io_queue = queue_new();
-		queue_push_head(data->io_queue, g_io_channel_ref(io));
-
-		data->io_id[2] = g_timeout_add(100, iso_timer_errqueue, data);
-		data->io_id[3] = g_io_add_watch(io, G_IO_ERR, iso_fail_errqueue,
-									data);
-	} else {
-		uint32_t flag = 1;
-
-		err = setsockopt(sk, SOL_BLUETOOTH, BT_POLL_ERRQUEUE,
-							&flag, sizeof(flag));
-		if (err >= 0) {
-			tester_warn("BT_POLL_ERRQUEUE available");
-			tester_test_failed();
-			return;
-		}
-
-		data->io_id[2] = g_io_add_watch(io, G_IO_ERR, iso_recv_errqueue,
-									data);
-	}
+	data->io_id[2] = g_io_add_watch(io, G_IO_ERR, iso_recv_errqueue, data);
 
 	if (isodata->cmsg_timestamping)
 		so &= ~TS_TX_RECORD_MASK;
@@ -2457,10 +2513,16 @@ static void iso_send_data(struct test_data *data, GIOChannel *io)
 	data->step++;
 }
 
-static void iso_send(struct test_data *data, GIOChannel *io)
+static gboolean iso_pollout(GIOChannel *io, GIOCondition cond,
+				gpointer user_data)
 {
+	struct test_data *data = user_data;
 	const struct iso_client_data *isodata = data->test_data;
 	unsigned int count;
+
+	data->io_id[0] = 0;
+
+	tester_print("POLLOUT event received");
 
 	for (count = 0; count < isodata->repeat_send_pre_ts; ++count)
 		iso_send_data(data, io);
@@ -2472,74 +2534,18 @@ static void iso_send(struct test_data *data, GIOChannel *io)
 
 	if (isodata->bcast) {
 		tester_test_passed();
-		return;
+		return FALSE;
 	}
 
 	if (isodata->recv)
 		iso_recv(data, io);
-}
-
-static void test_connect(const void *test_data);
-static gboolean iso_connect_cb(GIOChannel *io, GIOCondition cond,
-							gpointer user_data);
-static gboolean iso_accept_cb(GIOChannel *io, GIOCondition cond,
-							gpointer user_data);
-static bool iso_defer_accept_bcast(struct test_data *data, GIOChannel *io,
-						uint8_t num, GIOFunc func);
-
-static gboolean iso_disconnected(GIOChannel *io, GIOCondition cond,
-							gpointer user_data)
-{
-	struct test_data *data = user_data;
-	const struct iso_client_data *isodata = data->test_data;
-
-	data->io_id[0] = 0;
-
-	if (cond & G_IO_HUP) {
-		if (!isodata->bcast && data->handle)
-			tester_test_failed();
-
-		tester_print("Successfully disconnected");
-
-		if (data->reconnect) {
-			data->reconnect = false;
-
-			if (!isodata->server)
-				test_connect(data->test_data);
-			else {
-				GIOChannel *parent =
-					queue_peek_head(data->io_queue);
-
-				data->step++;
-
-				iso_defer_accept_bcast(data,
-					parent, 0, iso_accept_cb);
-			}
-
-			return FALSE;
-		}
-
-		tester_test_passed();
-	} else
-		tester_test_failed();
 
 	return FALSE;
 }
 
-static void iso_shutdown(struct test_data *data, GIOChannel *io)
+static void iso_send(struct test_data *data, GIOChannel *io)
 {
-	int sk;
-
-	sk = g_io_channel_unix_get_fd(io);
-
-	data->io_id[0] = g_io_add_watch(io, G_IO_HUP, iso_disconnected, data);
-
-	/* Shutdown using SHUT_WR as SHUT_RDWR cause the socket to HUP
-	 * immediately instead of waiting for Disconnect Complete event.
-	 */
-	shutdown(sk, SHUT_WR);
-
-	tester_print("Disconnecting...");
+	data->io_id[0] = g_io_add_watch(io, G_IO_OUT, iso_pollout, data);
 }
 
 static bool hook_set_event_mask(const void *msg, uint16_t len, void *user_data)
@@ -2873,7 +2879,15 @@ static void test_reconnect(const void *test_data)
 {
 	struct test_data *data = tester_get_data();
 
-	data->reconnect = true;
+	data->reconnect = 1;
+	test_connect(test_data);
+}
+
+static void test_reconnect_16(const void *test_data)
+{
+	struct test_data *data = tester_get_data();
+
+	data->reconnect = 16;
 	test_connect(test_data);
 }
 
@@ -3213,6 +3227,20 @@ static gboolean iso_accept(GIOChannel *io, GIOCondition cond,
 		}
 	}
 
+	if (isodata->pkt_seqnum) {
+		int opt = 1;
+
+		data->seqnum = -1;
+
+		if (setsockopt(new_sk, SOL_BLUETOOTH, BT_PKT_SEQNUM, &opt,
+							sizeof(opt)) < 0) {
+			tester_print("Can't set socket BT_PKT_SEQNUM option: "
+					"%s (%d)", strerror(errno), errno);
+			tester_test_failed();
+			return false;
+		}
+	}
+
 	ret = iso_connect(new_io, cond, user_data);
 
 	g_io_channel_unref(new_io);
@@ -3490,6 +3518,14 @@ static void test_bcast(const void *test_data)
 	setup_connect(data, 0, iso_connect_cb);
 }
 
+static void test_bcast_reconnect(const void *test_data)
+{
+	struct test_data *data = tester_get_data();
+
+	data->reconnect = 1;
+	setup_connect(data, 0, iso_connect_cb);
+}
+
 static void test_bcast2(const void *test_data)
 {
 	struct test_data *data = tester_get_data();
@@ -3507,7 +3543,7 @@ static void test_bcast2_reconn(const void *test_data)
 
 	data->io_queue = queue_new();
 
-	data->reconnect = true;
+	data->reconnect = 1;
 	setup_connect_many(data, 2, num, funcs);
 }
 
@@ -3540,7 +3576,7 @@ static void test_bcast_recv_defer_reconnect(const void *test_data)
 {
 	struct test_data *data = tester_get_data();
 
-	data->reconnect = true;
+	data->reconnect = 1;
 	data->step = 1;
 
 	setup_listen(data, 0, iso_accept_cb);
@@ -3763,12 +3799,11 @@ int main(int argc, char *argv[])
 			&connect_send_tx_cmsg_timestamping, setup_powered,
 			test_connect);
 
-	/* Test TX timestamping and disabling POLLERR wakeup */
-	test_iso("ISO Send - TX No Poll Timestamping",
-			&connect_send_tx_no_poll_timestamping, setup_powered,
-			test_connect);
-
 	test_iso("ISO Receive - Success", &listen_16_2_1_recv, setup_powered,
+							test_listen);
+
+	test_iso("ISO Receive Fragmented - Success", &listen_16_2_1_recv_frag,
+							setup_powered,
 							test_listen);
 
 	test_iso("ISO Receive Timestamped - Success", &listen_16_2_1_recv_ts,
@@ -3779,9 +3814,21 @@ int main(int argc, char *argv[])
 						&listen_16_2_1_recv_pkt_status,
 						setup_powered, test_listen);
 
+	test_iso("ISO Receive Packet Seqnum - Success",
+						&listen_16_2_1_recv_pkt_seqnum,
+						setup_powered, test_listen);
+
 	test_iso("ISO Receive - RX Timestamping",
 					&listen_16_2_1_recv_rx_timestamping,
 					setup_powered, test_listen);
+
+	test_iso("ISO Receive - HW Timestamping",
+					&listen_16_2_1_recv_hw_timestamping,
+					setup_powered, test_listen);
+
+	test_iso("ISO Receive Fragmented - HW Timestamping",
+				&listen_16_2_1_recv_frag_hw_timestamping,
+				setup_powered, test_listen);
 
 	test_iso("ISO Defer - Success", &defer_16_2_1, setup_powered,
 							test_defer);
@@ -3862,6 +3909,11 @@ int main(int argc, char *argv[])
 	test_iso("ISO Reconnect - Success", &reconnect_16_2_1,
 							setup_powered,
 							test_reconnect);
+
+	test_iso("ISO Reconnect Send and Receive #16 - Success",
+						&reconnect_16_2_1_send_recv,
+						setup_powered,
+						test_reconnect_16);
 
 	test_iso("ISO AC 1 & 4 - Success", &connect_ac_1_4, setup_powered,
 							test_connect);
@@ -3944,6 +3996,9 @@ int main(int argc, char *argv[])
 	test_iso("ISO Broadcaster SID 0x01 - Success", &bcast_16_2_1_send_sid1,
 							setup_powered,
 							test_bcast);
+	test_iso("ISO Broadcaster Reconnect - Success", &bcast_16_2_1_reconnect,
+							setup_powered,
+							test_bcast_reconnect);
 
 	test_iso("ISO Broadcaster Receiver - Success", &bcast_16_2_1_recv,
 							setup_powered,

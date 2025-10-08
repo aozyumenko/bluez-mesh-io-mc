@@ -24,11 +24,11 @@
 
 #include <glib.h>
 
-#include "lib/bluetooth.h"
-#include "lib/hci.h"
-#include "lib/hci_lib.h"
-#include "lib/mgmt.h"
-#include "lib/l2cap.h"
+#include "bluetooth/bluetooth.h"
+#include "bluetooth/hci.h"
+#include "bluetooth/hci_lib.h"
+#include "bluetooth/mgmt.h"
+#include "bluetooth/l2cap.h"
 
 #include "monitor/bt.h"
 #include "emulator/vhci.h"
@@ -1509,7 +1509,6 @@ static const char set_ssp_invalid_param[] = { 0x02 };
 static const char set_ssp_garbage_param[] = { 0x01, 0x00 };
 static const char set_ssp_settings_param_1[] = { 0xc0, 0x00, 0x00, 0x00 };
 static const char set_ssp_settings_param_2[] = { 0xc1, 0x00, 0x00, 0x00 };
-static const char set_ssp_settings_param_3[] = { 0xc1, 0x00, 0x40, 0x00 };
 static const char set_ssp_on_write_ssp_mode_param[] = { 0x01 };
 
 static const struct generic_data set_ssp_on_success_test_1 = {
@@ -6078,8 +6077,8 @@ static const struct generic_data set_dev_id_power_off_on = {
 	.send_param = set_powered_on_param,
 	.send_len = sizeof(set_powered_on_param),
 	.expect_status = MGMT_STATUS_SUCCESS,
-	.expect_param = set_ssp_settings_param_3,
-	.expect_len = sizeof(set_ssp_settings_param_3),
+	.expect_param = set_ssp_settings_param_2,
+	.expect_len = sizeof(set_ssp_settings_param_2),
 	.expect_settings_set = MGMT_SETTING_POWERED,
 	.expect_hci_command = BT_HCI_CMD_WRITE_EXT_INQUIRY_RESPONSE,
 	.expect_hci_param = write_eir_set_dev_id_success_1,
@@ -6095,8 +6094,8 @@ static const struct generic_data set_dev_id_ssp_off_on = {
 	.send_param = set_ssp_on_param,
 	.send_len = sizeof(set_ssp_on_param),
 	.expect_status = MGMT_STATUS_SUCCESS,
-	.expect_param = set_ssp_settings_param_3,
-	.expect_len = sizeof(set_ssp_settings_param_3),
+	.expect_param = set_ssp_settings_param_2,
+	.expect_len = sizeof(set_ssp_settings_param_2),
 	.expect_hci_command = BT_HCI_CMD_WRITE_EXT_INQUIRY_RESPONSE,
 	.expect_hci_param = write_eir_set_dev_id_success_1,
 	.expect_hci_len = sizeof(write_eir_set_dev_id_success_1),
@@ -6192,7 +6191,7 @@ static void setup_pairing_acceptor(const void *test_data)
 	setup_bthost();
 }
 
-/* Generic callback for checking the mgmt evnet status
+/* Generic callback for checking the mgmt event status
  */
 static void generic_mgmt_status_callback(uint8_t status, uint16_t length,
 					const void *param, void *user_data)
@@ -8599,15 +8598,13 @@ static const struct generic_data add_ext_advertising_success_17 = {
 	.expect_hci_len = sizeof(preset_connectable_off_ext_adv_param),
 };
 
-static const char set_le_settings_param_off_1[] = { 0x81, 0x00, 0x40, 0x00 };
-
 static const struct generic_data add_ext_advertising_le_off = {
 	.send_opcode = MGMT_OP_SET_LE,
 	.send_param = set_le_off_param,
 	.send_len = sizeof(set_le_off_param),
 	.expect_status = MGMT_STATUS_SUCCESS,
-	.expect_param = set_le_settings_param_off_1,
-	.expect_len = sizeof(set_le_settings_param_off_1),
+	.expect_param = set_le_settings_param_off,
+	.expect_len = sizeof(set_le_settings_param_off),
 	.expect_alt_ev = MGMT_EV_ADVERTISING_REMOVED,
 	.expect_alt_ev_param = advertising_instance1_param,
 	.expect_alt_ev_len = sizeof(advertising_instance1_param),
@@ -10045,8 +10042,8 @@ static void setup_set_exp_feature_alt(const void *test_data)
 {
 	struct test_data *data = tester_get_data();
 
-	/* Send the Read Experiemental Features Information command to receive
-	 * the Experiemental Feature Changed event
+	/* Send the Read Experimental Features Information command to receive
+	 * the Experimental Feature Changed event
 	 */
 	mgmt_send(data->mgmt_alt, MGMT_OP_READ_EXP_FEATURES_INFO,
 			data->mgmt_index, 0, NULL,
@@ -14396,7 +14393,7 @@ int main(int argc, char *argv[])
 	test_bredrle50("Set PHY 2m Success", &set_phy_2m_success,
 					NULL, test_command_generic);
 
-	test_bredrle50("Set PHY coded Succcess", &set_phy_coded_success,
+	test_bredrle50("Set PHY coded Success", &set_phy_coded_success,
 					NULL, test_command_generic);
 
 	test_bredrle50("Set PHY 2m tx success", &set_phy_2m_tx_success,
@@ -15001,7 +14998,7 @@ int main(int argc, char *argv[])
 	 * Setup: Enable Privacy, LL Privacy
 	 * Run: Pair device, disconnect, add device, add 2nd device, and
 	 *      remove the client, then unpair.
-	 * Expect: Expect the clinet is removed from the Accept List.
+	 * Expect: Expect the client is removed from the Accept List.
 	 */
 	test_bredrle50_full("LL Privacy - Unpair 2 (Remove from AL)",
 				&ll_privacy_unpair_2,

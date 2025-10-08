@@ -20,9 +20,9 @@
 
 #include <glib.h>
 
-#include "lib/bluetooth.h"
-#include "lib/l2cap.h"
-#include "lib/mgmt.h"
+#include "bluetooth/bluetooth.h"
+#include "bluetooth/l2cap.h"
+#include "bluetooth/mgmt.h"
 
 #include "monitor/bt.h"
 #include "emulator/bthost.h"
@@ -1954,6 +1954,7 @@ static int connect_socket(const uint8_t *client_bdaddr, GIOFunc connect_cb,
 			tester_print("Can't enable deferred setup: %s (%d)",
 						strerror(errno), errno);
 			tester_test_failed();
+			close(sk);
 			return -1;
 		}
 	}
@@ -2010,7 +2011,7 @@ static gboolean test_close_socket_1_part_2(gpointer args)
 
 	tester_print("Will close socket during scan phase...");
 
-	/* We tried to conect to LE device that is not advertising. It
+	/* We tried to connect to LE device that is not advertising. It
 	 * was added to kernel accept list, and scan was started. We
 	 * should be still scanning.
 	 */
@@ -2526,7 +2527,7 @@ static void test_getpeername_not_connected(const void *test_data)
 	}
 
 	if (errno != ENOTCONN) {
-		tester_warn("Unexpexted getpeername error: %s (%d)",
+		tester_warn("Unexpected getpeername error: %s (%d)",
 						strerror(errno), errno);
 		tester_test_failed();
 		goto done;

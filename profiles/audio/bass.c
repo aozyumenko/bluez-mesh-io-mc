@@ -27,9 +27,9 @@
 
 #include "gdbus/gdbus.h"
 
-#include "lib/bluetooth.h"
-#include "lib/uuid.h"
-#include "lib/iso.h"
+#include "bluetooth/bluetooth.h"
+#include "bluetooth/uuid.h"
+#include "bluetooth/iso.h"
 
 #include "src/dbus-common.h"
 #include "src/shared/util.h"
@@ -349,6 +349,9 @@ static void bap_state_changed(struct bt_bap_stream *stream, uint8_t old_state,
 	struct bass_setup *setup = queue_find(dg->setups,
 				match_setup_stream, stream);
 
+	if (setup == NULL)
+		return;
+
 	if (dg->bap != bap)
 		return;
 
@@ -546,7 +549,7 @@ static void bis_handler(uint8_t sid, uint8_t bis, uint8_t sgrp,
 
 	queue_push_tail(setup->dg->setups, setup);
 
-	/* Only handle streams required by the Brodcast Assistant. */
+	/* Only handle streams required by the Broadcast Assistant. */
 	if (!bt_bass_check_bis(dg->src, bis))
 		return;
 
@@ -915,7 +918,7 @@ static DBusMessage *push(DBusConnection *conn, DBusMessage *msg,
 {
 	struct bass_assistant *assistant = user_data;
 	struct bt_bass_bcast_audio_scan_cp_hdr hdr;
-	struct bt_bass_add_src_params params;
+	struct bt_bass_add_src_params params = {0};
 	struct iovec iov = {0};
 	uint32_t bis_sync = 0;
 	uint8_t meta_len = 0;
