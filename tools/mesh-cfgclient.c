@@ -1162,6 +1162,7 @@ static void import_node_reply(struct l_dbus_proxy *proxy,
 				struct l_dbus_message *msg, void *user_data)
 {
 	struct generic_request *req = user_data;
+	uint8_t *uuid;
 	uint16_t primary, net_idx;
 	uint8_t ele_cnt;
 
@@ -1172,12 +1173,15 @@ static void import_node_reply(struct l_dbus_proxy *proxy,
 		l_error("Failed to import remote node: %s", name);
 		return;
 	}
-
+	uuid = req->data1;
 	net_idx = (uint16_t) req->arg1;
 	primary = (uint16_t) req->arg2;
 	ele_cnt = (uint8_t) req->arg3;
 
 	remote_add_node(req->data1, primary, ele_cnt, net_idx);
+
+	if (!mesh_db_add_node(uuid, ele_cnt, primary, net_idx))
+		l_error("Failed to store imported remote node");
 }
 
 static void import_node_setup(struct l_dbus_message *msg, void *user_data)
