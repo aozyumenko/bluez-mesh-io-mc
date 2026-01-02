@@ -44,7 +44,8 @@ if AVRCP
 builtin_modules += avrcp
 builtin_sources += profiles/audio/control.h profiles/audio/control.c \
 			profiles/audio/avctp.h profiles/audio/avctp.c \
-			profiles/audio/avrcp.h profiles/audio/avrcp.c
+			profiles/audio/avrcp.h profiles/audio/avrcp.c \
+			profiles/audio/avrcp-player.c
 endif
 
 if NETWORK
@@ -146,7 +147,22 @@ builtin_modules += csip
 builtin_sources += profiles/audio/csip.c
 endif
 
+if TMAP
+builtin_modules += tmap
+builtin_sources += profiles/audio/tmap.c
+endif
+
+if GMAP
+builtin_modules += gmap
+builtin_sources += profiles/audio/gmap.c
+endif
+
 if ASHA
 builtin_modules += asha
 builtin_sources += profiles/audio/asha.h profiles/audio/asha.c
+endif
+
+if HFP
+builtin_modules += hfp
+builtin_sources += profiles/audio/telephony.h profiles/audio/telephony.c profiles/audio/hfp-hf.c
 endif

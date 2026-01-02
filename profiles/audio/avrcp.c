@@ -4868,6 +4868,7 @@ done:
 
 static struct btd_profile avrcp_target_profile = {
 	.name		= "audio-avrcp-target",
+	.bearer		= BTD_PROFILE_BEARER_BREDR,
 
 	.remote_uuid	= AVRCP_TARGET_UUID,
 	.device_probe	= avrcp_target_probe,
@@ -4951,6 +4952,7 @@ done:
 
 static struct btd_profile avrcp_controller_profile = {
 	.name		= "avrcp-controller",
+	.bearer		= BTD_PROFILE_BEARER_BREDR,
 
 	.remote_uuid	= AVRCP_REMOTE_UUID,
 	.device_probe	= avrcp_controller_probe,
@@ -4970,11 +4972,15 @@ static int avrcp_init(void)
 
 	populate_default_features();
 
+	avrcp_player_init();
+
 	return 0;
 }
 
 static void avrcp_exit(void)
 {
+	avrcp_player_exit();
+
 	btd_profile_unregister(&avrcp_controller_profile);
 	btd_profile_unregister(&avrcp_target_profile);
 }

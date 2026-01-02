@@ -46,6 +46,8 @@
 #include "src/shared/gatt-client.h"
 #include "src/shared/gatt-server.h"
 #include "src/shared/bap.h"
+#include "src/shared/tmap.h"
+#include "src/shared/gmap.h"
 
 #include "btio/btio.h"
 #include "src/plugin.h"
@@ -139,7 +141,8 @@ struct bap_data {
 	GIOChannel *listen_io;
 	unsigned int io_id;
 	unsigned int cig_update_id;
-	void *user_data;
+	bool services_ready;
+	bool bap_ready;
 };
 
 static struct queue *sessions;
@@ -151,16 +154,6 @@ static int bap_select_all(struct bap_data *data, bool reconfigure,
 static void setup_create_io(struct bap_data *data, struct bap_setup *setup,
 				struct bt_bap_stream *stream, int defer);
 static void bap_update_cigs(struct bap_data *data);
-
-static bool bap_data_set_user_data(struct bap_data *data, void *user_data)
-{
-	if (!data)
-		return false;
-
-	data->user_data = user_data;
-
-	return true;
-}
 
 static void bap_debug(const char *str, void *user_data)
 {
@@ -449,6 +442,104 @@ static gboolean get_qos(const GDBusPropertyTable *property,
 	return TRUE;
 }
 
+static bool probe_tmap_role(struct bap_ep *ep, uint32_t data)
+{
+	struct gatt_db *db = bt_bap_get_db(ep->data->bap, true);
+
+	return bt_tmap_get_role(bt_tmap_find(db)) & data;
+}
+
+static bool probe_gmap_role(struct bap_ep *ep, uint32_t data)
+{
+	struct gatt_db *db = bt_bap_get_db(ep->data->bap, true);
+
+	return bt_gmap_get_role(bt_gmap_find(db)) & data;
+}
+
+static bool probe_gmap_feature(struct bap_ep *ep, uint32_t data)
+{
+	struct gatt_db *db = bt_bap_get_db(ep->data->bap, true);
+
+	return bt_gmap_get_features(bt_gmap_find(db)) & data;
+}
+
+struct feature {
+	const char *name;
+	bool (*probe)(struct bap_ep *ep, uint32_t data);
+	uint32_t data;
+};
+
+#define TMAP_ROLE(key)		{ key ## _STR, probe_tmap_role, key },
+
+static const struct feature tmap_features[] = {
+	BT_TMAP_ROLE_LIST(TMAP_ROLE)
+};
+
+#define GMAP_ROLE(key)		{ key ## _STR, probe_gmap_role, key },
+#define GMAP_FEATURE(key)	{ key ## _STR, probe_gmap_feature, key },
+
+static const struct feature gmap_features[] = {
+	BT_GMAP_ROLE_LIST(GMAP_ROLE)
+	BT_GMAP_FEATURE_LIST(GMAP_FEATURE)
+};
+
+static const struct {
+	const char *uuid;
+	const struct feature *items;
+	size_t count;
+} features[] = {
+	{ TMAS_UUID_STR, tmap_features, ARRAY_SIZE(tmap_features) },
+	{ GMAS_UUID_STR, gmap_features, ARRAY_SIZE(gmap_features) },
+};
+
+static gboolean supported_features(const GDBusPropertyTable *property,
+					DBusMessageIter *iter, void *data)
+{
+	struct bap_ep *ep = data;
+	DBusMessageIter dict, entry, variant, list;
+	size_t i, j;
+
+	dbus_message_iter_open_container(iter, DBUS_TYPE_ARRAY, "{sv}", &dict);
+
+	for (i = 0; i < ARRAY_SIZE(features); ++i) {
+		for (j = 0; j < features[i].count; ++j) {
+			const struct feature *feature = &features[i].items[j];
+
+			if (feature->probe(ep, feature->data))
+				break;
+		}
+		if (j == features[i].count)
+			continue;
+
+		dbus_message_iter_open_container(&dict, DBUS_TYPE_DICT_ENTRY,
+								NULL, &entry);
+		dbus_message_iter_append_basic(&entry, DBUS_TYPE_STRING,
+							&features[i].uuid);
+		dbus_message_iter_open_container(&entry, DBUS_TYPE_VARIANT,
+								"as", &variant);
+		dbus_message_iter_open_container(&variant, DBUS_TYPE_ARRAY,
+								"s", &list);
+
+		for (j = 0; j < features[i].count; ++j) {
+			const struct feature *feature = &features[i].items[j];
+
+			if (!feature->probe(ep, feature->data))
+				continue;
+
+			dbus_message_iter_append_basic(&list, DBUS_TYPE_STRING,
+								&feature->name);
+		}
+
+		dbus_message_iter_close_container(&variant, &list);
+		dbus_message_iter_close_container(&entry, &variant);
+		dbus_message_iter_close_container(&dict, &entry);
+	}
+
+	dbus_message_iter_close_container(iter, &dict);
+
+	return TRUE;
+}
+
 static const GDBusPropertyTable ep_properties[] = {
 	{ "UUID", "s", get_uuid, NULL, NULL,
 					G_DBUS_PROPERTY_FLAG_EXPERIMENTAL },
@@ -467,6 +558,8 @@ static const GDBusPropertyTable ep_properties[] = {
 	{ "Context", "q", get_context, NULL, NULL,
 					G_DBUS_PROPERTY_FLAG_EXPERIMENTAL },
 	{ "QoS", "a{sv}", get_qos, NULL, qos_exists,
+					G_DBUS_PROPERTY_FLAG_EXPERIMENTAL },
+	{ "SupportedFeatures", "a{sv}", supported_features, NULL, NULL,
 					G_DBUS_PROPERTY_FLAG_EXPERIMENTAL },
 	{ }
 };
@@ -1151,13 +1244,6 @@ static DBusMessage *set_configuration(DBusConnection *conn, DBusMessage *msg,
 	if (dbus_message_iter_get_arg_type(&props) != DBUS_TYPE_DICT_ENTRY)
 		return btd_error_invalid_args(msg);
 
-	/* Broadcast source supports multiple setups, each setup will be BIS
-	 * and will be configured with the set_configuration command
-	 * TO DO reconfiguration of a BIS.
-	 */
-	if (bt_bap_pac_get_type(ep->lpac) != BT_BAP_BCAST_SOURCE)
-		ep_close(ep, NULL, NULL, NULL);
-
 	setup = setup_new(ep);
 
 	if (setup_parse_configuration(setup, &props) < 0) {
@@ -1527,12 +1613,12 @@ static void iso_pa_sync_confirm_cb(GIOChannel *io, void *user_data)
 								user_data);
 }
 
-static bool match_data_bap_data(const void *data, const void *match_data)
+static bool match_adapter(const void *data, const void *match_data)
 {
 	const struct bap_data *bdata = data;
 	const struct btd_adapter *adapter = match_data;
 
-	return bdata->user_data == adapter;
+	return bdata->adapter == adapter;
 }
 
 static const GDBusMethodTable ep_methods[] = {
@@ -1937,9 +2023,13 @@ static bool pac_select(struct bt_bap_pac *lpac, struct bt_bap_pac *rpac,
 		queue_push_tail(select->eps, ep);
 	}
 
-	bt_bap_select(lpac, rpac, &select->remaining, select_cb, ep);
+	bt_bap_select(data->bap, lpac, rpac, 0, &select->remaining,
+								select_cb, ep);
 
-	return true;
+	/* For initial configuration consider only one endpoint (for each
+	 * direction).
+	 */
+	return select->reconfigure;
 }
 
 static int bap_select_all(struct bap_data *data, bool reconfigure,
@@ -2029,10 +2119,10 @@ static bool pac_found_bcast(struct bt_bap_pac *lpac, struct bt_bap_pac *rpac,
 	return true;
 }
 
-static void bap_ready(struct bt_bap *bap, void *user_data)
+static void bap_ucast_start(struct bap_data *data)
 {
-	struct btd_service *service = user_data;
-	struct bap_data *data = btd_service_get_user_data(service);
+	struct btd_service *service = data->service;
+	struct bt_bap *bap = data->bap;
 
 	DBG("bap %p", bap);
 
@@ -2630,7 +2720,7 @@ static void setup_connect_io_broadcast(struct bap_data *data,
 					struct bt_bap_stream *stream,
 					struct bt_iso_qos *qos, int defer)
 {
-	struct btd_adapter *adapter = data->user_data;
+	struct btd_adapter *adapter = data->adapter;
 	GIOChannel *io = NULL;
 	GError *err = NULL;
 	bdaddr_t dst_addr = {0};
@@ -2874,6 +2964,27 @@ static void bap_state(struct bt_bap_stream *stream, uint8_t old_state,
 		}
 		break;
 	case BT_BAP_STREAM_STATE_STREAMING:
+		/* Order of STREAMING and iso_connect_cb() is nondeterministic.
+		 *
+		 * If iso_connect_cb() did not complete yet, mark IO as
+		 * connected regardless, otherwise transport fails acquiring it.
+		 * If the connect doesn't actually succeed, it is handled via
+		 * normal disconnect flow.
+		 */
+		if (setup) {
+			int fd;
+
+			if (!setup->io || !setup->cis_active)
+				break;
+			if (!bt_bap_stream_io_is_connecting(stream, &fd))
+				break;
+			if (fd != g_io_channel_unix_get_fd(setup->io))
+				break;
+
+			DBG("setup %p stream %p io not yet ready",
+								setup, stream);
+			bt_bap_stream_set_io(stream, fd);
+		}
 		break;
 	}
 }
@@ -3260,14 +3371,6 @@ static void pac_removed_broadcast(struct bt_bap_pac *pac, void *user_data)
 	ep_unregister(ep);
 }
 
-static bool match_device(const void *data, const void *match_data)
-{
-	const struct bap_data *bdata = data;
-	const struct btd_device *device = match_data;
-
-	return bdata->device == device;
-}
-
 static struct bap_data *bap_data_new(struct btd_device *device)
 {
 	struct bap_data *data;
@@ -3602,6 +3705,29 @@ static void pa_and_big_sync(struct bap_setup *setup)
 	}
 }
 
+static void bap_ready(struct bt_bap *bap, void *user_data)
+{
+	struct btd_service *service = user_data;
+	struct bap_data *data = btd_service_get_user_data(service);
+
+	DBG("bap %p", bap);
+
+	data->bap_ready = true;
+	if (data->services_ready)
+		bap_ucast_start(data);
+}
+
+static void bap_services_ready(struct btd_service *service)
+{
+	struct bap_data *data = btd_service_get_user_data(service);
+
+	DBG("%p", data);
+
+	data->services_ready = true;
+	if (data->bap_ready)
+		bap_ucast_start(data);
+}
+
 static int bap_bcast_probe(struct btd_service *service)
 {
 	struct btd_device *device = btd_service_get_device(service);
@@ -3663,6 +3789,14 @@ static int bap_bcast_probe(struct btd_service *service)
 	return 0;
 }
 
+static bool match_service(const void *data, const void *match_data)
+{
+	const struct bap_data *bdata = data;
+	const struct btd_service *service = match_data;
+
+	return bdata->service == service;
+}
+
 static void bap_bcast_remove(struct btd_service *service)
 {
 	struct btd_device *device = btd_service_get_device(service);
@@ -3672,7 +3806,10 @@ static void bap_bcast_remove(struct btd_service *service)
 	ba2str(device_get_address(device), addr);
 	DBG("%s", addr);
 
-	data = queue_find(sessions, match_device, device);
+	/* Lookup the bap session for this service since in case of
+	 * bass_delegator its user data is set by bass plugin.
+	 */
+	data = queue_find(sessions, match_service, service);
 	if (!data) {
 		error("BAP service not handled by profile");
 		return;
@@ -3745,6 +3882,9 @@ static int bap_accept(struct btd_service *service)
 		return -EINVAL;
 	}
 
+	data->bap_ready = false;
+	data->services_ready = false;
+
 	if (!bt_bap_attach(data->bap, client)) {
 		error("BAP unable to attach");
 		return -EINVAL;
@@ -3781,10 +3921,12 @@ static int bap_disconnect(struct btd_service *service)
 
 static int bap_bcast_disconnect(struct btd_service *service)
 {
-	struct btd_device *device = btd_service_get_device(service);
 	struct bap_data *data;
 
-	data = queue_find(sessions, match_device, device);
+	/* Lookup the bap session for this service since in case of
+	 * bass_delegator its user data is set by bass plugin.
+	 */
+	data = queue_find(sessions, match_service, service);
 	if (!data) {
 		error("BAP service not handled by profile");
 		return -EINVAL;
@@ -3828,14 +3970,11 @@ static int bap_adapter_probe(struct btd_profile *p, struct btd_adapter *adapter)
 		return -EINVAL;
 	}
 
+	data->adapter = adapter;
 	data->state_id = bt_bap_state_register(data->bap, bap_state_bcast_src,
 					bap_connecting_bcast, data, NULL);
 	data->pac_id = bt_bap_pac_register(data->bap, pac_added_broadcast,
 					pac_removed_broadcast, data, NULL);
-
-	bap_data_set_user_data(data, adapter);
-
-	data->adapter = adapter;
 
 	return 0;
 }
@@ -3843,8 +3982,7 @@ static int bap_adapter_probe(struct btd_profile *p, struct btd_adapter *adapter)
 static void bap_adapter_remove(struct btd_profile *p,
 					struct btd_adapter *adapter)
 {
-	struct bap_data *data = queue_find(sessions, match_data_bap_data,
-						adapter);
+	struct bap_data *data = queue_find(sessions, match_adapter, adapter);
 	char addr[18];
 
 	ba2str(btd_adapter_get_address(adapter), addr);
@@ -3861,6 +3999,7 @@ static void bap_adapter_remove(struct btd_profile *p,
 static struct btd_profile bap_profile = {
 	.name		= "bap",
 	.priority	= BTD_PROFILE_PRIORITY_MEDIUM,
+	.bearer		= BTD_PROFILE_BEARER_LE,
 	.remote_uuid	= PACS_UUID_STR,
 	.device_probe	= bap_probe,
 	.device_remove	= bap_remove,
@@ -3870,11 +4009,14 @@ static struct btd_profile bap_profile = {
 	.adapter_remove	= bap_adapter_remove,
 	.auto_connect	= true,
 	.experimental	= true,
+	.after_services	= BTD_PROFILE_UUID_CB(bap_services_ready,
+				VCS_UUID_STR, TMAS_UUID_STR, GMAS_UUID_STR),
 };
 
 static struct btd_profile bap_bcast_profile = {
 	.name		= "bcaa",
 	.priority	= BTD_PROFILE_PRIORITY_MEDIUM,
+	.bearer		= BTD_PROFILE_BEARER_LE,
 	.remote_uuid	= BCAAS_UUID_STR,
 	.device_probe	= bap_bcast_probe,
 	.device_remove	= bap_bcast_remove,

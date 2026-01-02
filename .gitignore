@@ -117,11 +117,17 @@ unit/test-ecc
 unit/test-hog
 unit/test-bap
 unit/test-bass
+unit/test-battery
+unit/test-tmap
+unit/test-gmap
+unit/test-mcp
+unit/test-profile
 tools/mgmt-tester
 tools/smp-tester
 tools/gap-tester
 tools/rfcomm-tester
 tools/bnep-tester
+tools/6lowpan-tester
 tools/userchan-tester
 tools/ioctl-tester
 tools/btattach

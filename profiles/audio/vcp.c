@@ -54,7 +54,6 @@
 #include "vcp.h"
 #include "transport.h"
 
-#define VCS_UUID_STR "00001844-0000-1000-8000-00805f9b34fb"
 #define MEDIA_ENDPOINT_INTERFACE "org.bluez.MediaEndpoint1"
 
 struct vcp_data {
@@ -282,6 +281,13 @@ static void vcp_remove(struct btd_service *service)
 	vcp_data_remove(data);
 }
 
+static void vcp_ready(struct bt_vcp *vcp, void *user_data)
+{
+	struct btd_service *service = user_data;
+
+	btd_service_connecting_complete(service, 0);
+}
+
 static int vcp_accept(struct btd_service *service)
 {
 	struct btd_device *device = btd_service_get_device(service);
@@ -297,12 +303,10 @@ static int vcp_accept(struct btd_service *service)
 		return -EINVAL;
 	}
 
-	if (!bt_vcp_attach(data->vcp, client)) {
+	if (!bt_vcp_attach(data->vcp, client, vcp_ready, service)) {
 		error("VCP unable to attach");
 		return -EINVAL;
 	}
-
-	btd_service_connecting_complete(service, 0);
 
 	return 0;
 }
@@ -328,6 +332,7 @@ static void vcp_server_remove(struct btd_profile *p,
 static struct btd_profile vcp_profile = {
 	.name		= "vcp",
 	.priority	= BTD_PROFILE_PRIORITY_MEDIUM,
+	.bearer		= BTD_PROFILE_BEARER_LE,
 	.remote_uuid	= VCS_UUID_STR,
 
 	.device_probe	= vcp_probe,

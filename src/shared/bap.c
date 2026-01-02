@@ -204,11 +204,6 @@ struct bt_bap {
 	void *user_data;
 };
 
-struct bt_bap_chan {
-	uint8_t count;
-	uint32_t location;
-};
-
 struct bt_bap_pac {
 	struct bt_bap_db *bdb;
 	char *name;
@@ -1735,7 +1730,7 @@ static bool bap_queue_req(struct bt_bap *bap, struct bt_bap_req *req)
 	struct queue *queue;
 	struct bt_att *att = bt_bap_get_att(bap);
 	uint16_t mtu = bt_att_get_mtu(att);
-	uint16_t len = 2 + bap_req_len(req);
+	uint16_t len = 3 + 2 + bap_req_len(req);
 
 	if (len > mtu) {
 		DBG(bap, "Unable to queue request: req len %u > %u mtu", len,
@@ -2129,10 +2124,16 @@ static unsigned int bap_ucast_start(struct bt_bap_stream *stream,
 
 static uint8_t stream_disable(struct bt_bap_stream *stream, struct iovec *rsp)
 {
-	if (!stream || stream->ep->state == BT_BAP_STREAM_STATE_QOS ||
-			stream->ep->state == BT_BAP_STREAM_STATE_CONFIG ||
-			stream->ep->state == BT_BAP_STREAM_STATE_IDLE)
+	if (!stream)
 		return 0;
+
+	switch (stream->ep->state) {
+	case BT_BAP_STREAM_STATE_ENABLING:
+	case BT_BAP_STREAM_STATE_STREAMING:
+		break;
+	default:
+		return 0;
+	}
 
 	DBG(stream->bap, "stream %p", stream);
 
@@ -2246,8 +2247,14 @@ static uint8_t stream_metadata(struct bt_bap_stream *stream, struct iovec *meta,
 	util_iov_free(stream->meta, 1);
 	stream->meta = util_iov_dup(meta, 1);
 
-	/* Force state change to the same state to update the metadata */
-	stream_set_state(stream, bt_bap_stream_get_state(stream));
+	switch (bt_bap_stream_get_state(stream)) {
+	case BT_BAP_STREAM_STATE_IDLE:
+		/* Initial metadata */
+		break;
+	default:
+		/* Force state change to the same state to update metadata */
+		stream_set_state(stream, bt_bap_stream_get_state(stream));
+	}
 
 	return 0;
 }
@@ -3507,10 +3514,12 @@ static uint8_t ascs_stop(struct bt_ascs *ascs, struct bt_bap *bap,
 	return ep_stop(ep, rsp);
 }
 
-static uint8_t ep_metadata(struct bt_bap_endpoint *ep, struct iovec *meta,
-						struct iovec *rsp)
+static uint8_t ep_metadata(struct bt_bap_endpoint *ep,
+				struct bt_ascs_metadata *req,
+				struct iovec *iov, struct iovec *rsp)
 {
 	struct bt_bap_stream *stream = ep->stream;
+	struct iovec meta;
 
 	DBG(stream->bap, "ep %p id 0x%02x dir 0x%02x", ep, ep->id, ep->dir);
 
@@ -3529,7 +3538,13 @@ static uint8_t ep_metadata(struct bt_bap_endpoint *ep, struct iovec *meta,
 		return 0;
 	}
 
-	return stream_metadata(ep->stream, meta, rsp);
+	if (iov->iov_len < req->len)
+		return BT_ATT_ERROR_INVALID_ATTRIBUTE_VALUE_LEN;
+
+	meta.iov_base = util_iov_pull_mem(iov, req->len);
+	meta.iov_len = req->len;
+
+	return stream_metadata(ep->stream, &meta, rsp);
 }
 
 static uint8_t ascs_metadata(struct bt_ascs *ascs, struct bt_bap *bap,
@@ -3556,7 +3571,7 @@ static uint8_t ascs_metadata(struct bt_ascs *ascs, struct bt_bap *bap,
 		return 0;
 	}
 
-	return ep_metadata(ep, iov, rsp);
+	return ep_metadata(ep, req, iov, rsp);
 }
 
 static uint8_t ascs_release(struct bt_ascs *ascs, struct bt_bap *bap,
@@ -3834,56 +3849,12 @@ static void *ltv_merge(struct iovec *data, struct iovec *cont)
 	if (!data)
 		return NULL;
 
+	util_iov_append(data, &delimiter, sizeof(delimiter));
+
 	if (!cont || !cont->iov_len || !cont->iov_base)
 		return data->iov_base;
 
-	util_iov_append(data, &delimiter, sizeof(delimiter));
-
 	return util_iov_append(data, cont->iov_base, cont->iov_len);
-}
-
-static void bap_pac_chan_add(struct bt_bap_pac *pac, uint8_t count,
-				uint32_t location)
-{
-	struct bt_bap_chan *chan;
-
-	if (!pac->channels)
-		pac->channels = queue_new();
-
-	chan = new0(struct bt_bap_chan, 1);
-	chan->count = count;
-	chan->location = location;
-
-	queue_push_tail(pac->channels, chan);
-}
-
-static void bap_pac_foreach_channel(size_t i, uint8_t l, uint8_t t, uint8_t *v,
-					void *user_data)
-{
-	struct bt_bap_pac *pac = user_data;
-
-	if (!v)
-		return;
-
-	bap_pac_chan_add(pac, *v, bt_bap_pac_get_locations(pac));
-}
-
-static void bap_pac_update_channels(struct bt_bap_pac *pac, struct iovec *data)
-{
-	uint8_t type = 0x03;
-
-	if (!data)
-		return;
-
-	util_ltv_foreach(data->iov_base, data->iov_len, &type,
-				bap_pac_foreach_channel, pac);
-
-	/* If record didn't set a channel count but set a location use that as
-	 * channel count.
-	 */
-	if (queue_isempty(pac->channels) && pac->qos.location)
-		bap_pac_chan_add(pac, pac->qos.location, pac->qos.location);
-
 }
 
 static void bap_pac_merge(struct bt_bap_pac *pac, struct iovec *data,
@@ -3894,9 +3865,6 @@ static void bap_pac_merge(struct bt_bap_pac *pac, struct iovec *data,
 		ltv_merge(pac->data, data);
 	else
 		pac->data = util_iov_dup(data, 1);
-
-	/* Update channels */
-	bap_pac_update_channels(pac, data);
 
 	/* Merge metadata into existing record */
 	if (pac->metadata)
@@ -4647,6 +4615,17 @@ struct bt_att *bt_bap_get_att(struct bt_bap *bap)
 	return bt_gatt_client_get_att(bap->client);
 }
 
+struct gatt_db *bt_bap_get_db(struct bt_bap *bap, bool remote)
+{
+	if (!bap)
+		return NULL;
+
+	if (remote)
+		return bap->rdb ? bap->rdb->db : NULL;
+
+	return bap->ldb ? bap->ldb->db : NULL;
+}
+
 struct bt_bap *bt_bap_ref(struct bt_bap *bap)
 {
 	if (!bap)
@@ -4708,7 +4687,7 @@ static void bap_parse_pacs(struct bt_bap *bap, uint8_t type,
 	for (i = 0; i < rsp->num_pac; i++) {
 		struct bt_bap_pac *pac;
 		struct bt_pac *p;
-		struct bt_ltv *cc;
+		struct bt_ltv *cc, *m;
 		struct bt_pac_metadata *meta;
 		struct iovec data, metadata;
 
@@ -4725,13 +4704,15 @@ static void bap_parse_pacs(struct bt_bap *bap, uint8_t type,
 
 		pac = NULL;
 
-		if (!bt_bap_debug_caps(iov.iov_base, p->cc_len, bap->debug_func,
-					bap->debug_data))
-			return;
-
 		cc = util_iov_pull_mem(&iov, p->cc_len);
 		if (!cc) {
 			DBG(bap, "Unable to parse PAC codec capabilities");
+			return;
+		}
+
+		if (!bt_bap_debug_caps(cc, p->cc_len, bap->debug_func,
+					bap->debug_data)) {
+			DBG(bap, "Invalid PAC codec capabilities LTV");
 			return;
 		}
 
@@ -4741,13 +4722,23 @@ static void bap_parse_pacs(struct bt_bap *bap, uint8_t type,
 			return;
 		}
 
+		m = util_iov_pull_mem(&iov, meta->len);
+		if (!m) {
+			DBG(bap, "Unable to parse PAC metadata");
+			return;
+		}
+
+		if (!bt_bap_debug_metadata(meta->data, meta->len,
+					bap->debug_func, bap->debug_data)) {
+			DBG(bap, "Invalid PAC metadata LTV");
+			return;
+		}
+
 		data.iov_len = p->cc_len;
 		data.iov_base = cc;
 
 		metadata.iov_len = meta->len;
-		metadata.iov_base = meta->data;
-
-		util_iov_pull_mem(&iov, meta->len);
+		metadata.iov_base = m;
 
 		DBG(bap, "PAC #%u: type %u codec 0x%02x cc_len %u meta_len %u",
 			i, type, p->codec.id, p->cc_len, meta->len);
@@ -4816,6 +4807,8 @@ static void read_source_pac_loc(bool success, uint8_t att_ecode,
 
 	pacs->source_loc_value = get_le32(value);
 
+	DBG(bap, "PACS Source Locations: 0x%08x", pacs->source_loc_value);
+
 	/* Resume reading sinks if supported but for some reason is empty */
 	if (pacs->source && queue_isempty(bap->rdb->sources)) {
 		uint16_t value_handle;
@@ -4848,6 +4841,8 @@ static void read_sink_pac_loc(bool success, uint8_t att_ecode,
 	}
 
 	pacs->sink_loc_value = get_le32(value);
+
+	DBG(bap, "PACS Sink Locations: 0x%08x", pacs->sink_loc_value);
 
 	/* Resume reading sinks if supported but for some reason is empty */
 	if (pacs->sink && queue_isempty(bap->rdb->sinks)) {
@@ -4882,6 +4877,9 @@ static void read_pac_context(bool success, uint8_t att_ecode,
 
 	pacs->sink_context_value = le16_to_cpu(ctx->snk);
 	pacs->source_context_value = le16_to_cpu(ctx->src);
+
+	DBG(bap, "PACS Sink Context: 0x%04x", pacs->sink_context_value);
+	DBG(bap, "PACS Source Context: 0x%04x", pacs->source_context_value);
 }
 
 static void read_pac_supported_context(bool success, uint8_t att_ecode,
@@ -4905,6 +4903,11 @@ static void read_pac_supported_context(bool success, uint8_t att_ecode,
 
 	pacs->supported_sink_context_value = le16_to_cpu(ctx->snk);
 	pacs->supported_source_context_value = le16_to_cpu(ctx->src);
+
+	DBG(bap, "PACS Supported Sink Context: 0x%04x",
+					pacs->supported_sink_context_value);
+	DBG(bap, "PACS Supported Source Context: 0x%04x",
+					pacs->supported_source_context_value);
 }
 
 static void foreach_pacs_char(struct gatt_db_attribute *attr, void *user_data)
@@ -5655,6 +5658,8 @@ bool bt_bap_attach_broadcast(struct bt_bap *bap)
 
 	queue_push_tail(sessions, bap);
 
+	queue_foreach(bap_cbs, bap_attached, bap);
+
 	ep = bap_get_endpoint_bcast(bap->remote_eps, bap->ldb,
 				BT_BAP_BCAST_SOURCE);
 	if (ep)
@@ -6082,12 +6087,55 @@ static bool match_pac(struct bt_bap_pac *lpac, struct bt_bap_pac *rpac,
 	return false;
 }
 
-int bt_bap_select(struct bt_bap_pac *lpac, struct bt_bap_pac *rpac,
-			int *count, bt_bap_pac_select_t func,
-			void *user_data)
+static void bap_pac_ltv_ch_counts(size_t i, uint8_t l, uint8_t t, uint8_t *v,
+								void *user_data)
 {
-	const struct queue_entry *lchan, *rchan;
-	int selected = 0;
+	uint8_t *mask = user_data;
+
+	if (v)
+		*mask |= *v;
+}
+
+static uint8_t bap_pac_ch_counts(struct bt_bap_pac *pac)
+{
+	uint8_t type = 0x03;
+	uint8_t mask = 0;
+
+	if (!pac->data)
+		return 0;
+
+	util_ltv_foreach(pac->data->iov_base, pac->data->iov_len, &type,
+						bap_pac_ltv_ch_counts, &mask);
+
+	if (!mask)
+		mask = 0x01;  /* default (BAP v1.0.1 Sec 4.3.1) */
+
+	return mask;
+}
+
+static unsigned int bap_count_eps(struct queue *eps, uint8_t dir)
+{
+	const struct queue_entry *entry;
+	unsigned int count = 0;
+
+	for (entry = queue_get_entries(eps); entry; entry = entry->next) {
+		struct bt_bap_endpoint *ep = entry->data;
+
+		if (ep->dir == dir)
+			count++;
+	}
+
+	return count;
+}
+
+int bt_bap_select(struct bt_bap *bap,
+			struct bt_bap_pac *lpac, struct bt_bap_pac *rpac,
+			unsigned int max_channels, int *count,
+			bt_bap_pac_select_t func, void *user_data)
+{
+	uint32_t locations;
+	uint8_t ch_counts;
+	unsigned int num_ase;
 
 	if (!lpac || !rpac || !func)
 		return -EINVAL;
@@ -6095,66 +6143,54 @@ int bt_bap_select(struct bt_bap_pac *lpac, struct bt_bap_pac *rpac,
 	if (!lpac->ops || !lpac->ops->select)
 		return -EOPNOTSUPP;
 
-	for (lchan = queue_get_entries(lpac->channels); lchan;
-					lchan = lchan->next) {
-		struct bt_bap_chan *lc = lchan->data;
-		struct bt_bap_chan map = *lc;
-		int i;
+	if (!max_channels)
+		max_channels = 2;  /* By default: don't go beyond BAP AC */
 
-		for (i = 0, rchan = queue_get_entries(rpac->channels); rchan;
-					rchan = rchan->next, i++) {
-			struct bt_bap_chan *rc = rchan->data;
+	ch_counts = bap_pac_ch_counts(lpac) & bap_pac_ch_counts(rpac);
+	locations = bt_bap_pac_get_locations(rpac);
+	num_ase = bap_count_eps(bap->remote_eps, rpac->type);
 
-			/* Try matching the channel count */
-			if (!(map.count & rc->count))
-				break;
+	/* Fallback to unspecified/mono allocation if nothing is matching */
+	if (!locations || !ch_counts) {
+		lpac->ops->select(lpac, rpac, 0, &rpac->qos, func, user_data,
+							lpac->user_data);
+		if (count)
+			(*count)++;
+		return 0;
+	}
 
-			/* Check if location was set otherwise attempt to
-			 * assign one based on the number of channels it
-			 * supports.
-			 */
-			if (!rc->location) {
-				rc->location = bt_bap_pac_get_locations(rpac);
-				/* If channel count is 1 use a single
-				 * location
-				 */
-				if (rc->count == 0x01)
-					rc->location &= BIT(i);
-			}
+	/* Allocate all locations to streams */
+	while (num_ase) {
+		uint32_t allocation = 0, alloc = 0;
+		unsigned int i, n;
 
-			/* Try matching the channel location */
-			if (!(map.location & rc->location))
+		/* Put max number of channels per stream */
+		for (i = 0, n = 0; i < 32 && n < 8; ++i) {
+			uint32_t loc = (1LL << i);
+
+			if (!(locations & loc))
 				continue;
 
-			lpac->ops->select(lpac, rpac, map.location &
-						rc->location, &rpac->qos,
-						func, user_data,
-						lpac->user_data);
-			selected++;
+			alloc |= loc;
+			if ((BIT(n) & ch_counts) && n < max_channels)
+				allocation = alloc;
 
-			/* Check if there are any channels left to select */
-			map.count &= ~(map.count & rc->count);
-			/* Check if there are any locations left to select */
-			map.location &= ~(map.location & rc->location);
-
-			if (!map.count || !map.location)
-				break;
-
-			/* Check if device require AC*(i) settings */
-			if (rc->count == 0x01)
-				map.count = map.count >> 1;
+			++n;
 		}
-	}
 
-	/* Fallback to no channel allocation since none could be matched. */
-	if (!selected) {
-		lpac->ops->select(lpac, rpac, 0, &rpac->qos, func, user_data,
-					lpac->user_data);
-		selected++;
-	}
+		if (!allocation)
+			break;
 
-	if (count)
-		*count += selected;
+		/* Configure stream */
+		lpac->ops->select(lpac, rpac, allocation, &rpac->qos,
+					func, user_data, lpac->user_data);
+		if (count)
+			(*count)++;
+
+		locations &= ~allocation;
+		max_channels -= __builtin_popcount(allocation);
+		num_ase--;
+	}
 
 	return 0;
 }
@@ -6769,6 +6805,36 @@ static void bap_stream_get_out_qos(void *data, void *user_data)
 	*qos = &stream->qos;
 }
 
+static void bap_stream_bcast_get_out_qos(void *data, void *user_data)
+{
+	struct bt_bap_stream *stream = data;
+	struct bt_bap_qos **qos = user_data;
+
+	if (!stream)
+		return;
+
+	if (!qos || *qos || stream->ep->dir != BT_BAP_BCAST_SINK ||
+				!stream->qos.bcast.io_qos.sdu)
+		return;
+
+	*qos = &stream->qos;
+}
+
+static void bap_stream_bcast_get_in_qos(void *data, void *user_data)
+{
+	struct bt_bap_stream *stream = data;
+	struct bt_bap_qos **qos = user_data;
+
+	if (!stream)
+		return;
+
+	if (!qos || *qos || stream->ep->dir != BT_BAP_BCAST_SOURCE ||
+				!stream->qos.bcast.io_qos.sdu)
+		return;
+
+	*qos = &stream->qos;
+}
+
 bool bt_bap_stream_io_get_qos(struct bt_bap_stream *stream,
 					struct bt_bap_qos **in,
 					struct bt_bap_qos **out)
@@ -6785,13 +6851,19 @@ bool bt_bap_stream_io_get_qos(struct bt_bap_stream *stream,
 		bap_stream_get_out_qos(stream, out);
 		queue_foreach(stream->links, bap_stream_get_in_qos, in);
 		break;
+	case BT_BAP_BCAST_SOURCE:
+		bap_stream_bcast_get_in_qos(stream, in);
+		break;
+	case BT_BAP_BCAST_SINK:
+		bap_stream_bcast_get_out_qos(stream, out);
+		break;
 	default:
 		return false;
 	}
 
 	DBG(stream->bap, "in %p out %p", in ? *in : NULL, out ? *out : NULL);
 
-	return in && out;
+	return (in && *in) || (out && *out);
 }
 
 static void bap_stream_get_dir(void *data, void *user_data)

@@ -178,6 +178,7 @@ extern "C" {
 #define BCAST_AUDIO_SCAN_CP_UUID			0x2bc7
 #define BCAST_RECV_STATE_UUID				0x2bc8
 
+#define VCS_UUID_STR		"00001844-0000-1000-8000-00805f9b34fb"
 #define VCS_UUID					0x1844
 #define VOL_OFFSET_CS_UUID				0x1845
 #define AUDIO_INPUT_CS_UUID				0x1843
@@ -197,20 +198,35 @@ extern "C" {
 #define	AICS_AUDIO_INPUT_CP_CHRC_UUID		0X2B7B
 #define	AICS_INPUT_DESCR_CHAR_UUID		0X2B7C
 
+#define MCS_UUID                                0x1848
 #define GMCS_UUID                               0x1849
-#define MEDIA_PLAYER_NAME_CHRC_UUID             0x2b93
-#define MEDIA_TRACK_CHNGD_CHRC_UUID             0x2b96
-#define MEDIA_TRACK_TITLE_CHRC_UUID             0x2b97
-#define MEDIA_TRACK_DURATION_CHRC_UUID          0x2b98
-#define MEDIA_TRACK_POSTION_CHRC_UUID           0x2b99
-#define MEDIA_PLAYBACK_SPEED_CHRC_UUID          0x2b9a
-#define MEDIA_SEEKING_SPEED_CHRC_UUID           0x2b9b
-#define MEDIA_PLAYING_ORDER_CHRC_UUID           0x2ba1
-#define MEDIA_PLAY_ORDER_SUPPRTD_CHRC_UUID      0x2ba2
-#define MEDIA_STATE_CHRC_UUID                   0x2ba3
-#define MEDIA_CP_CHRC_UUID                      0x2ba4
-#define MEDIA_CP_OP_SUPPORTED_CHRC_UUID         0x2ba5
-#define MEDIA_CONTENT_CONTROL_ID_CHRC_UUID      0x2bba
+#define MCS_MEDIA_PLAYER_NAME_CHRC_UUID         0x2b93
+#define MCS_TRACK_CHANGED_CHRC_UUID             0x2b96
+#define MCS_TRACK_TITLE_CHRC_UUID               0x2b97
+#define MCS_TRACK_DURATION_CHRC_UUID            0x2b98
+#define MCS_TRACK_POSITION_CHRC_UUID            0x2b99
+#define MCS_PLAYBACK_SPEED_CHRC_UUID            0x2b9a
+#define MCS_SEEKING_SPEED_CHRC_UUID             0x2b9b
+#define MCS_PLAYING_ORDER_CHRC_UUID             0x2ba1
+#define MCS_PLAYING_ORDER_SUPPORTED_CHRC_UUID   0x2ba2
+#define MCS_MEDIA_STATE_CHRC_UUID               0x2ba3
+#define MCS_MEDIA_CP_CHRC_UUID                  0x2ba4
+#define MCS_MEDIA_CP_OP_SUPPORTED_CHRC_UUID     0x2ba5
+#define MCS_CCID_CHRC_UUID                      0x2bba
+
+/* Telephony and Media Audio Service */
+#define TMAS_UUID_STR		"00001855-0000-1000-8000-00805f9b34fb"
+#define TMAS_UUID				0x1855
+#define TMAP_ROLE_CHRC_UUID			0x2b51
+
+/* Gaming Audio Service */
+#define GMAS_UUID_STR		"00001858-0000-1000-8000-00805f9b34fb"
+#define GMAS_UUID				0x1858
+#define GMAP_ROLE_CHRC_UUID			0x2c00
+#define GMAP_UGG_CHRC_UUID			0x2c01
+#define GMAP_UGT_CHRC_UUID			0x2c02
+#define GMAP_BGS_CHRC_UUID			0x2c03
+#define GMAP_BGR_CHRC_UUID			0x2c04
 
 /* Coordinated Set Identification Profile(CSIP) */
 #define CSIS_UUID					0x1846

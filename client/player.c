@@ -43,6 +43,7 @@
 #include "src/shared/shell.h"
 #include "src/shared/io.h"
 #include "src/shared/queue.h"
+#include "src/shared/timeout.h"
 #include "src/shared/bap-debug.h"
 #include "print.h"
 #include "player.h"
@@ -111,16 +112,22 @@ struct endpoint {
 	uint16_t supported_context;
 	uint16_t context;
 	bool auto_accept;
+	bool auto_acquire;
 	uint8_t max_transports;
 	uint8_t iso_group;
 	uint8_t iso_stream;
 	struct queue *acquiring;
+	struct queue *auto_acquiring;
+	unsigned int auto_acquiring_id;
+	struct queue *selecting;
+	unsigned int selecting_id;
 	struct queue *transports;
 	DBusMessage *msg;
 	struct preset *preset;
 	struct codec_preset *codec_preset;
 	bool broadcast;
 	struct iovec *bcode;
+	unsigned int refcount;
 };
 
 static DBusConnection *dbus_conn;
@@ -134,6 +141,8 @@ static GList *local_endpoints = NULL;
 static GList *transports = NULL;
 static struct queue *ios = NULL;
 static uint8_t bcast_code[] = BCAST_CODE;
+static bool auto_acquire = false;
+static bool auto_select = false;
 
 struct transport {
 	GDBusProxy *proxy;
@@ -1095,6 +1104,121 @@ static void confirm_response(const char *input, void *user_data)
 									NULL);
 }
 
+static bool match_proxy(const void *data, const void *user_data)
+{
+	const struct transport *transport = data;
+	const GDBusProxy *proxy = user_data;
+
+	return transport->proxy == proxy;
+}
+
+static struct transport *find_transport(GDBusProxy *proxy)
+{
+	return queue_find(ios, match_proxy, proxy);
+}
+
+static bool ep_selecting_process(void *user_data)
+{
+	struct endpoint *ep = user_data;
+	struct transport_select_args *args;
+	const struct queue_entry *entry;
+
+	if (queue_isempty(ep->selecting))
+		return true;
+
+	args = g_new0(struct transport_select_args, 1);
+
+	for (entry = queue_get_entries(ep->selecting); entry;
+					entry = entry->next) {
+		GDBusProxy *link;
+
+		link = g_dbus_proxy_lookup(transports, NULL, entry->data,
+					BLUEZ_MEDIA_TRANSPORT_INTERFACE);
+		if (!link)
+			continue;
+
+		if (find_transport(link))
+			continue;
+
+		if (!args->proxy) {
+			args->proxy = link;
+			continue;
+		}
+
+		if (!args->links)
+			args->links = queue_new();
+
+		/* Enqueue all links */
+		queue_push_tail(args->links, link);
+	}
+
+	queue_destroy(ep->selecting, NULL);
+	ep->selecting = NULL;
+
+	transport_set_links(args);
+
+	return true;
+}
+
+static void ep_set_selecting(struct endpoint *ep, const char *path)
+{
+	bt_shell_printf("Transport %s selecting\n", path);
+
+	if (!ep->selecting)
+		ep->selecting = queue_new();
+
+	queue_push_tail(ep->selecting, strdup(path));
+
+	if (!ep->selecting_id)
+		ep->selecting_id = timeout_add(1000, ep_selecting_process, ep,
+						NULL);
+}
+
+static void transport_acquire(GDBusProxy *proxy, bool prompt);
+
+static bool ep_auto_acquiring_process(void *user_data)
+{
+	struct endpoint *ep = user_data;
+	const struct queue_entry *entry;
+
+	ep->auto_acquiring_id = 0;
+
+	if (queue_isempty(ep->auto_acquiring))
+		return true;
+
+	for (entry = queue_get_entries(ep->auto_acquiring); entry;
+					entry = entry->next) {
+		GDBusProxy *proxy;
+
+		proxy = g_dbus_proxy_lookup(transports, NULL, entry->data,
+					BLUEZ_MEDIA_TRANSPORT_INTERFACE);
+		if (!proxy)
+			continue;
+
+		transport_acquire(proxy, false);
+	}
+
+	queue_destroy(ep->auto_acquiring, NULL);
+	ep->auto_acquiring = NULL;
+
+	return true;
+}
+
+static void ep_set_auto_acquiring(struct endpoint *ep, const char *path)
+{
+	bt_shell_printf("Transport %s auto acquiring\n", path);
+
+	if (!ep->auto_acquiring)
+		ep->auto_acquiring = queue_new();
+
+	queue_push_tail(ep->auto_acquiring, strdup(path));
+
+	if (!ep->auto_acquiring_id)
+		ep->auto_acquiring_id = timeout_add(1000,
+						ep_auto_acquiring_process,
+						ep, NULL);
+}
+
 static DBusMessage *endpoint_set_configuration(DBusConnection *conn,
 					DBusMessage *msg, void *user_data)
 {
@@ -1132,6 +1256,11 @@ static DBusMessage *endpoint_set_configuration(DBusConnection *conn,
 	queue_push_tail(ep->transports, strdup(path));
 
 	if (ep->auto_accept) {
+		if (auto_select && ep->broadcast)
+			ep_set_selecting(ep, path);
+		else if (ep->auto_acquire && !ep->broadcast)
+			ep_set_auto_acquiring(ep, path);
+
 		bt_shell_printf("Auto Accepting...\n");
 		return g_dbus_create_reply(msg, DBUS_TYPE_INVALID);
 	}
@@ -1336,7 +1465,7 @@ static struct codec_preset lc3_ucast_presets[] = {
 	LC3_PRESET("24_1_1", LC3_CONFIG_24_1, LC3_QOS_24_1_1),
 	LC3_PRESET("24_2_1", LC3_CONFIG_24_2, LC3_QOS_24_2_1),
 	LC3_PRESET("32_1_1", LC3_CONFIG_32_1, LC3_QOS_32_1_1),
-	LC3_PRESET("32_2_1", LC3_CONFIG_32_2, LC3_QOS_32_1_1),
+	LC3_PRESET("32_2_1", LC3_CONFIG_32_2, LC3_QOS_32_2_1),
 	LC3_PRESET("44_1_1", LC3_CONFIG_44_1, LC3_QOS_44_1_1),
 	LC3_PRESET("44_2_1", LC3_CONFIG_44_2, LC3_QOS_44_2_1),
 	LC3_PRESET("48_1_1", LC3_CONFIG_48_1, LC3_QOS_48_1_1),
@@ -1736,6 +1865,11 @@ static DBusMessage *endpoint_select_configuration(DBusConnection *conn,
 	}
 
 	bt_shell_printf("Auto Accepting using %s...\n", p->name);
+
+	/* Mark auto_acquire if set so the transport is acquired upon
+	 * SetConfiguration.
+	 */
+	ep->auto_acquire = auto_acquire;
 
 	return reply;
 }
@@ -2185,6 +2319,11 @@ static DBusMessage *endpoint_select_properties(DBusConnection *conn,
 	reply = endpoint_select_properties_reply(ep, msg, p);
 	if (!reply)
 		return NULL;
+
+	/* Mark auto_acquire if set so the transport is acquired upon
+	 * SetConfiguration.
+	 */
+	ep->auto_acquire = auto_acquire;
 
 	return reply;
 }
@@ -2859,6 +2998,7 @@ static void print_endpoint_properties(GDBusProxy *proxy)
 	print_property(proxy, "SupportedContext");
 	print_property(proxy, "Context");
 	print_property(proxy, "QoS");
+	print_property(proxy, "SupportedFeatures");
 }
 
 static void print_endpoints(void *data, void *user_data)
@@ -2935,7 +3075,12 @@ static void endpoint_free(void *data)
 	if (ep->codec == 0xff)
 		free(ep->preset);
 
+	timeout_remove(ep->selecting_id);
+	timeout_remove(ep->auto_acquiring_id);
+
 	queue_destroy(ep->acquiring, NULL);
+	queue_destroy(ep->auto_acquiring, free);
+	queue_destroy(ep->selecting, free);
 	queue_destroy(ep->transports, free);
 
 	g_free(ep->path);
@@ -3179,6 +3324,7 @@ static void register_endpoint_reply(DBusMessage *message, void *user_data)
 	}
 
 	bt_shell_printf("Endpoint %s registered\n", ep->path);
+	ep->refcount++;
 
 	return bt_shell_noninteractive_quit(EXIT_SUCCESS);
 }
@@ -3593,9 +3739,13 @@ static void unregister_endpoint_reply(DBusMessage *message, void *user_data)
 
 	bt_shell_printf("Endpoint %s unregistered\n", ep->path);
 
-	local_endpoints = g_list_remove(local_endpoints, ep);
-	g_dbus_unregister_interface(dbus_conn, ep->path,
-					BLUEZ_MEDIA_ENDPOINT_INTERFACE);
+	ep->refcount--;
+
+	if (ep->refcount == 0) {
+		local_endpoints = g_list_remove(local_endpoints, ep);
+		g_dbus_unregister_interface(dbus_conn, ep->path,
+					    BLUEZ_MEDIA_ENDPOINT_INTERFACE);
+	}
 
 	return bt_shell_noninteractive_quit(EXIT_SUCCESS);
 }
@@ -5072,10 +5222,8 @@ static void transport_property_changed(GDBusProxy *proxy, const char *name,
 
 	dbus_message_iter_get_basic(iter, &str);
 
-	if (strcmp(str, "pending"))
-		return;
-
-	transport_acquire(proxy, true);
+	if (!strcmp(str, "pending") || !strcmp(str, "broadcasting"))
+		transport_acquire(proxy, !auto_acquire);
 }
 
 static void property_changed(GDBusProxy *proxy, const char *name,
@@ -5206,23 +5354,15 @@ static void cmd_show_transport(int argc, char *argv[])
 	return bt_shell_noninteractive_quit(EXIT_SUCCESS);
 }
 
-static bool match_proxy(const void *data, const void *user_data)
-{
-	const struct transport *transport = data;
-	const GDBusProxy *proxy = user_data;
-
-	return transport->proxy == proxy;
-}
-
-static struct transport *find_transport(GDBusProxy *proxy)
-{
-	return queue_find(ios, match_proxy, proxy);
-}
-
 static void cmd_acquire_transport(int argc, char *argv[])
 {
 	GDBusProxy *proxy;
 	int i;
+
+	if (argc == 2 && !strcmp(argv[1], "auto")) {
+		auto_acquire = true;
+		return bt_shell_noninteractive_quit(EXIT_SUCCESS);
+	}
 
 	for (i = 1; i < argc; i++) {
 		proxy = g_dbus_proxy_lookup(transports, NULL, argv[i],
@@ -5263,17 +5403,26 @@ static void set_bcode_cb(const DBusError *error, void *user_data)
 static void set_bcode(const char *input, void *user_data)
 {
 	struct transport_select_args *args = user_data;
-	char *bcode;
+	uint8_t *bcode = NULL;
+	size_t len = 0;
 
 	if (!strcasecmp(input, "n") || !strcasecmp(input, "no"))
-		bcode = g_new0(char, 16);
-	else
-		bcode = g_strdup(input);
+		bcode = g_new0(uint8_t, 16);
+	else {
+		bcode = str2bytearray((char *) input, &len);
+		/* If the input is not 16 bytes, perhaps it was entered as
+		 * string so just use it instead.
+		 */
+		if (len != 16) {
+			bcode = (uint8_t *)strdup(input);
+			len = strlen(input);
+		}
+	}
 
 	if (g_dbus_proxy_set_property_dict(args->proxy, "QoS",
 				set_bcode_cb, user_data,
 				NULL, "BCode", DBUS_TYPE_ARRAY, DBUS_TYPE_BYTE,
-				strlen(bcode), bcode, NULL) == FALSE) {
+				len, bcode, NULL) == FALSE) {
 		bt_shell_printf("Setting broadcast code failed\n");
 		g_free(bcode);
 		free_transport_select_args(args);
@@ -5295,9 +5444,11 @@ static void transport_select(struct transport_select_args *args)
 
 static void transport_set_bcode(struct transport_select_args *args)
 {
-	DBusMessageIter iter, array, entry, value;
-	unsigned char encryption;
+	DBusMessageIter iter, array;
+	unsigned char encryption = 0;
 	const char *key;
+	uint8_t *bcode, zeroed_bcode[16] = {};
+	int bcode_len = 0;
 
 	if (g_dbus_proxy_get_property(args->proxy, "QoS", &iter) == FALSE) {
 		free_transport_select_args(args);
@@ -5308,22 +5459,46 @@ static void transport_set_bcode(struct transport_select_args *args)
 
 	while (dbus_message_iter_get_arg_type(&array) !=
 						DBUS_TYPE_INVALID) {
+		DBusMessageIter entry, value, array_value;
+		int var;
+
 		dbus_message_iter_recurse(&array, &entry);
 		dbus_message_iter_get_basic(&entry, &key);
 
+		dbus_message_iter_next(&entry);
+		dbus_message_iter_recurse(&entry, &value);
+
+		var = dbus_message_iter_get_arg_type(&value);
+
 		if (!strcasecmp(key, "Encryption")) {
-			dbus_message_iter_next(&entry);
-			dbus_message_iter_recurse(&entry, &value);
+			if (var != DBUS_TYPE_BYTE)
+				break;
+
 			dbus_message_iter_get_basic(&value, &encryption);
-			if (encryption == 1) {
-				bt_shell_prompt_input("",
-					"Enter brocast code[value/no]:",
-					set_bcode, args);
-				return;
-			}
-			break;
+		} else if (!strcasecmp(key, "BCode")) {
+			if (var != DBUS_TYPE_ARRAY)
+				break;
+
+			dbus_message_iter_recurse(&value, &array_value);
+			dbus_message_iter_get_fixed_array(&array_value, &bcode,
+								&bcode_len);
+
+			if (bcode_len != 16 || !memcmp(bcode, zeroed_bcode, 16))
+				bcode_len = 0;
 		}
+
 		dbus_message_iter_next(&array);
+	}
+
+	/* Only attempt to set bcode if encryption is enabled and
+	 * bcode is not already set.
+	 */
+	if (encryption == 1 && !bcode_len) {
+		const char *path = g_dbus_proxy_get_path(args->proxy);
+
+		bt_shell_prompt_input(path, "Enter bcode[value/no]:",
+					set_bcode, args);
+		return;
 	}
 
 	/* Go straight to selecting transport, if Broadcast Code
@@ -5406,6 +5581,11 @@ static void cmd_select_transport(int argc, char *argv[])
 	GDBusProxy *link = NULL;
 	struct transport_select_args *args;
 	int i;
+
+	if (argc == 2 && !strcmp(argv[1], "auto")) {
+		auto_select = true;
+		return bt_shell_noninteractive_quit(EXIT_SUCCESS);
+	}
 
 	args = g_new0(struct transport_select_args, 1);
 

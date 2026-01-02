@@ -239,6 +239,20 @@ struct bt_ll_cis_term_ind {
 	uint8_t  reason;
 } __attribute__ ((packed));
 
+#define BT_LL_FEATURE_EXT_REQ	0x2b
+struct bt_ll_feature_ext_req {
+	uint8_t  max_page;
+	uint8_t  page;
+	uint8_t  features[24];
+} __attribute__ ((packed));
+
+#define BT_LL_FEATURE_EXT_RSP	0x2c
+struct bt_ll_feature_ext_rsp {
+	uint8_t  max_page;
+	uint8_t  page;
+	uint8_t  features[24];
+} __attribute__ ((packed));
+
 #define LMP_ESC4(x) ((127 << 8) | (x))
 
 #define BT_LMP_NAME_REQ			1
@@ -2630,22 +2644,32 @@ struct bt_hci_cmd_set_pa_rec_enable {
 	uint8_t  enable;
 } __attribute__ ((packed));
 
-#define BT_HCI_CMD_PERIODIC_SYNC_TRANS		0x205a
-struct bt_hci_cmd_periodic_sync_trans {
+#define BT_HCI_CMD_LE_PAST			0x205a
+struct bt_hci_cmd_le_past {
 	uint16_t handle;
 	uint16_t service_data;
 	uint16_t sync_handle;
 } __attribute__ ((packed));
 
-#define BT_HCI_CMD_PA_SET_INFO_TRANS		0x205b
-struct bt_hci_cmd_pa_set_info_trans {
+struct bt_hci_rsp_le_past {
+	uint8_t  status;
 	uint16_t handle;
-	uint16_t service_data;
-	uint8_t adv_handle;
 } __attribute__ ((packed));
 
-#define BT_HCI_CMD_PA_SYNC_TRANS_PARAMS		0x205c
-struct bt_hci_cmd_pa_sync_trans_params {
+#define BT_HCI_CMD_LE_PAST_SET_INFO		0x205b
+struct bt_hci_cmd_le_past_set_info {
+	uint16_t handle;
+	uint16_t service_data;
+	uint8_t  adv_handle;
+} __attribute__ ((packed));
+
+struct bt_hci_rsp_le_past_set_info {
+	uint8_t  status;
+	uint16_t handle;
+} __attribute__ ((packed));
+
+#define BT_HCI_CMD_LE_PAST_PARAMS		0x205c
+struct bt_hci_cmd_le_past_params {
 	uint16_t  handle;
 	uint8_t   mode;
 	uint16_t  skip;
@@ -2653,8 +2677,13 @@ struct bt_hci_cmd_pa_sync_trans_params {
 	uint8_t   cte_type;
 } __attribute__ ((packed));
 
-#define BT_HCI_CMD_DEFAULT_PA_SYNC_TRANS_PARAMS	0x205d
-struct bt_hci_cmd_default_pa_sync_trans_params {
+struct bt_hci_rsp_le_past_params {
+	uint8_t  status;
+	uint16_t handle;
+} __attribute__ ((packed));
+
+#define BT_HCI_CMD_DEFAULT_PAST_PARAMS		0x205d
+struct bt_hci_cmd_le_default_past_params {
 	uint8_t  mode;
 	uint16_t skip;
 	uint16_t sync_timeout;
@@ -2935,6 +2964,21 @@ struct bt_hci_rsp_le_read_iso_link_quality {
 	uint32_t crc_error_packets;
 	uint32_t rx_unreceived_packets;
 	uint32_t duplicated_packets;
+} __attribute__ ((packed));
+
+#define BT_HCI_CMD_LE_READ_ALL_LOCAL_FEATURES	0x2087
+#define BT_HCI_BIT_LE_READ_ALL_LOCAL_FEATURES	BT_HCI_CMD_BIT(47, 2)
+struct bt_hci_rsp_le_read_all_local_features {
+	uint8_t  status;
+	uint8_t  page;
+	uint8_t  features[248];
+} __attribute__ ((packed));
+
+#define BT_HCI_CMD_LE_READ_ALL_REMOTE_FEATURES	0x2088
+#define BT_HCI_BIT_LE_READ_ALL_REMOTE_FEATURES	BT_HCI_CMD_BIT(47, 3)
+struct bt_hci_cmd_le_read_all_remote_features {
+	uint16_t handle;
+	uint8_t  pages;
 } __attribute__ ((packed));
 
 #define BT_HCI_CMD_LE_CS_RD_LOC_SUPP_CAP	0x2089
@@ -3865,8 +3909,8 @@ struct bt_hci_evt_le_cte_request_failed {
 	uint16_t handle;
 } __attribute__ ((packed));
 
-#define BT_HCI_EVT_LE_PA_SYNC_TRANS_REC		0x18
-struct bt_hci_evt_le_pa_sync_trans_rec {
+#define BT_HCI_EVT_LE_PAST_RECEIVED		0x18
+struct bt_hci_evt_le_past_recv {
 	uint8_t  status;
 	uint16_t handle;
 	uint16_t service_data;
@@ -3973,6 +4017,15 @@ struct bt_hci_evt_le_big_info_adv_report {
 	uint8_t  phy;
 	uint8_t  framing;
 	uint8_t  encryption;
+} __attribute__ ((packed));
+
+#define BT_HCI_EVT_LE_READ_ALL_REMOTE_FEATURES_COMPLETE	0x2B
+struct bt_hci_evt_le_read_all_remote_features_complete {
+	uint8_t  status;
+	uint16_t handle;
+	uint8_t  max_pages;
+	uint8_t  valid_pages;
+	uint8_t  features[248];
 } __attribute__ ((packed));
 
 #define BT_HCI_EVT_LE_CS_RD_REM_SUPP_CAP_COMPLETE	(0x2C)

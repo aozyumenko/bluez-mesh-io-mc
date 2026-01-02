@@ -242,9 +242,13 @@ shared_sources = src/shared/io.h src/shared/timeout.h \
 			src/shared/csip.c src/shared/csip.h \
 			src/shared/bass.h src/shared/bass.c \
 			src/shared/ccp.h src/shared/ccp.c \
+			src/shared/tmap.c src/shared/tmap.h \
+			src/shared/gmap.c src/shared/gmap.h \
 			src/shared/lc3.h src/shared/tty.h \
 			src/shared/bap-defs.h \
-			src/shared/asha.h src/shared/asha.c
+			src/shared/asha.h src/shared/asha.c \
+			src/shared/battery.h src/shared/battery.c \
+			src/shared/uinput.h src/shared/uinput.c
 
 if READLINE
 shared_sources += src/shared/shell.c src/shared/shell.h
@@ -301,9 +305,9 @@ include Makefile.plugins
 
 pkglibexec_PROGRAMS += src/bluetoothd
 
-src_bluetoothd_SOURCES = $(builtin_sources) \
+bluetoothd_internal_sources = \
 			$(attrib_sources) $(btio_sources) \
-			src/main.c src/log.h src/log.c \
+			src/log.h src/log.c \
 			src/backtrace.h src/backtrace.c \
 			src/rfkill.c src/btd.h src/sdpd.h \
 			src/sdpd-server.c src/sdpd-request.c \
@@ -313,7 +317,6 @@ src_bluetoothd_SOURCES = $(builtin_sources) \
 			src/sdp-client.h src/sdp-client.c \
 			src/textfile.h src/textfile.c \
 			src/uuid-helper.h src/uuid-helper.c \
-			src/plugin.h src/plugin.c \
 			src/storage.h src/storage.c \
 			src/advertising.h src/advertising.c \
 			src/agent.h src/agent.c \
@@ -330,10 +333,17 @@ src_bluetoothd_SOURCES = $(builtin_sources) \
 			src/settings.h src/settings.c \
 			src/set.h src/set.c \
 			src/bearer.h src/bearer.c
-src_bluetoothd_LDADD = lib/libbluetooth-internal.la \
+
+bluetoothd_internal_ldadd = lib/libbluetooth-internal.la \
 			gdbus/libgdbus-internal.la \
 			src/libshared-glib.la \
-			$(BACKTRACE_LIBS) $(GLIB_LIBS) $(DBUS_LIBS) -ldl -lrt \
+			$(BACKTRACE_LIBS) $(GLIB_LIBS) $(DBUS_LIBS) -ldl -lrt
+
+src_bluetoothd_SOURCES = $(builtin_sources) \
+			$(bluetoothd_internal_sources) \
+			src/plugin.h src/plugin.c \
+			src/main.c
+src_bluetoothd_LDADD = $(bluetoothd_internal_ldadd) \
 			$(builtin_ldadd)
 
 if EXTERNAL_PLUGINS
@@ -388,6 +398,7 @@ man_MANS += doc/org.bluez.obex.Client.5 doc/org.bluez.obex.Session.5 \
 		doc/org.bluez.obex.Message.5 \
 		doc/org.bluez.obex.AgentManager.5 doc/org.bluez.obex.Agent.5 \
 		doc/org.bluez.obex.Image.5
+man_MANS += doc/org.bluez.Telephony.5 doc/org.bluez.Call.5
 endif
 manual_pages += src/bluetoothd.8
 manual_pages += doc/hci.7 doc/mgmt.7 doc/l2cap.7 doc/rfcomm.7 doc/sco.7 \
@@ -424,6 +435,7 @@ manual_pages += doc/org.bluez.obex.Client.5 doc/org.bluez.obex.Session.5 \
 		doc/org.bluez.obex.Message.5 \
 		doc/org.bluez.obex.AgentManager.5 doc/org.bluez.obex.Agent.5 \
 		doc/org.bluez.obex.Image.5
+manual_pages += doc/org.bluez.Telephony.5 doc/org.bluez.Call.5
 
 EXTRA_DIST += src/genbuiltin src/bluetooth.conf \
 			src/main.conf profiles/network/network.conf \
@@ -508,6 +520,8 @@ EXTRA_DIST += doc/org.bluez.obex.Client.rst doc/org.bluez.obex.Session.rst \
 		doc/org.bluez.obex.AgentManager.rst doc/org.bluez.obex.Agent.rst \
 		doc/org.bluez.obex.Image.rst
 
+EXTRA_DIST += doc/org.bluez.Telephony.rst doc/org.bluez.Call.rst
+
 EXTRA_DIST += doc/pics-opp.txt doc/pixit-opp.txt \
 		doc/pts-opp.txt
 
@@ -572,6 +586,12 @@ unit_tests += unit/test-uhid
 
 unit_test_uhid_SOURCES = unit/test-uhid.c
 unit_test_uhid_LDADD = src/libshared-glib.la $(GLIB_LIBS)
+
+unit_tests += unit/test-profile
+
+unit_test_profile_SOURCES = unit/test-profile.c \
+			unit/btd.c $(bluetoothd_internal_sources)
+unit_test_profile_LDADD = $(bluetoothd_internal_ldadd)
 
 unit_tests += unit/test-sdp
 
@@ -700,6 +720,30 @@ unit_test_vcp_SOURCES = unit/test-vcp.c $(btio_sources)
 unit_test_vcp_LDADD = src/libshared-glib.la \
 				lib/libbluetooth-internal.la $(GLIB_LIBS)
 
+unit_tests += unit/test-tmap
+
+unit_test_tmap_SOURCES = unit/test-tmap.c $(btio_sources)
+unit_test_tmap_LDADD = src/libshared-glib.la \
+				lib/libbluetooth-internal.la $(GLIB_LIBS)
+
+unit_tests += unit/test-gmap
+
+unit_test_gmap_SOURCES = unit/test-gmap.c $(btio_sources)
+unit_test_gmap_LDADD = src/libshared-glib.la \
+				lib/libbluetooth-internal.la $(GLIB_LIBS)
+
+unit_tests += unit/test-mcp
+
+unit_test_mcp_SOURCES = unit/test-mcp.c $(btio_sources)
+unit_test_mcp_LDADD = src/libshared-glib.la \
+				lib/libbluetooth-internal.la $(GLIB_LIBS)
+
+unit_tests += unit/test-battery
+
+unit_test_battery_SOURCES = unit/test-battery.c
+unit_test_battery_LDADD = src/libshared-glib.la \
+				lib/libbluetooth-internal.la $(GLIB_LIBS)
+
 if MIDI
 unit_tests += unit/test-midi
 unit_test_midi_CPPFLAGS = $(AM_CPPFLAGS) $(ALSA_CFLAGS) -DMIDI_TEST
@@ -744,14 +788,21 @@ endif
 EXTRA_DIST += $(manual_pages) $(patsubst %.1,%.rst, \
 				$(patsubst %.8,%.rst,$(manual_pages)))
 
-DISTCHECK_CONFIGURE_FLAGS = --disable-datafiles --enable-library \
+# pkg-config gives absolute paths that do not work with distcheck that wants to use its own $(prefix)
+AM_DISTCHECK_CONFIGURE_FLAGS = --disable-datafiles --enable-library \
 						--enable-health \
 						--enable-midi \
 						--enable-manpages \
 						--enable-mesh \
 						--enable-btpclient \
 						--disable-systemd \
-						--disable-udev
+						--disable-udev \
+						--disable-cups \
+						--with-dbusconfdir=$${dc_install_base}/$(DBUS_CONFDIR) \
+						--with-dbussystembusdir=$${dc_install_base}/$(DBUS_SYSTEMBUSDIR) \
+						--with-dbussessionbusdir=$${dc_install_base}/$(DBUS_SESSIONBUSDIR)
+
+
 
 DISTCLEANFILES = $(pkgconfig_DATA) $(unit_tests) $(manual_pages)
 

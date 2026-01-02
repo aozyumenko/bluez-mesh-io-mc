@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <errno.h>
+#include <poll.h>
 #include <stdbool.h>
 
 #include <glib.h>
@@ -46,6 +47,7 @@ struct test_data {
 	bool enable_codecs;
 	bool disable_sco_flowctl;
 	int step;
+	uint16_t acl_handle;
 	uint16_t handle;
 	struct tx_tstamp_data tx_ts;
 };
@@ -56,14 +58,26 @@ struct sco_client_data {
 	const uint8_t *send_data;
 	uint16_t data_len;
 
+	/* Connect timeout */
+	unsigned int connect_timeout_us;
+
 	/* Shutdown socket after connect */
 	bool shutdown;
+
+	/* Close socket after connect */
+	bool close_after_connect;
 
 	/* Enable SO_TIMESTAMPING with these flags */
 	uint32_t so_timestamping;
 
 	/* Number of additional packets to send. */
 	unsigned int repeat_send;
+
+	/* Listen on SCO socket */
+	bool server;
+
+	/* Defer setup when accepting SCO connections */
+	bool defer;
 };
 
 static void print_debug(const char *str, void *user_data)
@@ -247,7 +261,7 @@ static void test_data_free(void *test_data)
 }
 
 #define test_sco_full(name, data, setup, func, _disable_esco, _enable_codecs, \
-							_disable_sco_flowctl) \
+					_disable_sco_flowctl, _timeout) \
 	do { \
 		struct test_data *user; \
 		user = malloc(sizeof(struct test_data)); \
@@ -264,26 +278,37 @@ static void test_data_free(void *test_data)
 		user->disable_sco_flowctl = _disable_sco_flowctl; \
 		tester_add_full(name, data, \
 				test_pre_setup, setup, func, NULL, \
-				test_post_teardown, 2, user, test_data_free); \
+				test_post_teardown, _timeout, user, \
+				test_data_free); \
 	} while (0)
 
 #define test_sco(name, data, setup, func) \
-	test_sco_full(name, data, setup, func, false, false, false)
+	test_sco_full(name, data, setup, func, false, false, false, 2)
 
 #define test_sco_no_flowctl(name, data, setup, func) \
-	test_sco_full(name, data, setup, func, false, false, true)
+	test_sco_full(name, data, setup, func, false, false, true, 2)
 
 #define test_sco_11(name, data, setup, func) \
-	test_sco_full(name, data, setup, func, true, false, false)
+	test_sco_full(name, data, setup, func, true, false, false, 2)
 
 #define test_sco_11_no_flowctl(name, data, setup, func) \
-	test_sco_full(name, data, setup, func, true, false, true)
+	test_sco_full(name, data, setup, func, true, false, true, 2)
 
 #define test_offload_sco(name, data, setup, func) \
-	test_sco_full(name, data, setup, func, false, true, false)
+	test_sco_full(name, data, setup, func, false, true, false, 2)
 
 static const struct sco_client_data connect_success = {
 	.expect_err = 0
+};
+
+static const struct sco_client_data connect_timeout = {
+	.expect_err = ETIMEDOUT,
+	.connect_timeout_us = 1,
+};
+
+/* Check timeout handling if closed before connect finishes */
+static const struct sco_client_data connect_close = {
+	.close_after_connect = true,
 };
 
 static const struct sco_client_data disconnect_success = {
@@ -343,14 +368,44 @@ static const struct sco_client_data connect_send_no_flowctl_tx_timestamping = {
 	.repeat_send = 2,
 };
 
+static const struct sco_client_data listen_success = {
+	.server = true,
+	.expect_err = 0,
+};
+
+static const struct sco_client_data listen_defer_success = {
+	.server = true,
+	.defer = true,
+	.expect_err = 0,
+};
+
+static const struct sco_client_data listen_recv_success = {
+	.server = true,
+	.expect_err = 0,
+	.data_len = sizeof(data),
+	.recv_data = data,
+};
+
+static const struct sco_client_data listen_send_success = {
+	.server = true,
+	.expect_err = 0,
+	.data_len = sizeof(data),
+	.send_data = data,
+};
+
 static void client_connectable_complete(uint16_t opcode, uint8_t status,
 					const void *param, uint8_t len,
 					void *user_data)
 {
+	struct test_data *data = user_data;
+
 	if (opcode != BT_HCI_CMD_WRITE_SCAN_ENABLE)
 		return;
 
 	tester_print("Client set connectable status 0x%02x", status);
+
+	if (--data->step)
+		return;
 
 	if (status)
 		tester_setup_failed();
@@ -384,10 +439,26 @@ static void bthost_sco_disconnected(void *user_data)
 	data->handle = 0x0000;
 }
 
+static void acl_new_conn(uint16_t handle, void *user_data)
+{
+	struct test_data *data = user_data;
+
+	tester_print("New ACL connection with handle 0x%04x", handle);
+
+	data->acl_handle = handle;
+
+	if (--data->step)
+		return;
+
+	tester_setup_complete();
+}
+
 static void sco_new_conn(uint16_t handle, void *user_data)
 {
 	struct test_data *data = user_data;
+	const struct sco_client_data *scodata = data->test_data;
 	struct bthost *host;
+	struct iovec iov = { (void *)scodata->recv_data, scodata->data_len };
 
 	tester_print("New client connection with handle 0x%04x", handle);
 
@@ -396,6 +467,9 @@ static void sco_new_conn(uint16_t handle, void *user_data)
 	host = hciemu_client_get_host(data->hciemu);
 	bthost_add_sco_hook(host, data->handle, bthost_recv_data, data,
 				bthost_sco_disconnected);
+
+	if (scodata->recv_data)
+		bthost_send_sco(host, data->handle, 0x00, &iov, 1);
 }
 
 static void setup_powered_callback(uint8_t status, uint16_t length,
@@ -404,6 +478,7 @@ static void setup_powered_callback(uint8_t status, uint16_t length,
 	struct test_data *data = tester_get_data();
 	const struct sco_client_data *scodata = data->test_data;
 	struct bthost *bthost;
+	const uint8_t *bdaddr;
 
 	if (status != MGMT_STATUS_SUCCESS) {
 		tester_setup_failed();
@@ -415,9 +490,20 @@ static void setup_powered_callback(uint8_t status, uint16_t length,
 	bthost = hciemu_client_get_host(data->hciemu);
 	bthost_set_cmd_complete_cb(bthost, client_connectable_complete, data);
 	bthost_write_scan_enable(bthost, 0x03);
+	data->step++;
 
-	if (scodata && (scodata->send_data || scodata->recv_data))
+	if (!scodata)
+		return;
+
+	if (scodata->send_data || scodata->recv_data || scodata->server)
 		bthost_set_sco_cb(bthost, sco_new_conn, data);
+
+	if (scodata->server) {
+		bdaddr = hciemu_get_central_bdaddr(data->hciemu);
+		bthost_set_connect_cb(bthost, acl_new_conn, data);
+		bthost_hci_connect(bthost, bdaddr, BDADDR_BREDR);
+		data->step++;
+	}
 }
 
 static void setup_powered(const void *test_data)
@@ -684,6 +770,7 @@ end:
 
 static int create_sco_sock(struct test_data *data)
 {
+	const struct sco_client_data *scodata = data->test_data;
 	const uint8_t *central_bdaddr;
 	struct sockaddr_sco addr;
 	int sk, err;
@@ -695,6 +782,19 @@ static int create_sco_sock(struct test_data *data)
 		tester_warn("Can't create socket: %s (%d)", strerror(errno),
 									errno);
 		return err;
+	}
+
+	if (scodata->connect_timeout_us) {
+		struct timeval timeout = {
+			.tv_sec = scodata->connect_timeout_us / 1000000,
+			.tv_usec = scodata->connect_timeout_us % 1000000
+		};
+
+		if (setsockopt(sk, SOL_SOCKET, SO_SNDTIMEO,
+					(void *)&timeout, sizeof(timeout))) {
+			tester_warn("failed to set timeout: %m");
+			return -EINVAL;
+		}
 	}
 
 	central_bdaddr = hciemu_get_central_bdaddr(data->hciemu);
@@ -840,8 +940,6 @@ static gboolean sock_received_data(GIOChannel *io, GIOCondition cond,
 static void sco_recv_data(struct test_data *data, GIOChannel *io)
 {
 	const struct sco_client_data *scodata = data->test_data;
-	struct iovec iov = { (void *)scodata->recv_data, scodata->data_len };
-	struct bthost *bthost;
 
 	data->step = 0;
 
@@ -849,22 +947,18 @@ static void sco_recv_data(struct test_data *data, GIOChannel *io)
 						scodata->so_timestamping))
 		return;
 
-	bthost = hciemu_client_get_host(data->hciemu);
 	g_io_add_watch(io, G_IO_IN, sock_received_data, NULL);
 
-	bthost_send_sco(bthost, data->handle, 0x00, &iov, 1);
 	++data->step;
 }
 
-static gboolean sco_connect_cb(GIOChannel *io, GIOCondition cond,
+static gboolean sco_connect(GIOChannel *io, GIOCondition cond,
 							gpointer user_data)
 {
 	struct test_data *data = tester_get_data();
 	const struct sco_client_data *scodata = data->test_data;
 	int err, sk_err, sk;
 	socklen_t len = sizeof(sk_err);
-
-	data->io_id = 0;
 
 	sk = g_io_channel_unix_get_fd(io);
 
@@ -920,9 +1014,20 @@ static gboolean sco_connect_cb(GIOChannel *io, GIOCondition cond,
 	return FALSE;
 }
 
+static gboolean sco_connect_cb(GIOChannel *io, GIOCondition cond,
+							gpointer user_data)
+{
+	struct test_data *data = tester_get_data();
+
+	data->io_id = 0;
+	sco_connect(io, cond, user_data);
+	return FALSE;
+}
+
 static void test_connect(const void *test_data)
 {
 	struct test_data *data = tester_get_data();
+	const struct sco_client_data *scodata = data->test_data;
 	GIOChannel *io;
 	int sk;
 
@@ -935,6 +1040,12 @@ static void test_connect(const void *test_data)
 	if (connect_sco_sock(data, sk) < 0) {
 		close(sk);
 		tester_test_failed();
+		return;
+	}
+
+	if (scodata->close_after_connect) {
+		close(sk);
+		tester_test_passed();
 		return;
 	}
 
@@ -1034,6 +1145,25 @@ static void test_connect_offload_msbc(const void *test_data)
 
 end:
 	close(sk);
+}
+
+static bool hook_delay_evt(const void *msg, uint16_t len, void *user_data)
+{
+	tester_print("Delaying emulator response...");
+	g_usleep(500000);
+	tester_print("Delaying emulator response... Done.");
+	return true;
+}
+
+static void test_connect_delayed(const void *test_data)
+{
+	struct test_data *data = tester_get_data();
+
+	hciemu_add_hook(data->hciemu, HCIEMU_HOOK_POST_EVT,
+					BT_HCI_EVT_SYNC_CONN_COMPLETE,
+					hook_delay_evt, NULL);
+
+	test_connect(test_data);
 }
 
 static bool hook_setup_sync_evt(const void *buf, uint16_t len, void *user_data)
@@ -1182,6 +1312,174 @@ static void test_sco_ethtool_get_ts_info(const void *test_data)
 				!data->disable_sco_flowctl);
 }
 
+static int listen_sco_sock(struct test_data *data)
+{
+	const struct sco_client_data *scodata = data->test_data;
+	struct sockaddr_sco addr;
+	const uint8_t *src;
+	int sk, err;
+
+	sk = socket(PF_BLUETOOTH, SOCK_SEQPACKET | SOCK_NONBLOCK, BTPROTO_SCO);
+	if (sk < 0) {
+		err = -errno;
+		tester_warn("Can't create socket: %s (%d)", strerror(errno),
+									errno);
+		return err;
+	}
+
+	src = hciemu_get_central_bdaddr(data->hciemu);
+	if (!src) {
+		tester_warn("No source bdaddr");
+		err = -ENODEV;
+		goto fail;
+	}
+
+	/* Bind to local address */
+	memset(&addr, 0, sizeof(addr));
+	addr.sco_family = AF_BLUETOOTH;
+	bacpy(&addr.sco_bdaddr, (void *) src);
+
+	err = bind(sk, (struct sockaddr *) &addr, sizeof(addr));
+	if (err < 0) {
+		err = -errno;
+		tester_warn("Can't bind socket: %s (%d)", strerror(errno),
+									errno);
+		goto fail;
+	}
+
+	if (scodata->defer) {
+		int opt = 1;
+
+		if (setsockopt(sk, SOL_BLUETOOTH, BT_DEFER_SETUP, &opt,
+							sizeof(opt)) < 0) {
+			tester_print("Can't enable deferred setup: %s (%d)",
+						strerror(errno), errno);
+			goto fail;
+		}
+	}
+
+	if (listen(sk, 10)) {
+		err = -errno;
+		tester_warn("Can't listen socket: %s (%d)", strerror(errno),
+									errno);
+		goto fail;
+	}
+
+	return sk;
+
+fail:
+	close(sk);
+	return err;
+}
+
+static bool sco_defer_accept(struct test_data *data, GIOChannel *io)
+{
+	int sk;
+	char c;
+	struct pollfd pfd;
+
+	sk = g_io_channel_unix_get_fd(io);
+
+	memset(&pfd, 0, sizeof(pfd));
+	pfd.fd = sk;
+	pfd.events = POLLOUT;
+
+	if (poll(&pfd, 1, 0) < 0) {
+		tester_warn("poll: %s (%d)", strerror(errno), errno);
+		return false;
+	}
+
+	if (!(pfd.revents & POLLOUT)) {
+		if (read(sk, &c, 1) < 0) {
+			tester_warn("read: %s (%d)", strerror(errno), errno);
+			return false;
+		}
+	}
+
+	tester_print("Accept deferred setup");
+
+	return true;
+}
+
+static gboolean sco_accept_cb(GIOChannel *io, GIOCondition cond,
+							gpointer user_data)
+{
+	struct test_data *data = tester_get_data();
+	const struct sco_client_data *scodata = data->test_data;
+	int sk, new_sk;
+	gboolean ret;
+	GIOChannel *new_io;
+
+	tester_debug("New connection");
+
+	sk = g_io_channel_unix_get_fd(io);
+
+	new_sk = accept(sk, NULL, NULL);
+	if (new_sk < 0) {
+		tester_test_failed();
+		return false;
+	}
+
+	new_io = g_io_channel_unix_new(new_sk);
+	g_io_channel_set_close_on_unref(new_io, TRUE);
+
+	if (scodata->defer) {
+		if (scodata->expect_err < 0) {
+			g_io_channel_unref(new_io);
+			tester_test_passed();
+			return false;
+		}
+
+		if (!sco_defer_accept(data, new_io)) {
+			tester_warn("Unable to accept deferred setup");
+			tester_test_failed();
+			return false;
+		}
+	}
+
+	ret = sco_connect(new_io, cond, user_data);
+
+	g_io_channel_unref(new_io);
+	return ret;
+}
+
+static void setup_listen(struct test_data *data, GIOFunc func)
+{
+	struct hciemu_client *client;
+	struct bthost *host;
+	int sk;
+	GIOChannel *io;
+
+	sk = listen_sco_sock(data);
+	if (sk < 0) {
+		if (sk == -EPROTONOSUPPORT)
+			tester_test_abort();
+		else
+			tester_test_failed();
+		return;
+	}
+
+	io = g_io_channel_unix_new(sk);
+	g_io_channel_set_close_on_unref(io, TRUE);
+
+	data->io_id = g_io_add_watch(io, G_IO_IN, func, NULL);
+	g_io_channel_unref(io);
+
+	tester_print("Listen in progress");
+
+	client = hciemu_get_client(data->hciemu, 0);
+	host = hciemu_client_host(client);
+
+	bthost_setup_sco(host, data->acl_handle, BT_VOICE_CVSD_16BIT);
+}
+
+static void test_listen(const void *test_data)
+{
+	struct test_data *data = tester_get_data();
+
+	setup_listen(data, sco_accept_cb);
+}
+
 int main(int argc, char *argv[])
 {
 	tester_init(&argc, &argv);
@@ -1200,6 +1498,12 @@ int main(int argc, char *argv[])
 
 	test_sco("eSCO CVSD - Success", &connect_success, setup_powered,
 							test_connect);
+
+	test_sco_full("eSCO CVSD - Timeout", &connect_timeout, setup_powered,
+				test_connect_delayed, false, false, false, 8);
+
+	test_sco("eSCO CVSD - Close", &connect_close, setup_powered,
+						test_connect_delayed);
 
 	test_sco("eSCO mSBC - Success", &connect_success, setup_powered,
 							test_connect_transp);
@@ -1261,6 +1565,18 @@ int main(int argc, char *argv[])
 
 	test_sco_no_flowctl("SCO Ethtool Get Ts Info No Flowctl - Success",
 			NULL, setup_powered, test_sco_ethtool_get_ts_info);
+
+	test_sco("SCO CVSD Listen - Success", &listen_success,
+					setup_powered, test_listen);
+
+	test_sco("SCO CVSD Listen Defer - Success", &listen_defer_success,
+					setup_powered, test_listen);
+
+	test_sco("SCO CVSD Listen Recv - Success", &listen_recv_success,
+					setup_powered, test_listen);
+
+	test_sco("SCO CVSD Listen Send - Success", &listen_send_success,
+					setup_powered, test_listen);
 
 	return tester_run();
 }

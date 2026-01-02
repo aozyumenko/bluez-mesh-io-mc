@@ -108,6 +108,7 @@ struct bap_transport {
 	struct bt_bap_qos	qos;
 	guint			resume_id;
 	struct iovec		*meta;
+	guint			chan_id;
 };
 
 struct media_transport_ops {
@@ -1010,7 +1011,12 @@ static gboolean delay_reporting_exists(const GDBusPropertyTable *property,
 							void *data)
 {
 	struct media_transport *transport = data;
+	struct media_endpoint *endpoint = transport->endpoint;
 	struct avdtp_stream *stream;
+
+	/* Local A2DP sink decides itself if it has delay reporting */
+	if (!strcmp(media_endpoint_get_uuid(endpoint), A2DP_SINK_UUID))
+		return media_endpoint_get_delay_reporting(endpoint);
 
 	stream = media_transport_get_stream(transport);
 	if (stream == NULL)
@@ -2098,9 +2104,19 @@ static guint transport_bap_suspend(struct media_transport *transport,
 	return id;
 }
 
+static void bap_clear_chan(struct bap_transport *bap)
+{
+	if (bap->chan_id) {
+		g_source_remove(bap->chan_id);
+		bap->chan_id = 0;
+	}
+}
+
 static void transport_bap_cancel(struct media_transport *transport, guint id)
 {
 	struct bap_transport *bap = transport->data;
+
+	bap_clear_chan(bap);
 
 	if (id == bap->resume_id && bap->resume_id) {
 		g_source_remove(bap->resume_id);
@@ -2162,6 +2178,38 @@ static void bap_metadata_changed(struct media_transport *transport)
 	}
 }
 
+static gboolean bap_transport_fd_ready(GIOChannel *chan, GIOCondition cond,
+								gpointer data)
+{
+	struct media_transport *transport = data;
+	struct bap_transport *bap = transport->data;
+	int fd;
+	uint16_t imtu, omtu;
+	GError *err = NULL;
+
+	if (cond & (G_IO_HUP | G_IO_ERR | G_IO_NVAL)) {
+		error("Transport connection failed");
+		goto done;
+	}
+
+	if (!bt_io_get(chan, &err, BT_IO_OPT_OMTU, &omtu,
+					BT_IO_OPT_IMTU, &imtu,
+					BT_IO_OPT_INVALID)) {
+		error("%s", err->message);
+		goto done;
+	}
+
+	fd = g_io_channel_unix_get_fd(chan);
+	media_transport_set_fd(transport, fd, imtu, omtu);
+	transport_update_playing(transport, TRUE);
+
+done:
+	bap->chan_id = 0;
+	bap_resume_complete(transport);
+
+	return FALSE;
+}
+
 static void bap_state_changed(struct bt_bap_stream *stream, uint8_t old_state,
 				uint8_t new_state, void *user_data)
 {
@@ -2170,9 +2218,7 @@ static void bap_state_changed(struct bt_bap_stream *stream, uint8_t old_state,
 	struct media_owner *owner = transport->owner;
 	struct io *io;
 	GIOChannel *chan;
-	GError *err = NULL;
 	int fd;
-	uint16_t imtu, omtu;
 
 	if (bap->stream != stream)
 		return;
@@ -2209,7 +2255,6 @@ static void bap_state_changed(struct bt_bap_stream *stream, uint8_t old_state,
 			bap_update_bcast_qos(transport);
 
 		bap_metadata_changed(transport);
-		transport_update_playing(transport, TRUE);
 		break;
 	case BT_BAP_STREAM_STATE_RELEASING:
 		if (bt_bap_stream_io_dir(stream) == BT_BAP_BCAST_SINK)
@@ -2231,21 +2276,20 @@ static void bap_state_changed(struct bt_bap_stream *stream, uint8_t old_state,
 		goto done;
 	}
 
+	/* Wait for FD to become ready */
+	bap_clear_chan(bap);
+
 	chan = g_io_channel_unix_new(fd);
-
-	if (!bt_io_get(chan, &err, BT_IO_OPT_OMTU, &omtu,
-					BT_IO_OPT_IMTU, &imtu,
-					BT_IO_OPT_INVALID)) {
-		error("%s", err->message);
-		goto done;
-	}
-
+	bap->chan_id = g_io_add_watch(chan,
+				G_IO_OUT | G_IO_IN |
+				G_IO_HUP | G_IO_ERR | G_IO_NVAL,
+				bap_transport_fd_ready, transport);
 	g_io_channel_unref(chan);
-
-	media_transport_set_fd(transport, fd, imtu, omtu);
-	transport_update_playing(transport, TRUE);
+	if (bap->chan_id)
+		return;
 
 done:
+	bap_clear_chan(bap);
 	bap_resume_complete(transport);
 }
 
@@ -2286,6 +2330,8 @@ static int transport_bap_set_volume(struct media_transport *transport,
 static void transport_bap_destroy(void *data)
 {
 	struct bap_transport *bap = data;
+
+	bap_clear_chan(bap);
 
 	util_iov_free(bap->meta, 1);
 	bt_bap_state_unregister(bt_bap_stream_get_session(bap->stream),
@@ -2582,7 +2628,7 @@ struct media_transport *media_transport_create(struct btd_device *device,
 	struct media_endpoint *endpoint = data;
 	struct media_transport *transport;
 	const struct media_transport_ops *ops;
-	static int fd = 0;
+	int fd;
 
 	transport = g_new0(struct media_transport, 1);
 	if (device)
@@ -2595,15 +2641,34 @@ struct media_transport *media_transport_create(struct btd_device *device,
 	transport->size = size;
 	transport->remote_endpoint = g_strdup(remote_endpoint);
 
-	if (device)
-		transport->path = g_strdup_printf("%s/fd%d",
+	for (fd = g_slist_length(transports); fd < UINT8_MAX; fd++) {
+		char *path;
+
+		if (device)
+			path = g_strdup_printf("%s/fd%d",
 					remote_endpoint ? remote_endpoint :
-					device_get_path(device), fd++);
-	else
-		transport->path = g_strdup_printf("%s/fd%d",
+					device_get_path(device),
+					fd);
+		else
+			path = g_strdup_printf("%s/fd%d",
 					remote_endpoint ? remote_endpoint :
 					adapter_get_path(transport->adapter),
-					fd++);
+					fd);
+
+		/* Check if transport already exists */
+		if (!find_transport_by_path(path)) {
+			transport->path = path;
+			break;
+		}
+
+		g_free(path);
+	}
+
+	if (!transport->path) {
+		error("Unable to allocate transport path");
+		goto fail;
+	}
+
 	transport->fd = -1;
 
 	ops = media_transport_find_ops(media_endpoint_get_uuid(endpoint));
@@ -2680,6 +2745,7 @@ void media_transport_update_volume(struct media_transport *transport,
 	if (volume < 0)
 		return;
 
+#ifdef HAVE_A2DP
 	if (media_endpoint_get_sep(transport->endpoint)) {
 		struct a2dp_transport *a2dp = transport->data;
 
@@ -2692,6 +2758,7 @@ void media_transport_update_volume(struct media_transport *transport,
 
 		a2dp->volume = volume;
 	}
+#endif
 	g_dbus_emit_property_changed(btd_get_dbus_connection(),
 					transport->path,
 					MEDIA_TRANSPORT_INTERFACE, "Volume");
@@ -2704,6 +2771,7 @@ int media_transport_get_device_volume(struct btd_device *dev)
 	if (dev == NULL)
 		return -1;
 
+#ifdef HAVE_A2DP
 	/* Attempt to locate the transport to get its volume */
 	for (l = transports; l; l = l->next) {
 		struct media_transport *transport = l->data;
@@ -2720,6 +2788,7 @@ int media_transport_get_device_volume(struct btd_device *dev)
 			return -1;
 		}
 	}
+#endif
 
 	/* If transport volume doesn't exists use device_volume */
 	return btd_device_get_volume(dev);
@@ -2733,6 +2802,7 @@ void media_transport_update_device_volume(struct btd_device *dev,
 	if (dev == NULL || volume < 0)
 		return;
 
+#ifdef HAVE_A2DP
 	/* Attempt to locate the transport to set its volume */
 	for (l = transports; l; l = l->next) {
 		struct media_transport *transport = l->data;
@@ -2749,6 +2819,7 @@ void media_transport_update_device_volume(struct btd_device *dev,
 			break;
 		}
 	}
+#endif
 
 	btd_device_set_volume(dev, volume);
 }

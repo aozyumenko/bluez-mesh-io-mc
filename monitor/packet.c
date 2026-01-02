@@ -32,11 +32,13 @@
 #include "bluetooth/uuid.h"
 #include "bluetooth/hci.h"
 #include "bluetooth/hci_lib.h"
+#include "bluetooth/mgmt.h"
 
 #include "src/shared/util.h"
 #include "src/shared/btsnoop.h"
 #include "src/shared/queue.h"
 #include "src/shared/bap-debug.h"
+#include "src/shared/mgmt.h"
 #include "display.h"
 #include "bt.h"
 #include "ll.h"
@@ -2526,6 +2528,9 @@ void packet_print_version(const char *label, uint8_t version,
 	case 0x0d:
 		str = "Bluetooth 5.4";
 		break;
+	case 0x0e:
+		str = "Bluetooth 6.0";
+		break;
 	default:
 		str = "Reserved";
 		break;
@@ -2765,7 +2770,7 @@ static const struct bitfield_data features_page2[] = {
 	{ }
 };
 
-static const struct bitfield_data features_le[] = {
+static const struct bitfield_data features_le_0[] = {
 	{  0, "LE Encryption"					},
 	{  1, "Connection Parameter Request Procedure"		},
 	{  2, "Extended Reject Indication"			},
@@ -2806,7 +2811,22 @@ static const struct bitfield_data features_le[] = {
 	{ 37, "Connection Subrating"				},
 	{ 38, "Connection Subrating (Host Support)"		},
 	{ 39, "Channel Classification"				},
+	{ 40, "Advertising Coding Selection"			},
+	{ 41, "Advertising Coding Selection (Host Support)"	},
+	{ 42, "Decision-Based Advertising Filtering"		},
+	{ 43, "Periodic Advertising with Responses - Advertiser"},
+	{ 44, "Periodic Advertising with Responses - Scanner"	},
+	{ 45, "Unsegmented Framed Mode"				},
+	{ 46, "Channel Sounding"				},
+	{ 47, "Channel Sounding (Host Support)"			},
+	{ 48, "Channel Sounding Tone Quality Indication"	},
+	{ 63, "LL Extended Feature Set"				},
 	{ }
+};
+
+static const struct bitfield_data features_le_1[] = {
+	{ 0, "Monitoring Advertisers"				},
+	{ 1, "Frame Space Update"				},
 };
 
 static const struct bitfield_data features_msft[] = {
@@ -2819,20 +2839,35 @@ static const struct bitfield_data features_msft[] = {
 	{ }
 };
 
+static void print_features_subpage(uint8_t page, uint8_t subpages,
+					const uint8_t *features_array,
+					uint64_t *features)
+{
+	int i, j;
+	char str[18];
+
+	for (i = 0; i < subpages; i++) {
+		for (j = 0; j < 8; j++)
+			features[i] |= ((uint64_t) features_array[i * 8 + j])
+					<< (j * 8);
+		sprintf(str, "Features[%u/%u]", page, i);
+		print_hex_field(str, &features_array[i * 8], 8);
+	}
+}
+
 static void print_features(uint8_t page, const uint8_t *features_array,
 								uint8_t type)
 {
 	const struct bitfield_data *features_table = NULL;
-	uint64_t mask, features = 0;
-	char str[41];
+	uint64_t mask, features[3] = {};
+	uint8_t subpages = 1;
 	int i;
 
-	for (i = 0; i < 8; i++) {
-		sprintf(str + (i * 5), " 0x%2.2x", features_array[i]);
-		features |= ((uint64_t) features_array[i]) << (i * 8);
-	}
+	/* LE pages 1-10 are 192 bits (24 octets) each */
+	if (type == 0x01 && page)
+		subpages = 3;
 
-	print_field("Features:%s", str);
+	print_features_subpage(page, subpages, features_array, features);
 
 	switch (type) {
 	case 0x00:
@@ -2851,8 +2886,10 @@ static void print_features(uint8_t page, const uint8_t *features_array,
 	case 0x01:
 		switch (page) {
 		case 0:
-			features_table = features_le;
+			features_table = features_le_0;
 			break;
+		case 1:
+			features_table = features_le_1;
 		}
 		break;
 	case 0xf0:
@@ -2867,10 +2904,13 @@ static void print_features(uint8_t page, const uint8_t *features_array,
 	if (!features_table)
 		return;
 
-	mask = print_bitfield(2, features, features_table);
-	if (mask)
-		print_text(COLOR_UNKNOWN_FEATURE_BIT, "  Unknown features "
-						"(0x%16.16" PRIx64 ")", mask);
+	for (i = 0; i < subpages; i++) {
+		mask = print_bitfield(2, features[i], features_table);
+		if (mask)
+			print_text(COLOR_UNKNOWN_FEATURE_BIT,
+				"  Unknown features (0x%16.16" PRIx64 ")",
+				mask);
+	}
 }
 
 void packet_print_features_lmp(const uint8_t *features, uint8_t page)
@@ -2881,6 +2921,11 @@ void packet_print_features_lmp(const uint8_t *features, uint8_t page)
 void packet_print_features_ll(const uint8_t *features)
 {
 	print_features(0, features, 0x01);
+}
+
+void packet_print_features_ext_ll(uint8_t page, const uint8_t *features)
+{
+	print_features(page, features, 0x01);
 }
 
 void packet_print_features_msft(const uint8_t *features)
@@ -3192,18 +3237,36 @@ static const struct bitfield_data events_le_table[] = {
 	{ 20, "LE Connectionless IQ Report"		},
 	{ 21, "LE Connection IQ Report"			},
 	{ 22, "LE CTE Request Failed"			},
-	{ 23, "LE Periodic Advertising Sync Transfer Rvc"},
+	{ 23, "LE PAST Received"			},
 	{ 24, "LE CIS Established"			},
 	{ 25, "LE CIS Request"				},
 	{ 26, "LE Create BIG Complete"			},
 	{ 27, "LE Terminate BIG Complete"		},
 	{ 28, "LE BIG Sync Established Complete"	},
 	{ 29, "LE BIG Sync Lost"			},
-	{ 30, "LE Request Peer SCA Complete"},
-	{ 31, "LE Path Loss Threshold"		},
-	{ 32, "LE Transmit Power Reporting"	},
-	{ 33, "LE BIG Info Advertising Report"	},
+	{ 30, "LE Request Peer SCA Complete"		},
+	{ 31, "LE Path Loss Threshold"			},
+	{ 32, "LE Transmit Power Reporting"		},
+	{ 33, "LE BIG Info Advertising Report"		},
 	{ 34, "LE Subrate Change"			},
+	{ 35, "LE Periodic Advertising Sync Established v2"},
+	{ 36, "LE Periodic Advertising Report v2"	},
+	{ 37, "LE Periodic Advertising Sync Transfer Received" },
+	{ 38, "LE Periodic Advertising Subevent Data Request" },
+	{ 39, "LE Periodic Advertising Response Report" },
+	{ 40, "LE Enhanced Connection Complete v2"	},
+	{ 41, "LE CIS Established v2"			},
+	{ 42, "LE Read All Remote Features Complete"	},
+	{ 43, "LE CS Read Remote Supported Capabilities Complete" },
+	{ 44, "LE CS Read Remote FAE Table Complete"	},
+	{ 45, "LE CS Security Enable Complete"		},
+	{ 46, "LE CS Config Complete"			},
+	{ 47, "LE CS Procedure Enable Complete"		},
+	{ 48, "LE CS Subevent Result"			},
+	{ 49, "LE CS Subevent Result Continue"		},
+	{ 50, "LE CS Test End Complete"			},
+	{ 51, "LE Monitored Advertisers Report"		},
+	{ 52, "LE Frame Space Update Complete"		},
 	{ }
 };
 
@@ -4133,7 +4196,7 @@ static void print_eir(const uint8_t *eir, uint8_t eir_len, bool le)
 		eir += field_len + 1;
 	}
 
-	if (len < eir_len && eir[0] != 0)
+	if (len < eir_len)
 		packet_hexdump(eir, eir_len - len);
 }
 
@@ -8596,18 +8659,18 @@ static void le_pa_rec_enable(uint16_t index, const void *data, uint8_t size)
 	print_enable("Reporting", cmd->enable);
 }
 
-static void le_pa_sync_trans(uint16_t index, const void *data, uint8_t size)
+static void le_past(uint16_t index, const void *data, uint8_t size)
 {
-	const struct bt_hci_cmd_periodic_sync_trans *cmd = data;
+	const struct bt_hci_cmd_le_past *cmd = data;
 
 	print_field("Connection handle: %d", cmd->handle);
 	print_field("Service data: 0x%4.4x", cmd->service_data);
 	print_field("Sync handle: %d", cmd->sync_handle);
 }
 
-static void le_pa_set_info_trans(uint16_t index, const void *data, uint8_t size)
+static void le_past_set_info(uint16_t index, const void *data, uint8_t size)
 {
-	const struct bt_hci_cmd_pa_set_info_trans *cmd = data;
+	const struct bt_hci_cmd_le_past_set_info *cmd = data;
 
 	print_field("Connection handle: %d", cmd->handle);
 	print_field("Service data: 0x%4.4x", cmd->service_data);
@@ -8628,6 +8691,10 @@ static void print_sync_mode(uint8_t mode)
 	case 0x02:
 		str = "Enabled with report events enabled";
 		break;
+	case 0x03:
+		str = "Enabled with report events enabled with duplicate "
+			"filtering";
+		break;
 	default:
 		str = "RFU";
 		break;
@@ -8636,10 +8703,10 @@ static void print_sync_mode(uint8_t mode)
 	print_field("Mode: %s (0x%2.2x)", str, mode);
 }
 
-static void le_pa_sync_trans_params(uint16_t index, const void *data,
+static void le_past_params(uint16_t index, const void *data,
 							uint8_t size)
 {
-	const struct bt_hci_cmd_pa_sync_trans_params *cmd = data;
+	const struct bt_hci_cmd_le_past_params *cmd = data;
 
 	print_field("Connection handle: %d", cmd->handle);
 	print_sync_mode(cmd->mode);
@@ -8650,10 +8717,10 @@ static void le_pa_sync_trans_params(uint16_t index, const void *data,
 	print_create_sync_cte_type(cmd->cte_type);
 }
 
-static void le_set_default_pa_sync_trans_params(uint16_t index,
+static void le_set_default_past_params(uint16_t index,
 						const void *data, uint8_t size)
 {
-	const struct bt_hci_cmd_default_pa_sync_trans_params *cmd = data;
+	const struct bt_hci_cmd_le_default_past_params *cmd = data;
 
 	print_sync_mode(cmd->mode);
 	print_field("Skip: 0x%2.2x", cmd->skip);
@@ -9124,7 +9191,7 @@ static void le_set_host_feature_cmd(uint16_t index, const void *data,
 	print_field("Bit Number: %u", cmd->bit_number);
 
 	mask = print_bitfield(2, (((uint64_t) 1) << cmd->bit_number),
-							features_le);
+							features_le_0);
 	if (mask)
 		print_text(COLOR_UNKNOWN_FEATURE_BIT, "  Unknown features "
 						"(0x%16.16" PRIx64 ")", mask);
@@ -9161,6 +9228,41 @@ static void status_le_read_iso_link_quality_rsp(uint16_t index,
 	print_field("TX crc error packets %d", rsp->crc_error_packets);
 	print_field("RX unreceived packets %d", rsp->rx_unreceived_packets);
 	print_field("Duplicated packets %d", rsp->duplicated_packets);
+}
+
+static void print_le_ext_features(const uint8_t features[248], uint8_t pages)
+{
+	int i;
+
+	/* Page 0 containing bits 0 to 63 (octets 0 to 7) */
+	print_features(0, features, 0x01);
+
+	/* 10 pages of 192 bits (24 octets) each */
+	for (i = 0; i < pages && i < 10; i++)
+		print_features(i + 1, &features[i * 24 + 8], 0x01);
+}
+
+static void le_read_all_local_features_rsp(uint16_t index, const void *data,
+							uint8_t size)
+{
+	const struct bt_hci_rsp_le_read_all_local_features *rsp = data;
+
+	print_status(rsp->status);
+
+	if (size == 1)
+		return;
+
+	print_field("Page: %d", rsp->page);
+	print_le_ext_features(rsp->features, rsp->page);
+}
+
+static void le_read_all_remote_features(uint16_t index, const void *data,
+							uint8_t size)
+{
+	const struct bt_hci_cmd_le_read_all_remote_features *cmd = data;
+
+	print_handle(cmd->handle);
+	print_field("Pages: %d", cmd->pages);
 }
 
 static const struct bitfield_data cs_roles_supp_table[] = {
@@ -10492,17 +10594,17 @@ static const struct opcode_data opcode_table[] = {
 				le_pa_rec_enable, 3, true,
 				status_rsp, 1, true },
 	{ 0x205a, 326, "LE Periodic Advertising Sync Transfer",
-				le_pa_sync_trans, 6, true,
+				le_past, 6, true,
 				status_handle_rsp, 3, true },
 	{ 0x205b, 327, "LE Periodic Advertising Set Info Transfer",
-				le_pa_set_info_trans, 5, true,
+				le_past_set_info, 5, true,
 				status_handle_rsp, 3, true },
 	{ 0x205c, 328, "LE Periodic Advertising Sync Transfer Parameters",
-				le_pa_sync_trans_params, 8, true,
+				le_past_params, 8, true,
 				status_handle_rsp, 3, true},
 	{ 0x205d, 329, "LE Set Default Periodic Advertisng Sync Transfer "
 				"Parameters",
-				le_set_default_pa_sync_trans_params,
+				le_set_default_past_params,
 				6, true, status_rsp, 1, true},
 	{ BT_HCI_CMD_LE_READ_BUFFER_SIZE_V2,
 				BT_HCI_BIT_LE_READ_BUFFER_SIZE_V2,
@@ -10625,6 +10727,19 @@ static const struct opcode_data opcode_table[] = {
 				sizeof(
 				struct bt_hci_rsp_le_read_iso_link_quality),
 				true },
+	{ BT_HCI_CMD_LE_READ_ALL_LOCAL_FEATURES,
+			BT_HCI_BIT_LE_READ_ALL_LOCAL_FEATURES,
+			"LE Read All Local Features",
+			null_cmd, 0, true,
+			le_read_all_local_features_rsp,
+			sizeof(struct bt_hci_rsp_le_read_all_local_features),
+			true },
+	{ BT_HCI_CMD_LE_READ_ALL_REMOTE_FEATURES,
+			BT_HCI_BIT_LE_READ_ALL_REMOTE_FEATURES,
+			"LE Read All Remote Features",
+			le_read_all_remote_features,
+			sizeof(struct bt_hci_cmd_le_read_all_remote_features),
+			true, status_rsp, 1, true },
 	{ BT_HCI_CMD_LE_CS_RD_LOC_SUPP_CAP, BT_HCI_BIT_LE_CS_RD_LOC_SUPP_CAP,
 				"LE CS Read Local Supported Capabilities",
 				NULL, 0, false,
@@ -12383,10 +12498,10 @@ static void le_cte_request_failed_evt(struct timeval *tv, uint16_t index,
 	print_field("Connection handle: %d", evt->handle);
 }
 
-static void le_pa_sync_trans_rec_evt(struct timeval *tv, uint16_t index,
+static void le_past_received_evt(struct timeval *tv, uint16_t index,
 					const void *data, uint8_t size)
 {
-	const struct bt_hci_evt_le_pa_sync_trans_rec *evt = data;
+	const struct bt_hci_evt_le_past_recv *evt = data;
 
 	print_status(evt->status);
 	print_field("Handle: %d", evt->handle);
@@ -12499,7 +12614,7 @@ static void le_big_sync_estabilished_evt(struct timeval *tv, uint16_t index,
 	print_usec_interval("Transport Latency", evt->latency);
 	print_field("NSE: %u", evt->nse);
 	print_field("BN: %u", evt->bn);
-	print_field("PTO: %u", evt->bn);
+	print_field("PTO: %u", evt->pto);
 	print_field("IRC: %u", evt->irc);
 	print_field("Maximum PDU: %u", evt->max_pdu);
 	print_slot_125("ISO Interval", evt->interval);
@@ -12544,7 +12659,7 @@ static void le_big_info_evt(struct timeval *tv, uint16_t index,
 	print_field("NSE: %u", evt->nse);
 	print_slot_125("ISO Interval", evt->iso_interval);
 	print_field("BN: %u", evt->bn);
-	print_field("PTO: %u", evt->bn);
+	print_field("PTO: %u", evt->pto);
 	print_field("IRC: %u", evt->irc);
 	print_field("Maximum PDU: %u", evt->max_pdu);
 	print_usec_interval("SDU Interval", evt->sdu_interval);
@@ -12552,6 +12667,24 @@ static void le_big_info_evt(struct timeval *tv, uint16_t index,
 	print_le_phy("PHY", evt->phy);
 	print_framing(evt->framing);
 	print_field("Encryption: 0x%02x", evt->encryption);
+}
+
+static void le_read_all_remote_features_complete_evt(struct timeval *tv,
+					uint16_t index, const void *data,
+					uint8_t size)
+{
+	const struct bt_hci_evt_le_read_all_remote_features_complete *evt =
+									data;
+
+	print_status(evt->status);
+
+	if (size == 1)
+		return;
+
+	print_handle(evt->handle);
+	print_field("Max Pages: 0x%2.2x", evt->max_pages);
+	print_field("Valid Pages: 0x%2.2x", evt->valid_pages);
+	print_le_ext_features(evt->features, evt->valid_pages);
 }
 
 static void le_cs_rd_rem_supp_cap_complete_evt(struct timeval *tv,
@@ -13283,9 +13416,10 @@ static const struct subevent_data le_meta_event_table[] = {
 				le_chan_select_alg_evt, 3, true},
 	{ 0x17, "LE CTE Request Failed",
 				le_cte_request_failed_evt, 3, true},
-	{ 0x18, "LE Periodic Advertising Sync Transfer Received",
-					le_pa_sync_trans_rec_evt, 19,
-					true},
+	{ BT_HCI_EVT_LE_PAST_RECEIVED,
+			"LE Periodic Advertising Sync Transfer Received",
+			le_past_received_evt, 19,
+			true},
 	{ BT_HCI_EVT_LE_CIS_ESTABLISHED,
 				"LE Connected Isochronous Stream Established",
 				le_cis_established_evt,
@@ -13320,6 +13454,11 @@ static const struct subevent_data le_meta_event_table[] = {
 		"LE Broadcast Isochronous Group Info Advertising Report",
 		le_big_info_evt,
 		sizeof(struct bt_hci_evt_le_big_info_adv_report) },
+	{ BT_HCI_EVT_LE_READ_ALL_REMOTE_FEATURES_COMPLETE,
+		"LE Read All Remote Features Complete",
+		le_read_all_remote_features_complete_evt,
+		sizeof(struct bt_hci_evt_le_read_all_remote_features_complete),
+		true },
 	{ BT_HCI_EVT_LE_CS_RD_REM_SUPP_CAP_COMPLETE,
 		"LE CS Read Remote Supported Capabilities Complete",
 		le_cs_rd_rem_supp_cap_complete_evt,
@@ -14068,8 +14207,9 @@ void packet_hci_isodata(struct timeval *tv, struct ucred *cred, uint16_t index,
 	const struct bt_hci_iso_data_start *start;
 	uint16_t handle = le16_to_cpu(hdr->handle);
 	uint8_t flags = acl_flags(handle);
-	char handle_str[36], extra_str[33];
+	char handle_str[36], extra_str[50], ts_str[16] = { 0 };
 	struct index_buf_pool *pool = &index_list[index].iso;
+	size_t ts_size = 0;
 
 	if (index >= MAX_INDEX) {
 		print_field("Invalid index (%d).", index);
@@ -14086,11 +14226,15 @@ void packet_hci_isodata(struct timeval *tv, struct ucred *cred, uint16_t index,
 
 	/* Detect if timestamp field is preset */
 	if (iso_flags_ts(flags)) {
-		if (size < sizeof(uint32_t))
+		ts_size = sizeof(uint32_t);
+
+		if (size < ts_size)
 			goto malformed;
 
-		data += sizeof(uint32_t);
-		size -= sizeof(uint32_t);
+		snprintf(ts_str, sizeof(ts_str), " ts %u", get_le32(data));
+
+		data += ts_size;
+		size -= ts_size;
 	}
 
 	start = data;
@@ -14102,8 +14246,8 @@ void packet_hci_isodata(struct timeval *tv, struct ucred *cred, uint16_t index,
 		sprintf(handle_str, "Handle %u SN %u", acl_handle(handle),
 			start->sn);
 
-	sprintf(extra_str, "flags 0x%2.2x dlen %u slen %u", flags, hdr->dlen,
-		start->slen);
+	sprintf(extra_str, "flags 0x%2.2x dlen %u slen %u%s", flags, hdr->dlen,
+							start->slen, ts_str);
 
 	print_packet(tv, cred, in ? '>' : '<', index, NULL, COLOR_HCI_ISODATA,
 				in ? "ISO Data RX" : "ISO Data TX",
@@ -14113,9 +14257,16 @@ void packet_hci_isodata(struct timeval *tv, struct ucred *cred, uint16_t index,
 		packet_enqueue_tx(tv, acl_handle(handle),
 					index_list[index].frame, hdr->dlen);
 
-	if (size != hdr->dlen) {
+	if (size + ts_size != hdr->dlen) {
 		print_text(COLOR_ERROR, "invalid packet size (%d != %d)",
-							size, hdr->dlen);
+						size + (int)ts_size, hdr->dlen);
+		packet_hexdump(data, size);
+		return;
+	}
+
+	if (size != start->slen + 4) {
+		print_text(COLOR_ERROR, "invalid packet slen (%d+4 != %d)",
+							start->slen, size);
 		packet_hexdump(data, size);
 		return;
 	}
@@ -14419,6 +14570,8 @@ static const struct bitfield_data mgmt_settings_table[] = {
 	{ 20, "ISO Broadcaster"		},
 	{ 21, "Sync Receiver"		},
 	{ 22, "LL Privacy"		},
+	{ 23, "PAST Sender"		},
+	{ 24, "PAST Receiver"		},
 	{}
 };
 
@@ -14532,10 +14685,6 @@ static const struct bitfield_data mgmt_adv_flags_table[] = {
 	{  16, "Contain Scan Response Data"		},
 	{ }
 };
-#define MGMT_ADV_PARAM_DURATION		(1 << 12)
-#define MGMT_ADV_PARAM_TIMEOUT		(1 << 13)
-#define MGMT_ADV_PARAM_INTERVALS	(1 << 14)
-#define MGMT_ADV_PARAM_TX_POWER		(1 << 15)
 
 static void mgmt_print_adv_flags(uint32_t flags)
 {
@@ -15843,10 +15992,116 @@ static void mgmt_set_exp_feature_rsp(const void *data, uint16_t size)
 	mgmt_print_exp_feature(data);
 }
 
+static const struct {
+	uint16_t val;
+	const char *str;
+} default_system_config_table[] = {
+	{0x0000, "BR/EDR Page Scan Type"                              },
+	{0x0001, "BR/EDR Page Scan Interval"                          },
+	{0x0002, "BR/EDR Page Scan Window"                            },
+	{0x0003, "BR/EDR Inquiry Scan Type"                           },
+	{0x0004, "BR/EDR Inquiry Scan Interval"                       },
+	{0x0005, "BR/EDR Inquiry Scan Window"                         },
+	{0x0006, "BR/EDR Link Supervision Timeout"                    },
+	{0x0007, "BR/EDR Page Timeout"                                },
+	{0x0008, "BR/EDR Min Sniff Interval"                          },
+	{0x0009, "BR/EDR Max Sniff Interval"                          },
+	{0x000a, "LE Advertisement Min Interval"                      },
+	{0x000b, "LE Advertisement Max Interval"                      },
+	{0x000c, "LE Multi Advertisement Rotation Interval"           },
+	{0x000d, "LE Scanning Interval for auto connect"              },
+	{0x000e, "LE Scanning Window for auto connect"                },
+	{0x000f, "LE Scanning Interval for wake scenarios"            },
+	{0x0010, "LE Scanning Window for wake scenarios"              },
+	{0x0011, "LE Scanning Interval for discovery"                 },
+	{0x0012, "LE Scanning Window for discovery"                   },
+	{0x0013, "LE Scanning Interval for adv monitoring"            },
+	{0x0014, "LE Scanning Window for adv monitoring"              },
+	{0x0015, "LE Scanning Interval for connect"                   },
+	{0x0016, "LE Scanning Window for connect"                     },
+	{0x0017, "LE Min Connection Interval"                         },
+	{0x0018, "LE Max Connection Interval"                         },
+	{0x0019, "LE Connection Latency"                              },
+	{0x001a, "LE Connection Supervision Timeout"                  },
+	{0x001b, "LE Autoconnect Timeout"                             },
+	{0x001d, "LE Allow List Scanning Duration for adv monitoring" },
+	{0x001e, "LE No Filter Scanning Duration for adv monitoring"  },
+	{0x001f, "LE Enable Interleave Scan for adv monitoring"       },
+	{0x0020, "BR/EDR Connection Idle Timeout"                     },
+	{ }
+};
+
+static const char *default_system_config(uint16_t val)
+{
+	int i;
+
+	for (i = 0; default_system_config_table[i].str; i++) {
+		if (default_system_config_table[i].val == val)
+			return default_system_config_table[i].str;
+	}
+
+	return NULL;
+}
+
+static void mgmt_print_system_config_tlv(void *data, void *user_data)
+{
+	const struct mgmt_tlv *entry = data;
+	uint16_t type = get_le16(&entry->type);
+	const char *desc = default_system_config(type);
+	uint32_t value;
+	char buf[8];
+
+	if (!desc) {
+		snprintf(buf, sizeof(buf), "0x%4.4x", entry->type);
+		desc = buf;
+	}
+
+	if (entry->length == 1 || entry->length == 2 || entry->length == 4) {
+		if (entry->length == 1)
+			value = get_u8(entry->value);
+		else if (entry->length == 2)
+			value = get_le16(entry->value);
+		else if (entry->length == 4)
+			value = get_le32(entry->value);
+		print_field("%s: %u", desc, value);
+	} else {
+		print_hex_field(desc, entry->value, entry->length);
+	}
+}
+
+static void mgmt_read_default_system_config_rsp(const void *data, uint16_t size)
+{
+	struct mgmt_tlv_list *tlv_list;
+
+	tlv_list = mgmt_tlv_list_load_from_buf(data, size);
+	if (!tlv_list) {
+		print_text(COLOR_ERROR, "  Unable to parse response of read "
+					"system configuration");
+		return;
+	}
+	mgmt_tlv_list_foreach(tlv_list, mgmt_print_system_config_tlv, NULL);
+	mgmt_tlv_list_free(tlv_list);
+}
+
+static void mgmt_set_default_system_config_cmd(const void *data, uint16_t size)
+{
+	struct mgmt_tlv_list *tlv_list;
+
+	tlv_list = mgmt_tlv_list_load_from_buf(data, size);
+	if (!tlv_list) {
+		print_text(COLOR_ERROR, "  Unable to parse command of set "
+					"system configuration");
+		return;
+	}
+	mgmt_tlv_list_foreach(tlv_list, mgmt_print_system_config_tlv, NULL);
+	mgmt_tlv_list_free(tlv_list);
+}
+
 static const struct bitfield_data mgmt_added_device_flags_table[] = {
 	{ 0, "Remote Wakeup"		},
 	{ 1, "Device Privacy Mode"	},
 	{ 2, "Address Resolution"	},
+	{ 3, "PAST"			},
 	{ }
 };
 
@@ -16422,8 +16677,12 @@ static const struct mgmt_data mgmt_command_table[] = {
 	{ 0x004a, "Set Experimental Feature",
 				mgmt_set_exp_feature_cmd, 17, true,
 				mgmt_set_exp_feature_rsp, 20, true },
-	{ 0x004b, "Read Default System Configuration" },
-	{ 0x004c, "Set Default System Configuration" },
+	{ 0x004b, "Read Default System Configuration",
+				mgmt_null_cmd, 0, true,
+				mgmt_read_default_system_config_rsp, 4, false},
+	{ 0x004c, "Set Default System Configuration",
+				mgmt_set_default_system_config_cmd, 4, false,
+				mgmt_null_rsp, 0, true},
 	{ 0x004d, "Read Default Runtime Configuration" },
 	{ 0x004e, "Set Default Runtime Configuration" },
 	{ 0x004f, "Get Device Flags",

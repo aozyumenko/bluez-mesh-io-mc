@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0
 AC_PREREQ(2.60)
-AC_INIT(bluez, 5.84)
+AC_INIT(bluez, 5.85)
 
 AM_INIT_AUTOMAKE([foreign subdir-objects color-tests silent-rules
 					tar-pax no-dist-gzip dist-xz])
@@ -227,11 +227,32 @@ AC_ARG_ENABLE(csip, AS_HELP_STRING([--disable-csip],
 		[disable CSIP profile]), [enable_csip=${enableval}])
 AM_CONDITIONAL(CSIP, test "${enable_csip}" != "no")
 
+AC_ARG_ENABLE(tmap, AS_HELP_STRING([--disable-tmap],
+		[disable TMAP profile]), [enable_tmap=${enableval}])
+AM_CONDITIONAL(TMAP, test "${enable_tmap}" != "no")
+if test "${enable_tmap}" != "no"; then
+	AC_DEFINE(HAVE_TMAP, 1, [Define to 1 if you have TMAP support.])
+fi
+
+AC_ARG_ENABLE(gmap, AS_HELP_STRING([--disable-gmap],
+		[disable GMAP profile]), [enable_gmap=${enableval}])
+AM_CONDITIONAL(GMAP, test "${enable_gmap}" != "no")
+if test "${enable_gmap}" != "no"; then
+	AC_DEFINE(HAVE_GMAP, 1, [Define to 1 if you have GMAP support.])
+fi
+
 AC_ARG_ENABLE(asha, AS_HELP_STRING([--disable-asha],
 		[disable ASHA support]), [enable_asha=${enableval}])
 AM_CONDITIONAL(ASHA, test "${enable_asha}" != "no")
 if test "${enable_asha}" != "no"; then
 	AC_DEFINE(HAVE_ASHA, 1, [Define to 1 if you have ASHA support.])
+fi
+
+AC_ARG_ENABLE(hfp, AS_HELP_STRING([--disable-hfp],
+		[disable HFP support]), [enable_hfp=${enableval}])
+AM_CONDITIONAL(HFP, test "${enable_hfp}" != "no")
+if test "${enable_hfp}" != "no"; then
+	AC_DEFINE(HAVE_HFP, 1, [Define to 1 if you have HFP support.])
 fi
 
 AC_ARG_ENABLE(tools, AS_HELP_STRING([--disable-tools],
