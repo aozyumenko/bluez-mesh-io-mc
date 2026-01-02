@@ -687,6 +687,32 @@ uint16_t remote_get_next_unicast(uint16_t low, uint16_t high, uint8_t ele_cnt)
 	return addr;
 }
 
+bool remote_check_unicast_free(uint16_t low, uint16_t high, uint16_t unicast, uint8_t ele_cnt)
+{
+	struct remote_node *rmt;
+	const struct l_queue_entry *l;
+	uint16_t addr;
+
+	if (unicast < low || (unicast + ele_cnt - 1) > high)
+		return false;
+
+	if (!nodes || l_queue_isempty(nodes))
+		return true;
+
+	l = l_queue_get_entries(nodes);
+
+	/* Cycle through the sorted (by unicast) node list */
+	for (; l; l = l->next) {
+		rmt = l->data;
+		if (((unicast >= rmt->unicast) &&
+					(unicast < (rmt->unicast + rmt->num_ele))) ||
+				(((unicast + ele_cnt) > rmt->unicast) && 
+					((unicast + ele_cnt - 1) < (rmt->unicast + rmt->num_ele))))
+			return false;
+	}
+	return true;
+}
+
 void remote_add_rejected_address(uint16_t addr, uint32_t iv_index, bool save)
 {
 	struct rejected_addr *reject;

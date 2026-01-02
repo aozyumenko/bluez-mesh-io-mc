@@ -21,6 +21,7 @@ bool remote_set_model(uint16_t unicast, uint8_t ele_idx, uint32_t mod_id,
 void remote_add_rejected_address(uint16_t addr, uint32_t iv_index, bool save);
 void remote_clear_rejected_addresses(uint32_t iv_index);
 uint16_t remote_get_next_unicast(uint16_t low, uint16_t high, uint8_t ele_cnt);
+bool remote_check_unicast_free(uint16_t low, uint16_t high, uint16_t addr, uint8_t ele_cnt);
 bool remote_add_net_key(uint16_t addr, uint16_t net_idx, bool save);
 bool remote_del_net_key(uint16_t addr, uint16_t net_idx);
 bool remote_update_net_key(uint16_t addr, uint16_t net_idx, bool update,

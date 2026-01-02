@@ -167,6 +167,7 @@ static const char *config_opt;
 static uint32_t iv_index;
 static uint16_t low_addr;
 static uint16_t high_addr;
+static uint16_t pref_addr;
 static uint16_t prov_net_idx;
 static const char *cfg_fname;
 
@@ -1712,6 +1713,19 @@ static void cmd_start_prov(int argc, char *argv[])
 		return;
 	}
 
+	if (argc == 3) {
+		char *end;
+
+		pref_addr = strtol(argv[2], &end, 16);
+
+		if (end != (argv[2] + 4)) {
+			bt_shell_printf("Bad unicast address %s: "
+					"expected format 4 digit hex\n", argv[2]);
+			return;
+		}
+	} else
+		pref_addr = UNASSIGNED_ADDRESS;
+
 	if (l_dbus_proxy_method_call(local->mgmt_proxy, "AddNode",
 						add_node_setup, add_node_reply,
 						dev, NULL))
@@ -1794,7 +1808,7 @@ static const struct bt_shell_menu main_menu = {
 			"Set subnet (NetKey) phase" },
 	{ "list-unprovisioned", NULL, cmd_list_unprov,
 			"List unprovisioned devices" },
-	{ "provision", "<uuid>", cmd_start_prov,
+	{ "provision", "<uuid> [unicast]", cmd_start_prov,
 			"Initiate provisioning"},
 	{ "reprovision", "<unicast> [0|1|2]", cmd_start_reprov,
 			"Refresh Device Key"},
@@ -2096,13 +2110,19 @@ static struct l_dbus_message *req_prov_call(struct l_dbus *dbus,
 
 	}
 
-	unicast = remote_get_next_unicast(low_addr, high_addr, cnt);
+	if (IS_UNICAST(pref_addr)) {
+		if (remote_check_unicast_free(low_addr, high_addr, pref_addr, cnt))
+			unicast = pref_addr;
+		else
+			unicast = 0;
+	} else
+		unicast = remote_get_next_unicast(low_addr, high_addr, cnt);
 
 	if (!IS_UNICAST(unicast)) {
 		l_error("Failed to allocate addresses for %u elements\n", cnt);
 		return l_dbus_message_new_error(msg,
 					"org.freedesktop.DBus.Error."
-					"Failed to allocate address", NULL);
+					"%s", "Failed to allocate address");
 	}
 
 	bt_shell_printf("Assign addresses: %4.4x (cnt: %d)\n", unicast, cnt);
