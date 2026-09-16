@@ -37,6 +37,7 @@
 #include "src/shared/bap.h"
 #include "src/shared/bass.h"
 #include "src/shared/io.h"
+#include "src/btd.h"
 
 #ifdef HAVE_A2DP
 #include "avdtp.h"
@@ -109,11 +110,18 @@ struct bap_transport {
 	guint			resume_id;
 	struct iovec		*meta;
 	guint			chan_id;
+	/* desync variable is only writable when testing is enabled;
+	 * otherwise, it defaults to false, meaning the Enable/Acquire
+	 * operations synchronize input/output directions that share
+	 * the same ISO socket CID/CIG.
+	 */
+	bool			desync;
 };
 
 struct media_transport_ops {
 	const char *uuid;
 	const GDBusPropertyTable *properties;
+	const GDBusPropertyTable *test_properties;
 	void (*set_owner)(struct media_transport *transport,
 				struct media_owner *owner);
 	void (*remove_owner)(struct media_transport *transport,
@@ -328,6 +336,13 @@ static void linked_transport_remove_owner(void *data, void *user_data)
 		return;
 	}
 
+	/* Owner may have already been replaced (e.g. by a subsequent
+	 * linked_transport_set_owner), in which case it is not this
+	 * function's place to clear it.
+	 */
+	if (transport->owner != owner)
+		return;
+
 	DBG("Transport %s Owner %s", transport->path, owner->name);
 	transport->owner = NULL;
 }
@@ -351,7 +366,7 @@ static void transport_bap_remove_owner(struct media_transport *transport,
 {
 	struct bap_transport *bap = transport->data;
 
-	if (bap && bap->linked)
+	if (bap && bap->linked && !bap->desync)
 		queue_foreach(bt_bap_stream_io_get_links(bap->stream),
 				linked_transport_remove_owner, owner);
 }
@@ -720,6 +735,16 @@ static void linked_transport_set_owner(void *data, void *user_data)
 		return;
 	}
 
+	/* If the linked transport already has a different owner (e.g. it
+	 * was Acquired separately), tear it down properly instead of
+	 * silently overwriting it. Otherwise the previous owner is
+	 * orphaned: its D-Bus disconnect watch stays registered and its
+	 * ->transport back-pointer becomes dangling once this transport is
+	 * later destroyed, causing a use-after-free when the watch fires.
+	 */
+	if (transport->owner && transport->owner != owner)
+		media_transport_remove_owner(transport);
+
 	DBG("Transport %s Owner %s", transport->path, owner->name);
 	transport->owner = owner;
 }
@@ -729,7 +754,7 @@ static void transport_bap_set_owner(struct media_transport *transport,
 {
 	struct bap_transport *bap = transport->data;
 
-	if (bap && bap->linked)
+	if (bap && bap->linked && !bap->desync)
 		queue_foreach(bt_bap_stream_io_get_links(bap->stream),
 				linked_transport_set_owner, owner);
 }
@@ -1094,6 +1119,22 @@ static void set_delay_report(const GDBusPropertyTable *property,
 }
 #endif /* HAVE_A2DP */
 
+static int media_transport_get_volume(struct media_transport *transport,
+								int *volume)
+{
+	if (transport->ops && transport->ops->get_volume) {
+		int ret = transport->ops->get_volume(transport);
+
+		if (ret < 0)
+			return ret;
+
+		*volume = ret;
+		return 0;
+	}
+
+	return -EINVAL;
+}
+
 static gboolean volume_exists(const GDBusPropertyTable *property, void *data)
 {
 	struct media_transport *transport = data;
@@ -1103,16 +1144,6 @@ static gboolean volume_exists(const GDBusPropertyTable *property, void *data)
 		return FALSE;
 
 	return volume >= 0;
-}
-
-int media_transport_get_volume(struct media_transport *transport, int *volume)
-{
-	if (transport->ops && transport->ops->get_volume) {
-		*volume = transport->ops->get_volume(transport);
-		return 0;
-	}
-
-	return -EINVAL;
 }
 
 static gboolean get_volume(const GDBusPropertyTable *property,
@@ -1241,7 +1272,7 @@ static void append_io_qos(DBusMessageIter *dict, struct bt_bap_io_qos *qos)
 	dict_append_entry(dict, "Interval", DBUS_TYPE_UINT32, &qos->interval);
 	dict_append_entry(dict, "Latency", DBUS_TYPE_UINT16, &qos->latency);
 	dict_append_entry(dict, "SDU", DBUS_TYPE_UINT16, &qos->sdu);
-	dict_append_entry(dict, "PHY", DBUS_TYPE_BYTE, &qos->phy);
+	dict_append_entry(dict, "PHY", DBUS_TYPE_BYTE, &qos->phys);
 	dict_append_entry(dict, "Retransmissions", DBUS_TYPE_BYTE, &qos->rtn);
 }
 
@@ -1330,6 +1361,7 @@ static void set_metadata(const GDBusPropertyTable *property,
 	struct bap_transport *bap = transport->data;
 	DBusMessageIter array;
 	struct iovec iov;
+	int len;
 	int ret;
 
 	if (dbus_message_iter_get_arg_type(iter) != DBUS_TYPE_ARRAY) {
@@ -1341,7 +1373,8 @@ static void set_metadata(const GDBusPropertyTable *property,
 
 	dbus_message_iter_recurse(iter, &array);
 	dbus_message_iter_get_fixed_array(&array, &iov.iov_base,
-					(int *)&iov.iov_len);
+					&len);
+	iov.iov_len = len;
 
 	ret = bt_bap_stream_metadata(bap->stream, &iov, bap_metadata_complete,
 				     UINT_TO_PTR(id));
@@ -1455,12 +1488,65 @@ static void set_links(const GDBusPropertyTable *property,
 	g_dbus_pending_property_success(id);
 }
 
+static gboolean get_desync(const GDBusPropertyTable *property,
+					DBusMessageIter *iter, void *data)
+{
+	struct media_transport *transport = data;
+	struct bap_transport *bap = transport->data;
+
+	dbus_message_iter_append_basic(iter, DBUS_TYPE_BOOLEAN, &bap->desync);
+
+	return TRUE;
+}
+
+static void transport_desynchronize(void *data, void *user_data)
+{
+	struct bt_bap_stream *link = data;
+	bool desync = PTR_TO_UINT(user_data);
+	struct media_transport *transport;
+	struct bap_transport *bap;
+
+	transport = find_transport_by_bap_stream(link);
+	bap = transport->data;
+	bap->desync = desync;
+	g_dbus_emit_property_changed(btd_get_dbus_connection(), transport->path,
+						MEDIA_TRANSPORT_INTERFACE,
+						"Desynchronized");
+}
+
+static void set_desync(const GDBusPropertyTable *property,
+			DBusMessageIter *iter, GDBusPendingPropertySet id,
+			void *data)
+{
+	struct media_transport *transport = data;
+	struct bap_transport *bap = transport->data;
+
+	if (dbus_message_iter_get_arg_type(iter) != DBUS_TYPE_BOOLEAN) {
+		g_dbus_pending_property_error(id,
+				ERROR_INTERFACE ".InvalidArguments",
+				"Expected BOOLEAN");
+		return;
+	}
+
+	dbus_message_iter_get_basic(iter, &bap->desync);
+	g_dbus_emit_property_changed(btd_get_dbus_connection(), transport->path,
+						MEDIA_TRANSPORT_INTERFACE,
+						"Desynchronized");
+
+	/* Set desynchronized for all the links */
+	queue_foreach(bt_bap_stream_io_get_links(bap->stream),
+					transport_desynchronize,
+					UINT_TO_PTR(bap->desync));
+
+	g_dbus_pending_property_success(id);
+}
+
 static gboolean qos_ucast_exists(const GDBusPropertyTable *property, void *data)
 {
 	struct media_transport *transport = data;
 	struct bap_transport *bap = transport->data;
 
-	return bap->qos.ucast.io_qos.phy != 0x00;
+	return bap->qos.ucast.io_qos.phys != 0x00;
 }
 
 static const GDBusPropertyTable transport_bap_uc_properties[] = {
@@ -1475,6 +1561,22 @@ static const GDBusPropertyTable transport_bap_uc_properties[] = {
 	{ "Metadata", "ay", get_metadata, set_metadata },
 	{ "Links", "ao", get_links, NULL, links_exists },
 	{ "Volume", "q", get_volume, set_volume, volume_exists },
+	{ }
+};
+
+static const GDBusPropertyTable transport_bap_uc_test_properties[] = {
+	{ "Device", "o", get_device },
+	{ "UUID", "s", get_uuid },
+	{ "Codec", "y", get_codec },
+	{ "Configuration", "ay", get_configuration },
+	{ "State", "s", get_state },
+	{ "QoS", "a{sv}", get_ucast_qos, NULL, qos_ucast_exists },
+	{ "Endpoint", "o", get_endpoint, NULL, endpoint_exists },
+	{ "Location", "u", get_location },
+	{ "Metadata", "ay", get_metadata, set_metadata },
+	{ "Links", "ao", get_links, NULL, links_exists },
+	{ "Volume", "q", get_volume, set_volume, volume_exists },
+	{ "Desynchronized", "b", get_desync, set_desync, links_exists},
 	{ }
 };
 
@@ -1520,6 +1622,8 @@ static gboolean get_bcast_qos(const GDBusPropertyTable *property,
 					&bap->qos.bcast.mse);
 	dict_append_entry(&dict, "Timeout", DBUS_TYPE_UINT16,
 					&bap->qos.bcast.timeout);
+	dict_append_entry(&dict, "PresentationDelay", DBUS_TYPE_UINT32,
+					&bap->qos.bcast.delay);
 
 	append_io_qos(&dict, &bap->qos.bcast.io_qos);
 
@@ -1533,7 +1637,7 @@ static gboolean qos_bcast_exists(const GDBusPropertyTable *property, void *data)
 	struct media_transport *transport = data;
 	struct bap_transport *bap = transport->data;
 
-	return bap->qos.bcast.io_qos.phy != 0x00;
+	return bap->qos.bcast.io_qos.phys != 0x00;
 }
 
 static void bcast_qos_set(void *user_data, int err)
@@ -1547,6 +1651,8 @@ static void bcast_qos_set(void *user_data, int err)
 					ERROR_INTERFACE ".Failed",
 					"Failed to set Broadcast Code");
 }
+
+static void bap_update_bcast_qos(const struct media_transport *transport);
 
 static void set_bcast_qos(const GDBusPropertyTable *property,
 			DBusMessageIter *dict, GDBusPendingPropertySet id,
@@ -1596,6 +1702,7 @@ static void set_bcast_qos(const GDBusPropertyTable *property,
 	}
 
 	bt_bap_stream_qos(bap->stream, bap_qos, NULL, NULL);
+	bap_update_bcast_qos(transport);
 	g_dbus_pending_property_success(id);
 }
 
@@ -1608,7 +1715,7 @@ static const GDBusPropertyTable transport_bap_bc_properties[] = {
 	{ "QoS", "a{sv}", get_bcast_qos, set_bcast_qos, qos_bcast_exists },
 	{ "Endpoint", "o", get_endpoint, NULL, endpoint_exists },
 	{ "Location", "u", get_location },
-	{ "Metadata", "ay", get_metadata },
+	{ "Metadata", "ay", get_metadata, set_metadata },
 	{ "Links", "ao", get_links, set_links, NULL },
 	{ }
 };
@@ -1909,6 +2016,9 @@ static void transport_bap_update_links_uc(
 	g_dbus_emit_property_changed(btd_get_dbus_connection(), transport->path,
 						MEDIA_TRANSPORT_INTERFACE,
 						"Links");
+	g_dbus_emit_property_changed(btd_get_dbus_connection(), transport->path,
+						MEDIA_TRANSPORT_INTERFACE,
+						"Desynchronized");
 
 	DBG("stream %p linked %s", bap->stream, bap->linked ? "true" : "false");
 }
@@ -2026,8 +2136,9 @@ static guint transport_bap_resume(struct media_transport *transport,
 		return bap->resume_id;
 	}
 
-	id = bt_bap_stream_enable(bap->stream, bap->linked, NULL,
-					bap_enable_complete, owner);
+	id = bt_bap_stream_enable(bap->stream,
+				bap->desync ? false : bap->linked,
+				NULL, bap_enable_complete, owner);
 	if (!id)
 		return 0;
 
@@ -2150,7 +2261,7 @@ static void transport_bap_set_state(struct media_transport *transport,
 {
 	struct bap_transport *bap = transport->data;
 
-	if (!bap->linked)
+	if (!bap->linked || bap->desync)
 		return;
 
 	/* Update links */
@@ -2303,28 +2414,42 @@ static void bap_connecting(struct bt_bap_stream *stream, bool state, int fd,
 		return;
 
 	bap_update_links(transport);
+
+	/* IO connected; re-run Enabling to complete a deferred Acquire. */
+	if (!state && fd >= 0 && bt_bap_stream_get_state(stream) ==
+					BT_BAP_STREAM_STATE_ENABLING)
+		bap_state_changed(stream, BT_BAP_STREAM_STATE_ENABLING,
+					BT_BAP_STREAM_STATE_ENABLING,
+					user_data);
+}
+
+static bool transport_bap_is_playback(struct media_transport *transport)
+{
+	struct bap_transport *bap = transport->data;
+	uint8_t dir = bt_bap_stream_get_dir(bap->stream);
+
+	/* Unicast to local/remote Server Sink, or Broadcast */
+	return dir & (BT_BAP_SINK | BT_BAP_BCAST_SINK | BT_BAP_BCAST_SOURCE);
 }
 
 static int transport_bap_get_volume(struct media_transport *transport)
 {
-#ifdef HAVE_VCP
-	return bt_audio_vcp_get_volume(transport->device);
-#else
-	return -ENODEV;
-#endif /* HAVE_VCP */
+	if (transport_bap_is_playback(transport))
+		return bt_audio_vcp_get_volume(transport->device);
+	else
+		return -ENOTSUP; /* TODO: MICP */
 }
 
 static int transport_bap_set_volume(struct media_transport *transport,
 								int volume)
 {
-#ifdef HAVE_VCP
 	if (volume < 0 || volume > 255)
 		return -EINVAL;
 
-	return bt_audio_vcp_set_volume(transport->device, volume) ? 0 : -EIO;
-#else
-	return -ENODEV;
-#endif /* HAVE_VCP */
+	if (transport_bap_is_playback(transport))
+		return bt_audio_vcp_set_volume(transport->device, volume);
+	else
+		return -ENOTSUP; /* TODO: MICP */
 }
 
 static void transport_bap_destroy(void *data)
@@ -2522,10 +2647,11 @@ static void *transport_asha_init(struct media_transport *transport, void *data)
 #define TRANSPORT_OPS(_uuid, _props, _set_owner, _remove_owner, _init, \
 		      _resume, _suspend, _cancel, _set_state, _get_stream, \
 		      _get_volume, _set_volume, _set_delay, _update_links, \
-		      _destroy) \
+		      _destroy, _test_props) \
 { \
 	.uuid = _uuid, \
 	.properties = _props, \
+	.test_properties = _test_props, \
 	.set_owner = _set_owner, \
 	.remove_owner = _remove_owner, \
 	.init = _init, \
@@ -2547,26 +2673,28 @@ static void *transport_asha_init(struct media_transport *transport, void *data)
 			transport_a2dp_resume, transport_a2dp_suspend, \
 			transport_a2dp_cancel, NULL, \
 			transport_a2dp_get_stream, transport_a2dp_get_volume, \
-			_set_volume, _set_delay, NULL, _destroy)
+			_set_volume, _set_delay, NULL, _destroy, NULL)
 
 #define BAP_OPS(_uuid, _props, _set_owner, _remove_owner, _update_links, \
-		_set_state) \
+		_set_state, _test_props) \
 	TRANSPORT_OPS(_uuid, _props, _set_owner, _remove_owner,\
 			transport_bap_init, \
 			transport_bap_resume, transport_bap_suspend, \
 			transport_bap_cancel, _set_state, \
 			transport_bap_get_stream, transport_bap_get_volume, \
 			transport_bap_set_volume, NULL, \
-			_update_links, transport_bap_destroy)
+			_update_links, transport_bap_destroy, _test_props)
 
 #define BAP_UC_OPS(_uuid) \
 	BAP_OPS(_uuid, transport_bap_uc_properties, \
 			transport_bap_set_owner, transport_bap_remove_owner, \
-			transport_bap_update_links_uc, transport_bap_set_state)
+			transport_bap_update_links_uc, \
+			transport_bap_set_state, \
+			transport_bap_uc_test_properties)
 
 #define BAP_BC_OPS(_uuid) \
 	BAP_OPS(_uuid, transport_bap_bc_properties, NULL, NULL, \
-			transport_bap_update_links_bc, NULL)
+			transport_bap_update_links_bc, NULL, NULL)
 
 #define ASHA_OPS(_uuid) \
 	TRANSPORT_OPS(_uuid, transport_asha_properties, NULL, NULL, \
@@ -2574,7 +2702,7 @@ static void *transport_asha_init(struct media_transport *transport, void *data)
 			transport_asha_resume, transport_asha_suspend, \
 			transport_asha_cancel, NULL, NULL, \
 			transport_asha_get_volume, transport_asha_set_volume, \
-			NULL, NULL, NULL)
+			NULL, NULL, NULL, NULL)
 
 static const struct media_transport_ops transport_ops[] = {
 #ifdef HAVE_A2DP
@@ -2629,6 +2757,7 @@ struct media_transport *media_transport_create(struct btd_device *device,
 	struct media_transport *transport;
 	const struct media_transport_ops *ops;
 	int fd;
+	const GDBusPropertyTable *properties;
 
 	transport = g_new0(struct media_transport, 1);
 	if (device)
@@ -2683,9 +2812,14 @@ struct media_transport *media_transport_create(struct btd_device *device,
 			goto fail;
 	}
 
+	if (btd_opts.testing && ops->test_properties)
+		properties = ops->test_properties;
+	else
+		properties = ops->properties;
+
 	if (g_dbus_register_interface(btd_get_dbus_connection(),
 				transport->path, MEDIA_TRANSPORT_INTERFACE,
-				transport_methods, NULL, ops->properties,
+				transport_methods, NULL, properties,
 				transport, media_transport_free) == FALSE) {
 		error("Could not register transport %s", transport->path);
 		goto fail;
@@ -2739,46 +2873,33 @@ struct btd_device *media_transport_get_dev(struct media_transport *transport)
 	return transport->device;
 }
 
-void media_transport_update_volume(struct media_transport *transport,
-								int volume)
+static void media_transport_emit_volume(struct media_transport *transport)
 {
-	if (volume < 0)
+	int volume;
+
+	if (media_transport_get_volume(transport, &volume))
 		return;
 
-#ifdef HAVE_A2DP
-	if (media_endpoint_get_sep(transport->endpoint)) {
-		struct a2dp_transport *a2dp = transport->data;
-
-		if (volume > 127)
-			return;
-
-		/* Check if volume really changed */
-		if (a2dp->volume == volume)
-			return;
-
-		a2dp->volume = volume;
-	}
-#endif
 	g_dbus_emit_property_changed(btd_get_dbus_connection(),
 					transport->path,
 					MEDIA_TRANSPORT_INTERFACE, "Volume");
 }
 
-int media_transport_get_device_volume(struct btd_device *dev)
+int media_transport_get_a2dp_volume(struct btd_device *dev)
 {
 	GSList *l;
 
 	if (dev == NULL)
 		return -1;
 
-#ifdef HAVE_A2DP
 	/* Attempt to locate the transport to get its volume */
 	for (l = transports; l; l = l->next) {
 		struct media_transport *transport = l->data;
+
 		if (transport->device != dev)
 			continue;
 
-		/* Volume is A2DP only */
+		/* A2DP only */
 		if (media_endpoint_get_sep(transport->endpoint)) {
 			int volume;
 
@@ -2788,40 +2909,57 @@ int media_transport_get_device_volume(struct btd_device *dev)
 			return -1;
 		}
 	}
-#endif
 
-	/* If transport volume doesn't exists use device_volume */
+	/* If no transport, use device volume. This is a workaround for the lack
+	 * of ordering between AVRCP and A2DP session start. (Note BAP+VCP do
+	 * not have this issue.)
+	 */
 	return btd_device_get_volume(dev);
 }
 
-void media_transport_update_device_volume(struct btd_device *dev,
-								int volume)
+void media_transport_set_a2dp_volume(struct btd_device *dev, int volume)
 {
 	GSList *l;
 
-	if (dev == NULL || volume < 0)
+	if (dev == NULL || volume < 0 || volume > 127)
 		return;
 
-#ifdef HAVE_A2DP
 	/* Attempt to locate the transport to set its volume */
 	for (l = transports; l; l = l->next) {
 		struct media_transport *transport = l->data;
-		const char *uuid = media_endpoint_get_uuid(transport->endpoint);
+		struct a2dp_transport *a2dp;
+
+		if (transport->device != dev)
+			continue;
+		if (!media_endpoint_get_sep(transport->endpoint))
+			continue;
+
+		a2dp = transport->data;
+		if (a2dp->volume != volume) {
+			a2dp->volume = volume;
+			media_transport_emit_volume(transport);
+		}
+		break;
+	}
+
+	btd_device_set_volume(dev, volume);
+}
+
+void media_transport_volume_changed(struct btd_device *dev)
+{
+	GSList *l;
+
+	if (dev == NULL)
+		return;
+
+	for (l = transports; l; l = l->next) {
+		struct media_transport *transport = l->data;
+
 		if (transport->device != dev)
 			continue;
 
-		/* Volume is A2DP and BAP only */
-		if (media_endpoint_get_sep(transport->endpoint) ||
-				strcasecmp(uuid, PAC_SINK_UUID) ||
-				strcasecmp(uuid, PAC_SOURCE_UUID) ||
-				strcasecmp(uuid, BAA_SERVICE_UUID)) {
-			media_transport_update_volume(transport, volume);
-			break;
-		}
+		media_transport_emit_volume(transport);
 	}
-#endif
-
-	btd_device_set_volume(dev, volume);
 }
 
 const char *media_transport_stream_path(void *stream)

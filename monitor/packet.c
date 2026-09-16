@@ -27,6 +27,7 @@
 #include <sys/time.h>
 #include <sys/socket.h>
 #include <limits.h>
+#include <math.h>
 
 #include "bluetooth/bluetooth.h"
 #include "bluetooth/uuid.h"
@@ -72,6 +73,7 @@
 #define COLOR_HCI_ACLDATA		COLOR_CYAN
 #define COLOR_HCI_SCODATA		COLOR_YELLOW
 #define COLOR_HCI_ISODATA		COLOR_YELLOW
+#define COLOR_HCI_VENDOR		COLOR_GREEN
 
 #define COLOR_UNKNOWN_ERROR		COLOR_WHITE_BG
 #define COLOR_UNKNOWN_FEATURE_BIT	COLOR_WHITE_BG
@@ -100,14 +102,21 @@
 
 #define COLOR_PHY_PACKET		COLOR_BLUE
 
-#define UNKNOWN_MANUFACTURER 0xffff
+#define COMPANY_ID_INTEL	0x0002
+#define COMPANY_ID_BROADCOM	0x000F
+#define COMPANY_ID_QUALCOMM	0x001D
+#define COMPANY_ID_MEDIATEK	0x0046
+#define COMPANY_ID_APPLE	0x004C
+#define COMPANY_ID_REALTEK	0x005D
+#define COMPANY_ID_LINUX	0x05F1
+#define COMPANY_ID_UNKNOWN	0xFFFF
 
 static time_t time_offset = ((time_t) -1);
 static int priority_level = BTSNOOP_PRIORITY_DEBUG;
 static unsigned long filter_mask = 0;
 static bool index_filter = false;
 static uint16_t index_current = 0;
-static uint16_t fallback_manufacturer = UNKNOWN_MANUFACTURER;
+static uint16_t fallback_manufacturer = COMPANY_ID_UNKNOWN;
 
 #define CTRL_RAW  0x0000
 #define CTRL_USER 0x0001
@@ -221,21 +230,23 @@ static struct index_buf_pool *get_pool(uint16_t index, uint8_t type)
 		return NULL;
 
 	switch (type) {
-	case 0x00:
+	case BTMON_CONN_ACL:
 		if (index_list[index].acl.total)
 			return &index_list[index].acl;
 		break;
-	case 0x01:
+	case BTMON_CONN_LE:
 		if (index_list[index].le.total)
 			return &index_list[index].le;
 		break;
-	case 0x05:
-		if (index_list[index].iso.total)
-			return &index_list[index].iso;
-		break;
-	default:
+	case BTMON_CONN_SCO:
+	case BTMON_CONN_ESCO:
 		if (index_list[index].sco.total)
 			return &index_list[index].sco;
+		break;
+	case BTMON_CONN_CIS:
+	case BTMON_CONN_BIS:
+		if (index_list[index].iso.total)
+			return &index_list[index].iso;
 		break;
 	}
 
@@ -322,6 +333,43 @@ static void assign_handle(uint16_t index, uint16_t handle, uint8_t type,
 		memcpy(conn->dst, dst, sizeof(conn->dst));
 		conn->dst_type = dst_type;
 	}
+
+	switch (conn->dst_type) {
+	case 0x00:
+	case 0x02:
+		/* If address public set dst_oui */
+		hwdb_get_company(conn->dst, &conn->dst_oui);
+		break;
+	case 0x01:
+	case 0x03:
+		/* Attempt to resolve the identity if resolvable */
+		if ((conn->dst[5] & 0xc0) == 0x40) {
+			keys_resolve_identity(conn->dst, conn->dst,
+						&conn->dst_type);
+			/* If identity address is public set dst_out */
+			if (conn->dst_type == 0x00 || conn->dst_type == 0x02) {
+				hwdb_get_company(conn->dst, &conn->dst_oui);
+				break;
+			}
+		}
+
+		/* Set the random type */
+		switch ((conn->dst[5] & 0xc0) >> 6) {
+		case 0x00:
+			conn->dst_rtype = strdup("Non-Resolvable");
+			break;
+		case 0x01:
+			conn->dst_rtype = strdup("Resolvable");
+			break;
+		case 0x03:
+			conn->dst_rtype = strdup("Static");
+			break;
+		default:
+			conn->dst_rtype = strdup("Reserved");
+			break;
+		}
+		break;
+	}
 }
 
 struct packet_conn_data *packet_get_conn_data(uint16_t handle)
@@ -329,7 +377,7 @@ struct packet_conn_data *packet_get_conn_data(uint16_t handle)
 	int i;
 
 	for (i = 0; i < MAX_CONN; i++) {
-		if (conn_list[i].handle == handle)
+		if (conn_list[i].handle == acl_handle(handle))
 			return &conn_list[i];
 	}
 
@@ -404,8 +452,10 @@ void packet_set_fallback_manufacturer(uint16_t manufacturer)
 
 void packet_set_msft_evt_prefix(const uint8_t *prefix, uint8_t len)
 {
-	if (index_current < MAX_INDEX && len < 8)
+	if (index_current < MAX_INDEX && len < 8) {
 		memcpy(index_list[index_current].msft_evt_prefix, prefix, len);
+		index_list[index_current].msft_evt_len = len;
+	}
 }
 
 static void cred_pid(struct ucred *cred, char *str, size_t len)
@@ -555,13 +605,26 @@ static void print_packet(struct timeval *tv, struct ucred *cred, char ident,
 			max_len = col - len - ts_len - 3;
 		}
 
+		/* col comes from the terminal and len includes the optional
+		 * "comm[pid]: " prefix, so max_len can still be negative
+		 * here, or larger than the space left in line[]. Both
+		 * overflow the snprintf below, and a negative value also
+		 * indexes before line[].
+		 */
+		if (max_len > (int) sizeof(line) - pos - 1)
+			max_len = (int) sizeof(line) - pos - 1;
+		if (max_len < 0)
+			max_len = 0;
+
 		n = snprintf(line + pos, max_len + 1, "%s%s",
 						label ? ": " : "", text);
 		if (n > max_len) {
-			line[pos + max_len - 1] = '.';
-			line[pos + max_len - 2] = '.';
-			if (line[pos + max_len - 3] == ' ')
-				line[pos + max_len - 3] = '.';
+			if (max_len >= 3) {
+				line[pos + max_len - 1] = '.';
+				line[pos + max_len - 2] = '.';
+				if (line[pos + max_len - 3] == ' ')
+					line[pos + max_len - 3] = '.';
+			}
 
 			n = max_len;
 		}
@@ -885,10 +948,30 @@ static void print_lt_addr(uint8_t lt_addr)
 	print_field("LT address: %d", lt_addr);
 }
 
+static const char *conn_type_str(uint8_t type)
+{
+	switch (type) {
+	case BTMON_CONN_ACL:
+		return "BR-ACL";
+	case BTMON_CONN_LE:
+		return "LE-ACL";
+	case BTMON_CONN_SCO:
+		return "BR-SCO";
+	case BTMON_CONN_ESCO:
+		return "BR-ESCO";
+	case BTMON_CONN_CIS:
+		return "LE-CIS";
+	case BTMON_CONN_BIS:
+		return "LE-BIS";
+	default:
+		return "unknown";
+	}
+}
+
 static void print_handle_native(uint16_t handle)
 {
 	struct packet_conn_data *conn;
-	char label[25];
+	char label[32];
 
 	conn = packet_get_conn_data(handle);
 	if (!conn) {
@@ -896,7 +979,8 @@ static void print_handle_native(uint16_t handle)
 		return;
 	}
 
-	sprintf(label, "Handle: %d Address", handle);
+	sprintf(label, "Handle: %d (%s) Address", handle,
+				conn_type_str(conn->type));
 	print_addr(label, conn->dst, conn->dst_type);
 }
 
@@ -2348,6 +2432,30 @@ static void print_rssi(int8_t rssi)
 	packet_print_rssi("RSSI", rssi);
 }
 
+static void print_slot_125u(const char *label, uint16_t value)
+{
+	 print_field("%s: %.3f msec (0x%4.4x)", label,
+				le16_to_cpu(value) * 0.125, le16_to_cpu(value));
+}
+
+/* Connection event length recommended in requests by a Peripheral:
+ * Range: 0x0001 to 0x7CFF, Time = N * 125 us
+ */
+#define BT_HCI_CE_LEN_MIN 0x0001
+#define BT_HCI_CE_LEN_MAX 0x7cff
+
+static void print_ce_len(const char *label, uint16_t value)
+{
+	uint16_t val = le16_to_cpu(value);
+
+	if (val < BT_HCI_CE_LEN_MIN || val > BT_HCI_CE_LEN_MAX) {
+		print_field("%s: Reserved (0x%4.4x)", label, val);
+		return;
+	}
+
+	print_field("%s: %.3f msec (0x%4.4x)", label, val * 0.125, val);
+}
+
 static void print_slot_625(const char *label, uint16_t value)
 {
 	 print_field("%s: %.3f msec (0x%4.4x)", label,
@@ -2825,8 +2933,17 @@ static const struct bitfield_data features_le_0[] = {
 };
 
 static const struct bitfield_data features_le_1[] = {
-	{ 0, "Monitoring Advertisers"				},
-	{ 1, "Frame Space Update"				},
+	{  0, "Monitoring Advertisers"				},
+	{  1, "Frame Space Update"				},
+	{  2, "UTP OTA Mode"					},
+	{  3, "UTP HCI Pairing"					},
+	{  4, "LL_OTA_UTP_IND maximum length"			},
+	{  5, "LL_OTA_UTP_IND maximum length"			},
+	{  8, "Shorter Connection Intervals"			},
+	{  9, "Shorter Connection Intervals (Host Support)"	},
+	{ 10, "LE Flushable ACL Data"				},
+	{ 11, "Channel Sounding Enhancement #1"			},
+	{ }
 };
 
 static const struct bitfield_data features_msft[] = {
@@ -2835,23 +2952,37 @@ static const struct bitfield_data features_msft[] = {
 	{  2, "RSSI Monitoring of LE advertisements"		},
 	{  3, "Advertising Monitoring of LE advertisements"	},
 	{  4, "Verifying the validity of P-192 and P-256 keys"	},
-	{  5, "Continuous Advertising Monitoring"		},
+	{  5, "Continuous Advertising Monitoring (v1)"		},
+	{  7, "AVDTP offload"					},
+	{ 10, "Continuous Advertising Monitoring (v2)"		},
 	{ }
 };
 
 static void print_features_subpage(uint8_t page, uint8_t subpages,
 					const uint8_t *features_array,
-					uint64_t *features)
+					uint64_t *features,
+					const struct bitfield_data *table)
 {
-	int i, j;
+	uint8_t i, j;
 	char str[18];
 
 	for (i = 0; i < subpages; i++) {
+		uint64_t mask;
+
 		for (j = 0; j < 8; j++)
 			features[i] |= ((uint64_t) features_array[i * 8 + j])
 					<< (j * 8);
 		sprintf(str, "Features[%u/%u]", page, i);
 		print_hex_field(str, &features_array[i * 8], 8);
+
+		if (!table)
+			continue;
+
+		mask = print_bitfield(2, features[i], table);
+		if (mask)
+			print_text(COLOR_UNKNOWN_FEATURE_BIT,
+				"  Unknown features (0x%16.16" PRIx64 ")",
+				mask);
 	}
 }
 
@@ -2859,15 +2990,12 @@ static void print_features(uint8_t page, const uint8_t *features_array,
 								uint8_t type)
 {
 	const struct bitfield_data *features_table = NULL;
-	uint64_t mask, features[3] = {};
+	uint64_t features[3] = {};
 	uint8_t subpages = 1;
-	int i;
 
 	/* LE pages 1-10 are 192 bits (24 octets) each */
 	if (type == 0x01 && page)
 		subpages = 3;
-
-	print_features_subpage(page, subpages, features_array, features);
 
 	switch (type) {
 	case 0x00:
@@ -2901,16 +3029,8 @@ static void print_features(uint8_t page, const uint8_t *features_array,
 		break;
 	}
 
-	if (!features_table)
-		return;
-
-	for (i = 0; i < subpages; i++) {
-		mask = print_bitfield(2, features[i], features_table);
-		if (mask)
-			print_text(COLOR_UNKNOWN_FEATURE_BIT,
-				"  Unknown features (0x%16.16" PRIx64 ")",
-				mask);
-	}
+	print_features_subpage(page, subpages, features_array, features,
+							features_table);
 }
 
 void packet_print_features_lmp(const uint8_t *features, uint8_t page)
@@ -3051,9 +3171,9 @@ static void print_le_states(const uint8_t *states_array)
 		}
 
 		if (num > 0) {
-			print_field("  %s", str[0]);
+			print_field("  Bit %-2u %s", i, str[0]);
 			for (n = 1; n < num; n++)
-				print_field("    and %s", str[n]);
+				print_field("         and %s", str[n]);
 		}
 
 		mask &= ~val;
@@ -3214,59 +3334,62 @@ static const struct bitfield_data events_page2_table[] = {
 };
 
 static const struct bitfield_data events_le_table[] = {
-	{  0, "LE Connection Complete"			},
-	{  1, "LE Advertising Report"			},
-	{  2, "LE Connection Update Complete"		},
-	{  3, "LE Read Remote Used Features Complete"	},
-	{  4, "LE Long Term Key Request"		},
-	{  5, "LE Remote Connection Parameter Request"	},
-	{  6, "LE Data Length Change"			},
-	{  7, "LE Read Local P-256 Public Key Complete"	},
-	{  8, "LE Generate DHKey Complete"		},
-	{  9, "LE Enhanced Connection Complete"		},
-	{ 10, "LE Direct Advertising Report"		},
-	{ 11, "LE PHY Update Complete"			},
-	{ 12, "LE Extended Advertising Report"		},
-	{ 13, "LE Periodic Advertising Sync Established"},
-	{ 14, "LE Periodic Advertising Report"		},
-	{ 15, "LE Periodic Advertising Sync Lost"	},
-	{ 16, "LE Extended Scan Timeout"		},
-	{ 17, "LE Extended Advertising Set Terminated"	},
-	{ 18, "LE Scan Request Received"		},
-	{ 19, "LE Channel Selection Algorithm"		},
-	{ 20, "LE Connectionless IQ Report"		},
-	{ 21, "LE Connection IQ Report"			},
-	{ 22, "LE CTE Request Failed"			},
-	{ 23, "LE PAST Received"			},
-	{ 24, "LE CIS Established"			},
-	{ 25, "LE CIS Request"				},
-	{ 26, "LE Create BIG Complete"			},
-	{ 27, "LE Terminate BIG Complete"		},
-	{ 28, "LE BIG Sync Established Complete"	},
-	{ 29, "LE BIG Sync Lost"			},
-	{ 30, "LE Request Peer SCA Complete"		},
-	{ 31, "LE Path Loss Threshold"			},
-	{ 32, "LE Transmit Power Reporting"		},
-	{ 33, "LE BIG Info Advertising Report"		},
-	{ 34, "LE Subrate Change"			},
-	{ 35, "LE Periodic Advertising Sync Established v2"},
-	{ 36, "LE Periodic Advertising Report v2"	},
-	{ 37, "LE Periodic Advertising Sync Transfer Received" },
-	{ 38, "LE Periodic Advertising Subevent Data Request" },
-	{ 39, "LE Periodic Advertising Response Report" },
-	{ 40, "LE Enhanced Connection Complete v2"	},
-	{ 41, "LE CIS Established v2"			},
-	{ 42, "LE Read All Remote Features Complete"	},
-	{ 43, "LE CS Read Remote Supported Capabilities Complete" },
-	{ 44, "LE CS Read Remote FAE Table Complete"	},
-	{ 45, "LE CS Security Enable Complete"		},
-	{ 46, "LE CS Config Complete"			},
-	{ 47, "LE CS Procedure Enable Complete"		},
-	{ 48, "LE CS Subevent Result"			},
-	{ 49, "LE CS Subevent Result Continue"		},
-	{ 50, "LE CS Test End Complete"			},
-	{ 51, "LE Monitored Advertisers Report"		},
-	{ 52, "LE Frame Space Update Complete"		},
+	{  0, "LE Connection Complete"					},
+	{  1, "LE Advertising Report"					},
+	{  2, "LE Connection Update Complete"				},
+	{  3, "LE Read Remote Used Features Complete"			},
+	{  4, "LE Long Term Key Request"				},
+	{  5, "LE Remote Connection Parameter Request"			},
+	{  6, "LE Data Length Change"					},
+	{  7, "LE Read Local P-256 Public Key Complete"			},
+	{  8, "LE Generate DHKey Complete"				},
+	{  9, "LE Enhanced Connection Complete [v1]"			},
+	{ 10, "LE Direct Advertising Report"				},
+	{ 11, "LE PHY Update Complete"					},
+	{ 12, "LE Extended Advertising Report"				},
+	{ 13, "LE Periodic Advertising Sync Established [v1]"		},
+	{ 14, "LE Periodic Advertising Report [v1]"			},
+	{ 15, "LE Periodic Advertising Sync Lost"			},
+	{ 16, "LE Extended Scan Timeout"				},
+	{ 17, "LE Extended Advertising Set Terminated"			},
+	{ 18, "LE Scan Request Received"				},
+	{ 19, "LE Channel Selection Algorithm"				},
+	{ 20, "LE Connectionless IQ Report"				},
+	{ 21, "LE Connection IQ Report"					},
+	{ 22, "LE CTE Request Failed"					},
+	{ 23, "LE Periodic Advertising Sync Transfer Received [v1]"	},
+	{ 24, "LE CIS Established [v1]"					},
+	{ 25, "LE CIS Request"						},
+	{ 26, "LE Create BIG Complete"					},
+	{ 27, "LE Terminate BIG Complete"				},
+	{ 28, "LE BIG Sync Established Complete"			},
+	{ 29, "LE BIG Sync Lost"					},
+	{ 30, "LE Request Peer SCA Complete"				},
+	{ 31, "LE Path Loss Threshold"					},
+	{ 32, "LE Transmit Power Reporting"				},
+	{ 33, "LE BIG Info Advertising Report"				},
+	{ 34, "LE Subrate Change"					},
+	{ 35, "LE Periodic Advertising Sync Established [v2]"		},
+	{ 36, "LE Periodic Advertising Report [v2]"			},
+	{ 37, "LE Periodic Advertising Sync Transfer Received [v2]"	},
+	{ 38, "LE Periodic Advertising Subevent Data Request"		},
+	{ 39, "LE Periodic Advertising Response Report"			},
+	{ 40, "LE Enhanced Connection Complete [v2]"			},
+	{ 41, "LE CIS Established [v2]"					},
+	{ 42, "LE Read All Remote Features Complete"			},
+	{ 43, "LE CS Read Remote Supported Capabilities Complete [v1]"	},
+	{ 44, "LE CS Read Remote FAE Table Complete"			},
+	{ 45, "LE CS Security Enable Complete"				},
+	{ 46, "LE CS Config Complete"					},
+	{ 47, "LE CS Procedure Enable Complete"				},
+	{ 48, "LE CS Subevent Result"					},
+	{ 49, "LE CS Subevent Result Continue"				},
+	{ 50, "LE CS Test End Complete"					},
+	{ 51, "LE Monitored Advertisers Report"				},
+	{ 52, "LE Frame Space Update Complete"				},
+	{ 53, "LE UTP Received"						},
+	{ 54, "LE Connection Rate Change"				},
+	{ 55, "LE CS Read Remote Supported Capabilities Complete [v2]"	},
 	{ }
 };
 
@@ -3427,7 +3550,7 @@ static void print_manufacturer_data(const void *data, uint8_t data_len)
 	packet_print_company("Company", company);
 
 	switch (company) {
-	case 76:
+	case COMPANY_ID_APPLE:
 	case 19456:
 		print_manufacturer_apple(data + 2, data_len - 2);
 		break;
@@ -3548,7 +3671,7 @@ static void print_ltv(const char *str, void *user_data)
 	print_field("%s: %s", label, str);
 }
 
-static void print_base_annoucement(const uint8_t *data, uint8_t data_len)
+static void print_base_announcement(const uint8_t *data, uint8_t data_len)
 {
 	struct iovec iov;
 	struct bt_hci_le_pa_base_data *base_data;
@@ -3647,7 +3770,7 @@ done:
 		print_hex_field("  Data", iov.iov_base, iov.iov_len);
 }
 
-static void print_broadcast_annoucement(const uint8_t *data, uint8_t data_len)
+static void print_broadcast_announcement(const uint8_t *data, uint8_t data_len)
 {
 	uint32_t bid;
 
@@ -3660,12 +3783,57 @@ static void print_broadcast_annoucement(const uint8_t *data, uint8_t data_len)
 	print_field("Broadcast ID: %u (0x%06x)", bid, bid);
 }
 
+static const struct bitfield_data pbp_feat_table[] = {
+	{ 0, "Encryption"					},
+	{ 1, "Standard Quality"					},
+	{ 2, "High Quality"					},
+	{}
+};
+
+static void print_pbp_announcement(const uint8_t *data, uint8_t data_len)
+{
+	struct iovec iov, meta;
+	uint8_t feat;
+	uint8_t len;
+	uint8_t mask;
+
+	iov.iov_base = (void *) data;
+	iov.iov_len = data_len;
+
+	if (util_iov_pull_u8(&iov, &feat)) {
+		print_text(COLOR_ERROR, "  invalid features");
+		return;
+	}
+
+	print_field("Features: 0x%02x", feat);
+	mask = print_bitfield(4, feat, pbp_feat_table);
+
+	if (mask)
+		print_text(COLOR_UNKNOWN_SERVICE_CLASS,
+					"  Unknown feature (0x%2.2x)", mask);
+
+	if (util_iov_pull_u8(&iov, &len)) {
+		print_text(COLOR_ERROR, "  invalid metadata length");
+		return;
+	}
+
+	if (!len)
+		return;
+
+	meta.iov_base = util_iov_pull_mem(&iov, len);
+	meta.iov_len = len;
+
+	bt_bap_debug_metadata(meta.iov_base, meta.iov_len, print_ltv,
+						"    Metadata");
+}
+
 static const struct service_data_decoder {
 	uint16_t uuid;
 	void (*func)(const uint8_t *data, uint8_t data_len);
 } service_data_decoders[] = {
-	{ 0x1851, print_base_annoucement },
-	{ 0x1852, print_broadcast_annoucement }
+	{ 0x1851, print_base_announcement },
+	{ 0x1852, print_broadcast_announcement },
+	{ 0x1856, print_pbp_announcement }
 };
 
 static void print_service_data(const uint8_t *data, uint8_t data_len)
@@ -3933,12 +4101,15 @@ static void print_transport_data(const uint8_t *data, uint8_t len)
 	print_hex_field("  Data", data + 3, len - 3);
 }
 
-static void print_eir(const uint8_t *eir, uint8_t eir_len, bool le)
+static void print_eir(const char *label, const uint8_t *eir, uint8_t eir_len,
+			bool le)
 {
 	uint16_t len = 0;
 
 	if (eir_len == 0)
 		return;
+
+	print_hex_field(label, eir, eir_len);
 
 	while (len < eir_len - 1) {
 		uint8_t field_len = eir[0];
@@ -4221,7 +4392,7 @@ void packet_print_rssi(const char *label, int8_t rssi)
 
 void packet_print_ad(const void *data, uint8_t size)
 {
-	print_eir(data, size, true);
+	print_eir("Advertising Data", data, size, true);
 }
 
 struct broadcast_message {
@@ -4273,41 +4444,7 @@ static void print_3d_broadcast(const void *data, uint8_t size)
 
 void packet_hexdump(const unsigned char *buf, uint16_t len)
 {
-	static const char hexdigits[] = "0123456789abcdef";
-	char str[68];
-	uint16_t i;
-
-	if (!len)
-		return;
-
-	for (i = 0; i < len; i++) {
-		str[((i % 16) * 3) + 0] = hexdigits[buf[i] >> 4];
-		str[((i % 16) * 3) + 1] = hexdigits[buf[i] & 0xf];
-		str[((i % 16) * 3) + 2] = ' ';
-		str[(i % 16) + 49] = isprint(buf[i]) ? buf[i] : '.';
-
-		if ((i + 1) % 16 == 0) {
-			str[47] = ' ';
-			str[48] = ' ';
-			str[65] = '\0';
-			print_text(COLOR_WHITE, "%s", str);
-			str[0] = ' ';
-		}
-	}
-
-	if (i % 16 > 0) {
-		uint16_t j;
-		for (j = (i % 16); j < 16; j++) {
-			str[(j * 3) + 0] = ' ';
-			str[(j * 3) + 1] = ' ';
-			str[(j * 3) + 2] = ' ';
-			str[j + 49] = ' ';
-		}
-		str[47] = ' ';
-		str[48] = ' ';
-		str[65] = '\0';
-		print_text(COLOR_WHITE, "%s", str);
-	}
+	print_hexdump(buf, len);
 }
 
 void packet_control(struct timeval *tv, struct ucred *cred,
@@ -4321,6 +4458,41 @@ static int addr2str(const uint8_t *addr, char *str)
 {
 	return sprintf(str, "%2.2X:%2.2X:%2.2X:%2.2X:%2.2X:%2.2X",
 			addr[5], addr[4], addr[3], addr[2], addr[1], addr[0]);
+}
+
+static int get_msft_opcode(uint16_t manufacturer)
+{
+	switch (manufacturer) {
+	case COMPANY_ID_INTEL:
+		return 0xFC1E;
+	case COMPANY_ID_QUALCOMM:
+		return 0xFD70;
+	case COMPANY_ID_MEDIATEK:
+		return 0xFD30;
+	case COMPANY_ID_REALTEK:
+		return 0xFCF0;
+	case COMPANY_ID_LINUX:
+		return 0xFC1E;
+	default:
+		return BT_HCI_CMD_NOP;
+	}
+}
+
+static bool msft_event_prefix_match(const void *data, int size)
+{
+	const void *prefix = index_list[index_current].msft_evt_prefix;
+	int prefix_len = index_list[index_current].msft_evt_len;
+
+	/*
+	 * MSFT event has one byte of event code following the MSFT prefix.
+	 * We need to check the event code is valid, as it's possible for
+	 * a vendor to use the same MSFT prefix but for other events.
+	 */
+	if (size >= prefix_len + 1 && !memcmp(prefix, data, prefix_len))
+		return msft_event_code_valid(
+				((const uint8_t *) data)[prefix_len]);
+
+	return false;
 }
 
 void packet_monitor(struct timeval *tv, struct ucred *cred,
@@ -4392,6 +4564,12 @@ void packet_monitor(struct timeval *tv, struct ucred *cred,
 	case BTSNOOP_OPCODE_ISO_RX_PKT:
 		packet_hci_isodata(tv, cred, index, true, data, size);
 		break;
+	case BTSNOOP_OPCODE_VENDOR_TX_PKT:
+		packet_hci_vendor(tv, cred, index, false, data, size);
+		break;
+	case BTSNOOP_OPCODE_VENDOR_RX_PKT:
+		packet_hci_vendor(tv, cred, index, true, data, size);
+		break;
 	case BTSNOOP_OPCODE_OPEN_INDEX:
 		if (index < MAX_INDEX)
 			addr2str(index_list[index].bdaddr, str);
@@ -4415,50 +4593,8 @@ void packet_monitor(struct timeval *tv, struct ucred *cred,
 		if (index < MAX_INDEX) {
 			memcpy(index_list[index].bdaddr, ii->bdaddr, 6);
 			index_list[index].manufacturer = manufacturer;
-
-			switch (manufacturer) {
-			case 2:
-				/*
-				 * Intel controllers that support the
-				 * Microsoft vendor extension are using
-				 * 0xFC1E for VsMsftOpCode.
-				 */
-				index_list[index].msft_opcode = 0xFC1E;
-				break;
-			case 29:
-				/*
-				 * Qualcomm controllers that support the
-				 * Microsoft vendor extensions are using
-				 * 0xFD70 for VsMsftOpCode.
-				 */
-				index_list[index].msft_opcode = 0xFD70;
-				break;
-			case 70:
-				/*
-				 * Mediatek controllers that support the
-				 * Microsoft vendor extensions are using
-				 * 0xFD30 for VsMsftOpCode.
-				 */
-				index_list[index].msft_opcode = 0xFD30;
-				break;
-			case 93:
-				/*
-				 * Realtek controllers that support the
-				 * Microsoft vendor extensions are using
-				 * 0xFCF0 for VsMsftOpCode.
-				 */
-				index_list[index].msft_opcode = 0xFCF0;
-				break;
-			case 1521:
-				/*
-				 * Emulator controllers use Linux Foundation as
-				 * manufacturer and support the
-				 * Microsoft vendor extensions using
-				 * 0xFC1E for VsMsftOpCode.
-				 */
-				index_list[index].msft_opcode = 0xFC1E;
-				break;
-			}
+			index_list[index].msft_opcode =
+				get_msft_opcode(manufacturer);
 		}
 
 		addr2str(ii->bdaddr, str);
@@ -4473,7 +4609,7 @@ void packet_monitor(struct timeval *tv, struct ucred *cred,
 		packet_vendor_diag(tv, index, manufacturer, data, size);
 		break;
 	case BTSNOOP_OPCODE_SYSTEM_NOTE:
-		packet_system_note(tv, cred, index, data);
+		packet_system_note(tv, cred, index, data, size);
 		break;
 	case BTSNOOP_OPCODE_USER_LOGGING:
 		ul = data;
@@ -6042,7 +6178,7 @@ static void read_ext_inquiry_response_rsp(uint16_t index, const void *data,
 
 	print_status(rsp->status);
 	print_fec(rsp->fec);
-	print_eir(rsp->data, sizeof(rsp->data), false);
+	print_eir("EIR", rsp->data, sizeof(rsp->data), false);
 }
 
 static void write_ext_inquiry_response_cmd(uint16_t index, const void *data,
@@ -6051,7 +6187,7 @@ static void write_ext_inquiry_response_cmd(uint16_t index, const void *data,
 	const struct bt_hci_cmd_write_ext_inquiry_response *cmd = data;
 
 	print_fec(cmd->fec);
-	print_eir(cmd->data, sizeof(cmd->data), false);
+	print_eir("EIR", cmd->data, sizeof(cmd->data), false);
 }
 
 static void refresh_encrypt_key_cmd(uint16_t index, const void *data,
@@ -6494,12 +6630,16 @@ static void read_local_version_rsp(uint16_t index, const void *data,
 		}
 
 		index_list[index_current].manufacturer = manufacturer;
+		if (index_list[index_current].msft_opcode == BT_HCI_CMD_NOP) {
+			index_list[index_current].msft_opcode =
+				get_msft_opcode(manufacturer);
+		}
 	}
 
 	print_manufacturer(rsp->manufacturer);
 
 	switch (manufacturer) {
-	case 15:
+	case COMPANY_ID_BROADCOM:
 		print_manufacturer_broadcom(rsp->lmp_subver, rsp->hci_rev);
 		break;
 	}
@@ -7240,7 +7380,7 @@ static void le_set_adv_data_cmd(uint16_t index, const void *data, uint8_t size)
 	const struct bt_hci_cmd_le_set_adv_data *cmd = data;
 
 	print_field("Length: %d", cmd->len);
-	print_eir(cmd->data, cmd->len, true);
+	packet_print_ad(cmd->data, cmd->len);
 }
 
 static void le_set_scan_rsp_data_cmd(uint16_t index, const void *data,
@@ -7249,7 +7389,7 @@ static void le_set_scan_rsp_data_cmd(uint16_t index, const void *data,
 	const struct bt_hci_cmd_le_set_scan_rsp_data *cmd = data;
 
 	print_field("Length: %d", cmd->len);
-	print_eir(cmd->data, cmd->len, true);
+	print_eir("Scan Response", cmd->data, cmd->len, true);
 }
 
 static void le_set_adv_enable_cmd(uint16_t index, const void *data,
@@ -7768,7 +7908,7 @@ static const struct bitfield_data le_phys[] = {
 	{ }
 };
 
-static void print_le_phy_bitfield(const char *label, uint8_t phys)
+static void print_le_phys(const char *label, uint8_t phys)
 {
 	uint8_t mask;
 
@@ -7798,8 +7938,8 @@ static void print_le_phys_preference(uint8_t all_phys, uint8_t tx_phys,
 		print_text(COLOR_UNKNOWN_OPTIONS_BIT, "  Reserved"
 							" (0x%2.2x)", mask);
 
-	print_le_phy_bitfield("TX PHYs preference", tx_phys);
-	print_le_phy_bitfield("RX PHYs preference", rx_phys);
+	print_le_phys("TX PHYs preference", tx_phys);
+	print_le_phys("RX PHYs preference", rx_phys);
 }
 
 static void le_set_default_phy_cmd(uint16_t index, const void *data,
@@ -8071,7 +8211,7 @@ static void le_set_ext_adv_data_cmd(uint16_t index, const void *data,
 
 	print_field("Fragment preference: %s (0x%2.2x)", str,
 						cmd->fragment_preference);
-	print_field("Data length: 0x%2.2x", cmd->data_len);
+	print_field("Data length: %u", cmd->data_len);
 	packet_print_ad(cmd->data, size - sizeof(*cmd));
 }
 
@@ -8120,7 +8260,7 @@ static void le_set_ext_scan_rsp_data_cmd(uint16_t index, const void *data,
 
 	print_field("Fragment preference: %s (0x%2.2x)", str,
 						cmd->fragment_preference);
-	print_field("Data length: 0x%2.2x", cmd->data_len);
+	print_field("Data length: %u", cmd->data_len);
 	packet_print_ad(cmd->data, size - sizeof(*cmd));
 }
 
@@ -8233,8 +8373,8 @@ static void le_set_pa_data_cmd(uint16_t index, const void *data, uint8_t size)
 	}
 
 	print_field("Operation: %s (0x%2.2x)", str, cmd->operation);
-	print_field("Data length: 0x%2.2x", cmd->data_len);
-	print_eir(cmd->data, cmd->data_len, true);
+	print_field("Data length: %u", cmd->data_len);
+	print_eir("Data", cmd->data, size - sizeof(*cmd), true);
 }
 
 static void le_set_pa_enable_cmd(uint16_t index, const void *data, uint8_t size)
@@ -8853,8 +8993,8 @@ static void print_cis_params(const void *data, int i)
 						le16_to_cpu(cis->c_sdu));
 	print_field("Peripheral to Central Maximum SDU Size: %u",
 						le16_to_cpu(cis->p_sdu));
-	print_le_phy("Central to Peripheral PHY", cis->c_phy);
-	print_le_phy("Peripheral to Central PHY", cis->p_phy);
+	print_le_phys("Central to Peripheral PHYs", cis->c_phys);
+	print_le_phys("Peripheral to Central PHYs", cis->p_phys);
 	print_field("Central to Peripheral Retransmission attempts: 0x%2.2x",
 							cis->c_rtn);
 	print_field("Peripheral to Central Retransmission attempts: 0x%2.2x",
@@ -8900,8 +9040,8 @@ static void print_cis_params_test(const void *data, int i)
 						le16_to_cpu(cis->c_pdu));
 	print_field("Peripheral to Central Maximum PDU: 0x%4.4x",
 						le16_to_cpu(cis->p_pdu));
-	print_le_phy("Central to Peripheral PHY", cis->c_phy);
-	print_le_phy("Peripheral to Central PHY", cis->p_phy);
+	print_le_phys("Central to Peripheral PHYs", cis->c_phys);
+	print_le_phys("Peripheral to Central PHYs", cis->p_phys);
 	print_field("Central to Peripheral Burst Number: 0x%2.2x", cis->c_bn);
 	print_field("Peripheral to Central Burst Number: 0x%2.2x", cis->p_bn);
 }
@@ -9025,7 +9165,7 @@ static void print_bis(const struct bt_hci_bis *bis)
 	print_field("Maximum Latency: %u ms (0x%4.4x)",
 			le16_to_cpu(bis->latency), le16_to_cpu(bis->latency));
 	print_field("RTN: 0x%2.2x", bis->rtn);
-	print_le_phy("PHY", bis->phy);
+	print_le_phys("PHYs", bis->phys);
 	print_packing(bis->packing);
 	print_framing(bis->framing);
 	print_field("Encryption: 0x%2.2x", bis->encryption);
@@ -9055,7 +9195,7 @@ static void print_bis_test(const void *data, int i)
 	print_field("Maximum PDU: %u", bis->pdu);
 	print_packing(bis->packing);
 	print_framing(bis->framing);
-	print_le_phy("PHY", bis->phy);
+	print_le_phys("PHYs", bis->phys);
 	print_field("Burst Number: %u", bis->bn);
 	print_field("Immediate Repetition Count: %u", bis->irc);
 	print_field("Pre Transmission Offset: 0x%2.2x", bis->pto);
@@ -9725,6 +9865,33 @@ static void le_cs_test_cmd(uint16_t index, const void *data, uint8_t size)
 		cmd->override_parameters_length);
 }
 
+static void le_set_host_feature_v2_cmd(uint16_t index, const void *data,
+							uint8_t size)
+{
+	const struct bt_hci_cmd_le_set_host_feature_v2 *cmd = data;
+	uint8_t page;
+	uint8_t features[24] = {};
+	uint16_t bit_number = le16_to_cpu(cmd->bit_number);
+
+	print_field("Bit Number: %u", bit_number);
+
+	if (bit_number < 64) {
+		features[bit_number / 8] |= (1 << (bit_number % 8));
+		print_features(0, features, 0x01);
+	} else {
+		uint16_t bit;
+
+		page = (bit_number - 64) / 24 + 1;
+		/* Adjust the bit number to be relative to the page */
+		bit = (bit_number - 64) % 24;
+		/* Set the bit in the features array */
+		features[bit / 8] |= (1 << ((bit % 8)));
+		print_features(page, features, 0x01);
+	}
+
+	print_field("Bit Value: %u", cmd->bit_value);
+}
+
 static void le_cs_test_rsp(uint16_t index, const void *data, uint8_t size)
 {
 	const struct bt_hci_rsp_le_cs_test *rsp = data;
@@ -9764,8 +9931,91 @@ static void le_fsu_cmd(uint16_t index, const void *data, uint8_t size)
 	print_field("Frame Space max: %d us (0x%4.4x)",
 				le16_to_cpu(cmd->frame_space_max),
 				le16_to_cpu(cmd->frame_space_max));
-	print_le_phy_bitfield("PHYs", cmd->phys);
+	print_le_phys("PHYs", cmd->phys);
 	print_fsu_types(cmd->types);
+}
+
+static void le_conn_rate_cmd(uint16_t index, const void *data, uint8_t size)
+{
+	const struct bt_hci_cmd_le_conn_rate *cmd = data;
+
+	print_handle(cmd->handle);
+	print_slot_125u("Connection Interval Min", cmd->interval_min);
+	print_slot_125u("Connection Interval Max", cmd->interval_max);
+	print_field("Subrate Min: %u (0x%4.4x)",
+				le16_to_cpu(cmd->subrate_min),
+				le16_to_cpu(cmd->subrate_min));
+	print_field("Subrate Max: %u (0x%4.4x)",
+				le16_to_cpu(cmd->subrate_max),
+				le16_to_cpu(cmd->subrate_max));
+	print_field("Max Latency: %u (0x%4.4x)",
+				le16_to_cpu(cmd->max_latency),
+				le16_to_cpu(cmd->max_latency));
+	print_field("Continuation Number: %u (0x%4.4x)",
+				le16_to_cpu(cmd->cont_num),
+				le16_to_cpu(cmd->cont_num));
+	print_field("Supervision Timeout: %d ms (0x%4.4x)",
+				le16_to_cpu(cmd->supv_timeout) * 10,
+				le16_to_cpu(cmd->supv_timeout));
+	print_ce_len("Minimum CE Length", cmd->min_ce_len);
+	print_ce_len("Maximum CE Length", cmd->max_ce_len);
+}
+
+static void le_set_def_rate_cmd(uint16_t index, const void *data, uint8_t size)
+{
+	const struct bt_hci_cmd_le_set_def_rate *cmd = data;
+
+	print_slot_125u("Connection Interval Min", cmd->interval_min);
+	print_slot_125u("Connection Interval Max", cmd->interval_max);
+	print_field("Subrate Min: %u (0x%4.4x)",
+				le16_to_cpu(cmd->subrate_min),
+				le16_to_cpu(cmd->subrate_min));
+	print_field("Subrate Max: %u (0x%4.4x)",
+				le16_to_cpu(cmd->subrate_max),
+				le16_to_cpu(cmd->subrate_max));
+	print_field("Max Latency: %u (0x%4.4x)",
+				le16_to_cpu(cmd->max_latency),
+				le16_to_cpu(cmd->max_latency));
+	print_field("Continuation Number: %u (0x%4.4x)",
+				le16_to_cpu(cmd->cont_num),
+				le16_to_cpu(cmd->cont_num));
+	print_field("Supervision Timeout: %d ms (0x%4.4x)",
+				le16_to_cpu(cmd->supv_timeout) * 10,
+				le16_to_cpu(cmd->supv_timeout));
+	print_ce_len("Minimum CE Length", cmd->min_ce_len);
+	print_ce_len("Maximum CE Length", cmd->max_ce_len);
+}
+
+static void le_read_conn_interval_rsp(uint16_t index, const void *data,
+					uint8_t size)
+{
+	const struct bt_hci_rsp_le_read_conn_interval *rsp = data;
+	struct iovec iov;
+	uint8_t i;
+
+	print_status(rsp->status);
+	print_field("Number of Groups: %u", rsp->num_grps);
+
+	if (!rsp->num_grps)
+		return;
+
+	iov.iov_base = (void *)rsp->grps;
+	iov.iov_len = size - sizeof(*rsp);
+
+	for (i = 0; i < rsp->num_grps; i++) {
+		const struct bt_hci_le_conn_interval_group *grp;
+
+		grp = util_iov_pull(&iov, sizeof(*grp));
+		if (!grp) {
+			print_text(COLOR_ERROR, "  invalid group");
+			break;
+		}
+
+		print_field("Group %u:", i);
+		print_slot_125u("  Interval Min", grp->min);
+		print_slot_125u("  Interval Max", grp->max);
+		print_slot_125u("  Interval Stride", grp->stride);
+	}
 }
 
 struct opcode_data {
@@ -10727,19 +10977,6 @@ static const struct opcode_data opcode_table[] = {
 				sizeof(
 				struct bt_hci_rsp_le_read_iso_link_quality),
 				true },
-	{ BT_HCI_CMD_LE_READ_ALL_LOCAL_FEATURES,
-			BT_HCI_BIT_LE_READ_ALL_LOCAL_FEATURES,
-			"LE Read All Local Features",
-			null_cmd, 0, true,
-			le_read_all_local_features_rsp,
-			sizeof(struct bt_hci_rsp_le_read_all_local_features),
-			true },
-	{ BT_HCI_CMD_LE_READ_ALL_REMOTE_FEATURES,
-			BT_HCI_BIT_LE_READ_ALL_REMOTE_FEATURES,
-			"LE Read All Remote Features",
-			le_read_all_remote_features,
-			sizeof(struct bt_hci_cmd_le_read_all_remote_features),
-			true, status_rsp, 1, true },
 	{ BT_HCI_CMD_LE_CS_RD_LOC_SUPP_CAP, BT_HCI_BIT_LE_CS_RD_LOC_SUPP_CAP,
 				"LE CS Read Local Supported Capabilities",
 				NULL, 0, false,
@@ -10835,10 +11072,72 @@ static const struct opcode_data opcode_table[] = {
 				true},
 	{ BT_HCI_CMD_LE_CS_TEST_END, BT_HCI_BIT_LE_CS_TEST_END,
 				"LE CS Test End" },
+	{ 0x2076, 355, "LE Enhanced Read Transmit Power Level" },
+	{ 0x2077, 356, "LE Read Remote Transmit Power Level" },
+	{ 0x2078, 357, "LE Set Path Loss Reporting Parameters" },
+	{ 0x2079, 358, "LE Set Path Loss Reporting Enable" },
+	{ 0x207a, 359, "LE Set Transmit Power Reporting Enable" },
+	{ 0x207b, 360, "LE Transmitter Test [v4]" },
+	{ 0x0c82, 361, "Set Ecosystem Base Interval" },
+	{ 0x100d, 362, "Read Local Supported Codecs [v2]" },
+	{ 0x100e, 363, "Read Local Supported Codec Capabilities" },
+	{ 0x100f, 364, "Read Local Supported Controller Delay" },
+	{ 0x0c83, 365, "Configure Data Path" },
+	{ 0x207c, 366, "LE Set Data Related Address Changes" },
+	{ 0x0c84, 367, "Set Min Encryption Key Size" },
+	{ 0x207d, 368, "LE Set Default Subrate" },
+	{ 0x207e, 369, "LE Subrate Request" },
+	{ 0x207f, 370, "LE Set Extended Advertising Parameters [v2]" },
+	{ 0x2080, 371, "LE Set Decision Data" },
+	{ 0x2081, 372, "LE Set Decision Instructions" },
+	{ 0x2082, 373, "LE Set Periodic Advertising Subevent Data" },
+	{ 0x2083, 374, "LE Set Periodic Advertising Response Data" },
+	{ 0x2084, 375, "LE Set Periodic Sync Subevent" },
+	{ 0x2085, 376, "LE Extended Create Connection [v2]" },
+	{ 0x2086, 377, "LE Set Periodic Advertising Parameters [v2]" },
+	{ BT_HCI_CMD_LE_READ_ALL_LOCAL_FEATURES,
+			BT_HCI_BIT_LE_READ_ALL_LOCAL_FEATURES,
+			"LE Read All Local Features",
+			null_cmd, 0, true,
+			le_read_all_local_features_rsp,
+			sizeof(struct bt_hci_rsp_le_read_all_local_features),
+			true },
+	{ BT_HCI_CMD_LE_READ_ALL_REMOTE_FEATURES,
+			BT_HCI_BIT_LE_READ_ALL_REMOTE_FEATURES,
+			"LE Read All Remote Features",
+			le_read_all_remote_features,
+			sizeof(struct bt_hci_cmd_le_read_all_remote_features),
+			true, status_rsp, 1, true },
+	{ BT_HCI_CMD_LE_SET_HOST_FEATURE_V2, BT_HCI_BIT_LE_SET_HOST_FEATURE_V2,
+			"LE Set Host Feature [v2]",
+			le_set_host_feature_v2_cmd,
+			sizeof(struct bt_hci_cmd_le_set_host_feature_v2),
+			true, status_rsp, 1, true },
 	{ BT_HCI_CMD_LE_FSU, BT_HCI_BIT_LE_FSU,
 				"LE Frame Space Update", le_fsu_cmd,
 				sizeof(struct bt_hci_cmd_le_fsu),
 				true, status_rsp, 1, true },
+	{ BT_HCI_CMD_LE_CONN_RATE, BT_HCI_BIT_LE_CONN_RATE,
+				"LE Connection Rate Request", le_conn_rate_cmd,
+				sizeof(struct bt_hci_cmd_le_conn_rate),
+				true, status_rsp, 1, true },
+	{ BT_HCI_CMD_LE_SET_DEF_RATE, BT_HCI_BIT_LE_SET_DEF_RATE,
+				"LE Set Default Rate Parameteres",
+				le_set_def_rate_cmd,
+				sizeof(struct bt_hci_cmd_le_set_def_rate),
+				true, status_rsp, 1, true },
+	{ BT_HCI_CMD_LE_READ_CONN_INTERVAL,
+				BT_HCI_BIT_LE_READ_CONN_INTERVAL,
+				"LE Read Minimum Supported Connection Interval",
+				null_cmd, 0, true, le_read_conn_interval_rsp,
+				sizeof(struct bt_hci_rsp_le_read_conn_interval),
+				false },
+	{ 0x1010, 392, "Read Local Supported Commands [v2]" },
+	{ 0x20a4, 393, "LE Set Event Mask [v2]" },
+	{ 0x20a5, 394, "LE CS Read Local Supported Capabilities [v2] " },
+	{ 0x20a6, 395, "LE CS Write Cached Remote Supported Capabilities [v2]" },
+	{ 0x20a7, 396, "LE CS Set Security Requirements" },
+	{ 0x20a8, 397, "LE CS Set Default Security Requirements" },
 	{ }
 };
 
@@ -10871,11 +11170,11 @@ static const char *current_vendor_str(uint16_t ocf)
 		return "Microsoft";
 
 	switch (manufacturer) {
-	case 2:
+	case COMPANY_ID_INTEL:
 		return "Intel";
-	case 15:
+	case COMPANY_ID_BROADCOM:
 		return "Broadcom";
-	case 93:
+	case COMPANY_ID_REALTEK:
 		return "Realtek";
 	}
 
@@ -10899,20 +11198,25 @@ static const struct vendor_ocf *current_vendor_ocf(uint16_t ocf)
 		return msft_vendor_ocf();
 
 	switch (manufacturer) {
-	case 2:
+	case COMPANY_ID_INTEL:
 		return intel_vendor_ocf(ocf);
-	case 15:
+	case COMPANY_ID_BROADCOM:
 		return broadcom_vendor_ocf(ocf);
 	}
 
 	return NULL;
 }
 
-static const struct vendor_evt *current_vendor_evt(const void *data,
-							int *consumed_size)
+static const struct evt_vendor *current_evt_vendor(const void *data,
+					uint8_t size, int *consumed_size)
 {
 	uint16_t manufacturer;
 	uint8_t evt = *((const uint8_t *) data);
+
+	if (msft_event_prefix_match(data, size)) {
+		*consumed_size = index_list[index_current].msft_evt_len;
+		return msft_evt_vendor();
+	}
 
 	/* A regular vendor event consumes 1 byte. */
 	*consumed_size = 1;
@@ -10923,18 +11227,21 @@ static const struct vendor_evt *current_vendor_evt(const void *data,
 		manufacturer = fallback_manufacturer;
 
 	switch (manufacturer) {
-	case 2:
-		return intel_vendor_evt(data, consumed_size);
-	case 15:
-		return broadcom_vendor_evt(evt);
+	case COMPANY_ID_INTEL:
+		return intel_evt_vendor(data, consumed_size);
+	case COMPANY_ID_BROADCOM:
+		return broadcom_evt_vendor(evt);
 	}
 
 	return NULL;
 }
 
-static const char *current_vendor_evt_str(void)
+static const char *current_evt_vendor_str(const void *data, uint8_t size)
 {
 	uint16_t manufacturer;
+
+	if (msft_event_prefix_match(data, size))
+		return "Microsoft";
 
 	if (index_current < MAX_INDEX)
 		manufacturer = index_list[index_current].manufacturer;
@@ -10942,11 +11249,11 @@ static const char *current_vendor_evt_str(void)
 		manufacturer = fallback_manufacturer;
 
 	switch (manufacturer) {
-	case 2:
+	case COMPANY_ID_INTEL:
 		return "Intel";
-	case 15:
+	case COMPANY_ID_BROADCOM:
 		return "Broadcom";
-	case 93:
+	case COMPANY_ID_REALTEK:
 		return "Realtek";
 	}
 
@@ -10990,7 +11297,7 @@ static void conn_complete_evt(struct timeval *tv, uint16_t index,
 	print_enable("Encryption", evt->encr_mode);
 
 	if (evt->status == 0x00)
-		assign_handle(index, le16_to_cpu(evt->handle), 0x00,
+		assign_handle(index, le16_to_cpu(evt->handle), BTMON_CONN_ACL,
 					(void *)evt->bdaddr, BDADDR_BREDR);
 }
 
@@ -11087,7 +11394,7 @@ static void remote_version_complete_evt(struct timeval *tv, uint16_t index,
 	print_manufacturer(evt->manufacturer);
 
 	switch (le16_to_cpu(evt->manufacturer)) {
-	case 15:
+	case COMPANY_ID_BROADCOM:
 		print_manufacturer_broadcom(evt->lmp_subver, 0xffff);
 		break;
 	}
@@ -11288,7 +11595,26 @@ static void role_change_evt(struct timeval *tv, uint16_t index,
 
 void packet_latency_add(struct packet_latency *latency, struct timeval *delta)
 {
+	uint64_t usec;
+
 	timeradd(&latency->total, delta, &latency->total);
+
+	/*
+	 * Negative deltas are the result of out of order timestamps and
+	 * would only skew the deviation, so leave them out.
+	 */
+	if (delta->tv_sec >= 0 && delta->tv_usec >= 0) {
+		usec = (uint64_t)delta->tv_sec * 1000000 + delta->tv_usec;
+
+		latency->count++;
+		latency->sum_usec += usec;
+		/*
+		 * Square first and scale down to msec^2 afterwards so the
+		 * sub-msec resolution is not lost, while keeping the running
+		 * sum well clear of an overflow.
+		 */
+		latency->sum_sq_msec += (usec * usec) / 1000000;
+	}
 
 	if ((!timerisset(&latency->min) || timercmp(delta, &latency->min, <))
 				&& delta->tv_sec >= 0 && delta->tv_usec >= 0)
@@ -11315,6 +11641,52 @@ void packet_latency_add(struct packet_latency *latency, struct timeval *delta)
 		latency->med = tmp;
 	} else
 		latency->med = *delta;
+}
+
+long long packet_latency_stddev(const struct packet_latency *latency)
+{
+	double mean, var;
+
+	if (latency->count < 2)
+		return 0;
+
+	mean = (double)latency->sum_usec / latency->count / 1000;
+	var = (double)latency->sum_sq_msec / latency->count - mean * mean;
+	if (var <= 0)
+		return 0;
+
+	return (long long)sqrt(var);
+}
+
+void packet_loss_add(struct packet_loss *loss, uint16_t sn, uint8_t sflags)
+{
+	loss->total++;
+
+	switch (sflags) {
+	case 0x01:
+		loss->invalid++;
+		break;
+	case 0x02:
+		loss->dropped++;
+		break;
+	}
+
+	if (loss->have_sn) {
+		uint16_t gap = sn - loss->last_sn - 1;
+
+		/*
+		 * A sequence number that did not advance is a duplicate or a
+		 * retransmission, and one that moved backwards is a reorder.
+		 * Neither is a loss, so only account for forward gaps.
+		 */
+		if (sn != loss->last_sn && gap < 0x8000) {
+			loss->lost += gap;
+			loss->total += gap;
+		}
+	}
+
+	loss->last_sn = sn;
+	loss->have_sn = true;
 }
 
 static void packet_dequeue_tx(struct timeval *tv, uint16_t handle)
@@ -11349,10 +11721,12 @@ static void packet_dequeue_tx(struct timeval *tv, uint16_t handle)
 	if (TV_MSEC(delta)) {
 		print_field("#%zu: len %zu (%lld Kb/s)", frame->num, frame->len,
 				frame->len * 8 / TV_MSEC(delta));
-		print_field("Latency: %lld msec (%lld-%lld msec ~%lld msec)",
+		print_field("Latency: %lld msec (%lld-%lld msec ~%lld msec "
+				"+/- %lld msec)",
 				TV_MSEC(delta), TV_MSEC(conn->tx_l.min),
 				TV_MSEC(conn->tx_l.max),
-				TV_MSEC(conn->tx_l.med));
+				TV_MSEC(conn->tx_l.med),
+				packet_latency_stddev(&conn->tx_l));
 	}
 
 	l2cap_dequeue_frame(&delta, conn);
@@ -11577,7 +11951,9 @@ static void sync_conn_complete_evt(struct timeval *tv, uint16_t index,
 	print_air_mode(evt->air_mode);
 
 	if (evt->status == 0x00)
-		assign_handle(index, le16_to_cpu(evt->handle), evt->link_type,
+		assign_handle(index, le16_to_cpu(evt->handle),
+					evt->link_type ? BTMON_CONN_ESCO :
+					BTMON_CONN_SCO,
 					(void *)evt->bdaddr, BDADDR_BREDR);
 }
 
@@ -11619,7 +11995,7 @@ static void ext_inquiry_result_evt(struct timeval *tv, uint16_t index,
 	print_dev_class(evt->dev_class);
 	print_clock_offset(evt->clock_offset);
 	print_rssi(evt->rssi);
-	print_eir(evt->data, sizeof(evt->data), false);
+	print_eir("EIR", evt->data, sizeof(evt->data), false);
 }
 
 static void encrypt_key_refresh_complete_evt(struct timeval *tv, uint16_t index,
@@ -11990,6 +12366,17 @@ static void auth_payload_timeout_expired_evt(struct timeval *tv, uint16_t index,
 	print_handle(evt->handle);
 }
 
+static void encrypt_change_evt_v2(struct timeval *tv, uint16_t index,
+					const void *data, uint8_t size)
+{
+	const struct bt_hci_evt_encrypt_change_v2 *evt = data;
+
+	print_status(evt->status);
+	print_handle(evt->handle);
+	print_encr_mode_change(evt->encr_mode, evt->handle);
+	print_key_size(evt->encr_key_size);
+}
+
 static void le_conn_complete_evt(struct timeval *tv, uint16_t index,
 					const void *data, uint8_t size)
 {
@@ -12008,7 +12395,7 @@ static void le_conn_complete_evt(struct timeval *tv, uint16_t index,
 	print_field("Central clock accuracy: 0x%2.2x", evt->clock_accuracy);
 
 	if (evt->status == 0x00)
-		assign_handle(index, le16_to_cpu(evt->handle), 0x01,
+		assign_handle(index, le16_to_cpu(evt->handle), BTMON_CONN_LE,
 				(void *)evt->peer_addr, evt->peer_addr_type);
 }
 
@@ -12025,8 +12412,8 @@ report:
 	print_adv_event_type("Event type", evt->event_type);
 	print_peer_addr_type("Address type", evt->addr_type);
 	print_addr("Address", evt->addr, evt->addr_type);
-	print_field("Data length: %d", evt->data_len);
-	print_eir(evt->data, evt->data_len, true);
+	print_field("Data length: %u", evt->data_len);
+	packet_print_ad(evt->data, evt->data_len);
 
 	rssi = (int8_t *) (evt->data + evt->data_len);
 	print_rssi(*rssi);
@@ -12139,7 +12526,7 @@ static void le_enhanced_conn_complete_evt(struct timeval *tv, uint16_t index,
 	print_field("Central clock accuracy: 0x%2.2x", evt->clock_accuracy);
 
 	if (evt->status == 0x00)
-		assign_handle(index, le16_to_cpu(evt->handle), 0x01,
+		assign_handle(index, le16_to_cpu(evt->handle), BTMON_CONN_LE,
 				(void *)evt->peer_addr, evt->peer_addr_type);
 }
 
@@ -12345,10 +12732,9 @@ static void le_ext_adv_report_evt(struct timeval *tv, uint16_t index,
 						report->direct_addr_type);
 		print_addr("  Direct address", report->direct_addr,
 						report->direct_addr_type);
-		print_field("  Data length: 0x%2.2x", report->data_len);
+		print_field("  Data length: %u", report->data_len);
 		data += sizeof(struct bt_hci_le_ext_adv_report);
-		packet_hexdump(data, report->data_len);
-		print_eir(data, report->data_len, true);
+		packet_print_ad(data, report->data_len);
 		data += report->data_len;
 	}
 }
@@ -12431,8 +12817,8 @@ static void le_pa_report_evt(struct timeval *tv, uint16_t index,
 	}
 
 	print_field("Data status: %s%s%s", color_on, str, COLOR_OFF);
-	print_field("Data length: 0x%2.2x", evt->data_len);
-	print_eir(evt->data, evt->data_len, true);
+	print_field("Data length: %u", evt->data_len);
+	print_eir("Data", evt->data, evt->data_len, true);
 }
 
 static void le_pa_sync_lost_evt(struct timeval *tv, uint16_t index,
@@ -12540,7 +12926,8 @@ static void le_cis_established_evt(struct timeval *tv, uint16_t index,
 	print_slot_125("ISO Interval", evt->interval);
 
 	if (!evt->status)
-		assign_handle(index, le16_to_cpu(evt->conn_handle), 0x05,
+		assign_handle(index, le16_to_cpu(evt->conn_handle),
+					BTMON_CONN_CIS,
 					NULL, BDADDR_LE_PUBLIC);
 }
 
@@ -12591,7 +12978,8 @@ static void le_big_complete_evt(struct timeval *tv, uint16_t index,
 
 		for (i = 0; i < evt->num_bis; i++)
 			assign_handle(index, le16_to_cpu(evt->bis_handle[i]),
-					0x05, NULL, BDADDR_LE_PUBLIC);
+					BTMON_CONN_BIS, NULL,
+					BDADDR_LE_PUBLIC);
 	}
 }
 
@@ -12626,7 +13014,7 @@ static void le_big_sync_estabilished_evt(struct timeval *tv, uint16_t index,
 
 		for (i = 0; i < evt->num_bis; i++)
 			assign_handle(index, le16_to_cpu(evt->bis[i]),
-					0x05, NULL, BDADDR_LE_PUBLIC);
+					BTMON_CONN_BIS, NULL, BDADDR_LE_PUBLIC);
 	}
 }
 
@@ -13325,8 +13713,28 @@ static void le_fsu_evt(struct timeval *tv, uint16_t index,
 	print_field("Frame Space: %u us (0x%4.4x)",
 				le16_to_cpu(evt->frame_space),
 				le16_to_cpu(evt->frame_space));
-	print_le_phy_bitfield("PHYs", evt->phys);
+	print_le_phys("PHYs", evt->phys);
 	print_fsu_types(evt->types);
+}
+
+static void le_conn_rate_change_evt(struct timeval *tv, uint16_t index,
+					const void *data, uint8_t size)
+{
+	const struct bt_hci_evt_le_conn_rate_change *evt = data;
+
+	print_handle(evt->handle);
+	print_slot_125u("Connection Interval", le16_to_cpu(evt->interval));
+	print_field("Subrate Factor: %u (0x%4.4x)", le16_to_cpu(evt->subrate),
+					le16_to_cpu(evt->subrate));
+	print_field("Peripheral Latency: %u (0x%4.4x)",
+					le16_to_cpu(evt->latency),
+					le16_to_cpu(evt->latency));
+	print_field("Continuation Number: %u (0x%4.4x)",
+					le16_to_cpu(evt->cont_number),
+					le16_to_cpu(evt->cont_number));
+	print_field("Supervision Timeout: %u ms (0x%4.4X)",
+					le16_to_cpu(evt->supv_timeout),
+					le16_to_cpu(evt->supv_timeout));
 }
 
 struct subevent_data {
@@ -13495,6 +13903,10 @@ static const struct subevent_data le_meta_event_table[] = {
 	{ BT_HCI_EVT_LE_FSU_COMPLETE,
 		"LE Frame Space Update Complete",
 		le_fsu_evt, sizeof(struct bt_hci_evt_le_fsu_complete) },
+	{ BT_HCI_EVT_LE_CONN_RATE_CHANGE,
+		"LE Connection Rate Change",
+		le_conn_rate_change_evt,
+		sizeof(struct bt_hci_evt_le_conn_rate_change) },
 	{ }
 };
 
@@ -13522,23 +13934,26 @@ static void le_meta_event_evt(struct timeval *tv, uint16_t index,
 	print_subevent(tv, index, subevent_data, data + 1, size - 1);
 }
 
-static void vendor_evt(struct timeval *tv, uint16_t index,
+static void evt_vendor(struct timeval *tv, uint16_t index,
 				const void *data, uint8_t size)
 {
 	struct subevent_data vendor_data;
 	char vendor_str[150];
 	int consumed_size;
-	const struct vendor_evt *vnd = current_vendor_evt(data, &consumed_size);
+	const struct evt_vendor *vnd = current_evt_vendor(data, size,
+								&consumed_size);
 
 	if (vnd) {
-		const char *str = current_vendor_evt_str();
+		const char *str = current_evt_vendor_str(data, size);
 
 		if (str) {
 			snprintf(vendor_str, sizeof(vendor_str),
 						"%s %s", str, vnd->str);
 			vendor_data.str = vendor_str;
-		} else
+		} else {
 			vendor_data.str = vnd->str;
+		}
+
 		vendor_data.subevent = vnd->evt;
 		vendor_data.func = vnd->evt_func;
 		vendor_data.size = vnd->evt_size;
@@ -13554,7 +13969,7 @@ static void vendor_evt(struct timeval *tv, uint16_t index,
 		else
 			manufacturer = fallback_manufacturer;
 
-		vendor_event(manufacturer, data, size);
+		event_vendor(manufacturer, data, size);
 	}
 }
 
@@ -13718,8 +14133,10 @@ static const struct event_data event_table[] = {
 	{ 0x57, "Authenticated Payload Timeout Expired",
 				auth_payload_timeout_expired_evt, 2, true },
 	{ 0x58, "SAM Status Change" },
+	{ 0x59, "Encryption Change v2",
+				encrypt_change_evt_v2, 5, true },
 	{ 0xfe, "Testing" },
-	{ 0xff, "Vendor", vendor_evt, 0, false },
+	{ 0xff, "Vendor", evt_vendor, 0, false },
 	{ }
 };
 
@@ -13776,7 +14193,7 @@ void packet_vendor_diag(struct timeval *tv, uint16_t index,
 					"Vendor Diagnostic", NULL, extra_str);
 
 	switch (manufacturer) {
-	case 15:
+	case COMPANY_ID_BROADCOM:
 		broadcom_lm_diag(data, size);
 		break;
 	default:
@@ -13785,11 +14202,16 @@ void packet_vendor_diag(struct timeval *tv, uint16_t index,
 	}
 }
 
-void packet_system_note(struct timeval *tv, struct ucred *cred,
-					uint16_t index, const void *message)
+void packet_system_note(struct timeval *tv, struct ucred *cred, uint16_t index,
+					const void *data, uint16_t size)
 {
-	print_packet(tv, cred, '=', index, NULL, COLOR_SYSTEM_NOTE,
-					"Note", message, NULL);
+	char *str = strndup(data, size);
+
+	if (str) {
+		print_packet(tv, cred, '=', index, NULL, COLOR_SYSTEM_NOTE,
+							"Note", str, NULL);
+		free(str);
+	}
 }
 
 struct monitor_l2cap_hdr {
@@ -14079,6 +14501,43 @@ static void packet_enqueue_tx(struct timeval *tv, uint16_t handle,
 	queue_push_tail(conn->tx_q, frame);
 }
 
+static void handle_str_append_addr(char *handle_str,
+					struct packet_conn_data *conn)
+{
+	if (!conn)
+		return;
+
+	switch (conn->dst_type) {
+	case 0x00:
+	case 0x02:
+		if (conn->dst_oui) {
+			sprintf(handle_str + strlen(handle_str),
+				" [%2.2X:%2.2X:%2.2X:%2.2X:%2.2X:%2.2X (%.16s)]",
+				conn->dst[5], conn->dst[4], conn->dst[3],
+				conn->dst[2], conn->dst[1], conn->dst[0],
+				conn->dst_oui);
+			return;
+		}
+		break;
+	case 0x01:
+	case 0x03:
+		if (conn->dst_rtype) {
+			sprintf(handle_str + strlen(handle_str),
+				" [%2.2X:%2.2X:%2.2X:%2.2X:%2.2X:%2.2X (%.16s)]",
+				conn->dst[5], conn->dst[4], conn->dst[3],
+				conn->dst[2], conn->dst[1], conn->dst[0],
+				conn->dst_rtype);
+			return;
+		}
+		break;
+	}
+
+	sprintf(handle_str + strlen(handle_str),
+			" [%2.2X:%2.2X:%2.2X:%2.2X:%2.2X:%2.2X]",
+			conn->dst[5], conn->dst[4], conn->dst[3],
+			conn->dst[2], conn->dst[1], conn->dst[0]);
+}
+
 void packet_hci_acldata(struct timeval *tv, struct ucred *cred, uint16_t index,
 				bool in, const void *data, uint16_t size)
 {
@@ -14086,7 +14545,8 @@ void packet_hci_acldata(struct timeval *tv, struct ucred *cred, uint16_t index,
 	uint16_t handle = le16_to_cpu(hdr->handle);
 	uint16_t dlen = le16_to_cpu(hdr->dlen);
 	uint8_t flags = acl_flags(handle);
-	char handle_str[22], extra_str[32];
+	char label[8];
+	char handle_str[58], extra_str[32];
 	struct packet_conn_data *conn;
 	struct index_buf_pool *pool = &index_list[index].acl;
 
@@ -14121,11 +14581,17 @@ void packet_hci_acldata(struct timeval *tv, struct ucred *cred, uint16_t index,
 	else
 		sprintf(handle_str, "Handle %d", acl_handle(handle));
 
+	handle_str_append_addr(handle_str, conn);
+
 	sprintf(extra_str, "flags 0x%2.2x dlen %d", flags, dlen);
 
+	if (conn)
+		sprintf(label, "%s", conn_type_str(conn->type));
+	else
+		sprintf(label, "ACL");
+
 	print_packet(tv, cred, in ? '>' : '<', index, NULL, COLOR_HCI_ACLDATA,
-				in ? "ACL Data RX" : "ACL Data TX",
-						handle_str, extra_str);
+				label, handle_str, extra_str);
 
 	if (!in)
 		packet_enqueue_tx(tv, acl_handle(handle),
@@ -14150,7 +14616,9 @@ void packet_hci_scodata(struct timeval *tv, struct ucred *cred, uint16_t index,
 	const hci_sco_hdr *hdr = data;
 	uint16_t handle = le16_to_cpu(hdr->handle);
 	uint8_t flags = acl_flags(handle);
-	char handle_str[22], extra_str[32];
+	char label[8];
+	char handle_str[42], extra_str[32];
+	struct packet_conn_data *conn;
 
 	if (index >= MAX_INDEX) {
 		print_field("Invalid index (%d).", index);
@@ -14172,6 +14640,7 @@ void packet_hci_scodata(struct timeval *tv, struct ucred *cred, uint16_t index,
 
 	data += HCI_SCO_HDR_SIZE;
 	size -= HCI_SCO_HDR_SIZE;
+	conn = packet_get_conn_data(handle);
 
 	if (index_list[index].sco.total && !in)
 		sprintf(handle_str, "Handle %d [%u/%u]", acl_handle(handle),
@@ -14179,11 +14648,17 @@ void packet_hci_scodata(struct timeval *tv, struct ucred *cred, uint16_t index,
 	else
 		sprintf(handle_str, "Handle %d", acl_handle(handle));
 
+	handle_str_append_addr(handle_str, conn);
+
 	sprintf(extra_str, "flags 0x%2.2x dlen %d", flags, hdr->dlen);
 
+	if (conn)
+		sprintf(label, "%s", conn_type_str(conn->type));
+	else
+		sprintf(label, "SCO");
+
 	print_packet(tv, cred, in ? '>' : '<', index, NULL, COLOR_HCI_SCODATA,
-				in ? "SCO Data RX" : "SCO Data TX",
-						handle_str, extra_str);
+				label, handle_str, extra_str);
 
 	if (!in)
 		packet_enqueue_tx(tv, acl_handle(handle),
@@ -14204,17 +14679,24 @@ void packet_hci_isodata(struct timeval *tv, struct ucred *cred, uint16_t index,
 				bool in, const void *data, uint16_t size)
 {
 	const struct bt_hci_iso_hdr *hdr = data;
-	const struct bt_hci_iso_data_start *start;
-	uint16_t handle = le16_to_cpu(hdr->handle);
-	uint8_t flags = acl_flags(handle);
-	char handle_str[36], extra_str[50], ts_str[16] = { 0 };
-	struct index_buf_pool *pool = &index_list[index].iso;
+	uint16_t handle, dlen;
+	uint8_t flags, pb_flag;
+	char label[8];
+	char handle_str[100], extra_str[70], ts_str[16] = { 0 };
+	char sn_str[16] = { 0 }, slen_str[32] = { 0 };
+	struct index_buf_pool *pool;
+	struct packet_conn_data *conn;
 	size_t ts_size = 0;
+	bool have_hdr;
+	uint16_t sn = 0;
+	uint8_t sflags = 0;
 
 	if (index >= MAX_INDEX) {
 		print_field("Invalid index (%d).", index);
 		return;
 	}
+
+	pool = &index_list[index].iso;
 
 	index_list[index].frame++;
 
@@ -14224,11 +14706,18 @@ void packet_hci_isodata(struct timeval *tv, struct ucred *cred, uint16_t index,
 	data += sizeof(*hdr);
 	size -= sizeof(*hdr);
 
+	handle = le16_to_cpu(hdr->handle);
+	flags = acl_flags(handle);
+	pb_flag = iso_flags_pb(flags);
+	dlen = le16_to_cpu(hdr->dlen);
+
+	have_hdr = (pb_flag == 0x00 || pb_flag == 0x02);
+
 	/* Detect if timestamp field is preset */
 	if (iso_flags_ts(flags)) {
 		ts_size = sizeof(uint32_t);
 
-		if (size < ts_size)
+		if (size < ts_size || !have_hdr)
 			goto malformed;
 
 		snprintf(ts_str, sizeof(ts_str), " ts %u", get_le32(data));
@@ -14237,36 +14726,70 @@ void packet_hci_isodata(struct timeval *tv, struct ucred *cred, uint16_t index,
 		size -= ts_size;
 	}
 
-	start = data;
+	if (have_hdr) {
+		const struct bt_hci_iso_data_start *start = data;
+		uint16_t slen;
+
+		if (size < sizeof(*start))
+			goto malformed;
+
+		sn = le16_to_cpu(start->sn);
+		sflags = iso_data_flags(le16_to_cpu(start->slen));
+		slen = iso_data_len(le16_to_cpu(start->slen));
+
+		if (slen)
+			snprintf(slen_str, sizeof(slen_str), " slen %u", slen);
+		if (sflags)
+			snprintf(slen_str + strlen(slen_str),
+					sizeof(slen_str) - strlen(slen_str),
+					" sflags %u", sflags);
+
+		snprintf(sn_str, sizeof(sn_str), " SN %u", sn);
+	}
+
+	conn = packet_get_conn_data(handle);
+
+	if (in && have_hdr && conn)
+		packet_loss_add(&conn->rx_loss, sn, sflags);
 
 	if (!in && pool->total)
-		sprintf(handle_str, "Handle %d [%u/%u] SN %u",
-			acl_handle(handle), ++pool->tx, pool->total, start->sn);
+		sprintf(handle_str, "Handle %d [%u/%u]%s",
+			acl_handle(handle), ++pool->tx, pool->total, sn_str);
 	else
-		sprintf(handle_str, "Handle %u SN %u", acl_handle(handle),
-			start->sn);
+		sprintf(handle_str, "Handle %u%s", acl_handle(handle), sn_str);
 
-	sprintf(extra_str, "flags 0x%2.2x dlen %u slen %u%s", flags, hdr->dlen,
-							start->slen, ts_str);
+	handle_str_append_addr(handle_str, conn);
+
+	sprintf(extra_str, "flags 0x%2.2x dlen %u%s%s", flags, dlen, slen_str,
+									ts_str);
+
+	if (conn)
+		sprintf(label, "%s", conn_type_str(conn->type));
+	else
+		sprintf(label, "ISO");
 
 	print_packet(tv, cred, in ? '>' : '<', index, NULL, COLOR_HCI_ISODATA,
-				in ? "ISO Data RX" : "ISO Data TX",
-						handle_str, extra_str);
+				label, handle_str, extra_str);
+
+	if (in && conn) {
+		struct packet_loss *loss = &conn->rx_loss;
+
+		if (loss->lost || loss->dropped || loss->invalid)
+			print_field("Lost: %zu/%zu (%zu.%02zu%%) "
+				"dropped %zu invalid %zu",
+				loss->lost, loss->total,
+				loss->lost * 100 / loss->total,
+				(loss->lost * 10000 / loss->total) % 100,
+				loss->dropped, loss->invalid);
+	}
 
 	if (!in)
 		packet_enqueue_tx(tv, acl_handle(handle),
-					index_list[index].frame, hdr->dlen);
+					index_list[index].frame, dlen);
 
-	if (size + ts_size != hdr->dlen) {
+	if (size + ts_size != dlen) {
 		print_text(COLOR_ERROR, "invalid packet size (%d != %d)",
-						size + (int)ts_size, hdr->dlen);
-		packet_hexdump(data, size);
-		return;
-	}
-
-	if (size != start->slen + 4) {
-		print_text(COLOR_ERROR, "invalid packet slen (%d+4 != %d)",
-							start->slen, size);
+						size + (int)ts_size, dlen);
 		packet_hexdump(data, size);
 		return;
 	}
@@ -14283,6 +14806,25 @@ malformed:
 	else
 		print_packet(tv, cred, '*', index, NULL, COLOR_ERROR,
 				"Malformed ISO Data TX packet", NULL, NULL);
+	packet_hexdump(data, size);
+}
+
+void packet_hci_vendor(struct timeval *tv, struct ucred *cred, uint16_t index,
+				bool in, const void *data, uint16_t size)
+{
+	char extra_str[16];
+
+	if (index >= MAX_INDEX) {
+		print_field("Invalid index (%d).", index);
+		return;
+	}
+
+	index_list[index].frame++;
+
+	sprintf(extra_str, "(len %d)", size);
+	print_packet(tv, cred, in ? '>' : '<', index, NULL, COLOR_HCI_VENDOR,
+				"HCI Vendor", NULL, extra_str);
+
 	packet_hexdump(data, size);
 }
 
@@ -14572,6 +15114,7 @@ static const struct bitfield_data mgmt_settings_table[] = {
 	{ 22, "LL Privacy"		},
 	{ 23, "PAST Sender"		},
 	{ 24, "PAST Receiver"		},
+	{ 25, "Shorter Connection Interval"	},
 	{}
 };
 
@@ -14729,6 +15272,27 @@ static void mgmt_print_connection_parameter(const void *data)
 	print_field("Min connection interval: %u", min_conn_interval);
 	print_field("Max connection interval: %u", max_conn_interval);
 	print_conn_latency("Connection latency", conn_latency);
+	print_field("Supervision timeout: %u", supv_timeout);
+}
+
+static void mgmt_print_connection_subrate(const void *data)
+{
+	uint8_t address_type = get_u8(data + 6);
+	uint16_t min_interval = get_le16(data + 7);
+	uint16_t max_interval = get_le16(data + 9);
+	uint16_t subrate_min = get_le16(data + 11);
+	uint16_t subrate_max = get_le16(data + 13);
+	uint16_t max_latency = get_le16(data + 15);
+	uint16_t cont_num = get_le16(data + 17);
+	uint16_t supv_timeout = get_le16(data + 19);
+
+	mgmt_print_address(data, address_type);
+	print_field("Min connection interval: %u", min_interval);
+	print_field("Max connection interval: %u", max_interval);
+	print_field("Subrate min: %u", subrate_min);
+	print_field("Subrate max: %u", subrate_max);
+	print_field("Max latency: %u", max_latency);
+	print_field("Continuation number: %u", cont_num);
 	print_field("Supervision timeout: %u", supv_timeout);
 }
 
@@ -15657,6 +16221,22 @@ static void mgmt_load_connection_parameters_cmd(const void *data, uint16_t size)
 		mgmt_print_connection_parameter(data + 2 + (i * 15));
 }
 
+static void mgmt_load_conn_subrate_cmd(const void *data, uint16_t size)
+{
+	uint16_t num_parameters = get_le16(data);
+	int i;
+
+	print_field("Parameters: %u", num_parameters);
+
+	if (size - 2 != num_parameters * 21) {
+		packet_hexdump(data + 2, size - 2);
+		return;
+	}
+
+	for (i = 0; i < num_parameters; i++)
+		mgmt_print_connection_subrate(data + 2 + (i * 21));
+}
+
 static void mgmt_read_unconf_index_list_rsp(const void *data, uint16_t size)
 {
 	uint16_t num_controllers = get_le16(data);
@@ -15784,7 +16364,7 @@ static void mgmt_read_local_oob_ext_data_rsp(const void *data, uint16_t size)
 
 	mgmt_print_address_type(type);
 	print_field("Data length: %u", data_len);
-	print_eir(data + 3, size - 3, true);
+	print_eir("Data", data + 3, size - 3, true);
 }
 
 static void mgmt_read_advertising_features_rsp(const void *data, uint16_t size)
@@ -15828,9 +16408,10 @@ static void mgmt_add_advertising_cmd(const void *data, uint16_t size)
 	print_field("Duration: %u", duration);
 	print_field("Timeout: %u", timeout);
 	print_field("Advertising data length: %u", adv_data_len);
-	print_eir(data + 11, adv_data_len, false);
+	packet_print_ad(data + 11, adv_data_len);
 	print_field("Scan response length: %u", scan_rsp_len);
-	print_eir(data + 11 + adv_data_len, scan_rsp_len, false);
+	print_eir("Scan response", data + 11 + adv_data_len, scan_rsp_len,
+			false);
 }
 
 static void mgmt_add_advertising_rsp(const void *data, uint16_t size)
@@ -15904,7 +16485,7 @@ static void mgmt_read_ext_controller_info_rsp(const void *data, uint16_t size)
 	mgmt_print_settings("Supported settings", supported_settings);
 	mgmt_print_settings("Current settings", current_settings);
 	print_field("Data length: %u", data_len);
-	print_eir(data + 19, size - 19, false);
+	print_eir("Data", data + 19, size - 19, false);
 }
 
 static void mgmt_set_apperance_cmd(const void *data, uint16_t size)
@@ -16061,7 +16642,7 @@ static void mgmt_print_system_config_tlv(void *data, void *user_data)
 			value = get_u8(entry->value);
 		else if (entry->length == 2)
 			value = get_le16(entry->value);
-		else if (entry->length == 4)
+		else
 			value = get_le32(entry->value);
 		print_field("%s: %u", desc, value);
 	} else {
@@ -16189,9 +16770,10 @@ static void mgmt_add_ext_adv_data_cmd(const void *data, uint16_t size)
 
 	print_field("Instance: %u", instance);
 	print_field("Advertising data length: %u", adv_data_len);
-	print_eir(data + 3, adv_data_len, false);
+	packet_print_ad(data + 3, adv_data_len);
 	print_field("Scan response length: %u", scan_rsp_len);
-	print_eir(data + 3 + adv_data_len, scan_rsp_len, false);
+	print_eir("Scan Response", data + 3 + adv_data_len, scan_rsp_len,
+			false);
 }
 
 static void mgmt_add_ext_adv_data_rsp(const void *data, uint16_t size)
@@ -16725,6 +17307,9 @@ static const struct mgmt_data mgmt_command_table[] = {
 	{ 0x005B, "Send HCI command and wait for event",
 				mgmt_hci_cmd_sync_cmd, 6, false,
 				mgmt_hci_cmd_sync_rsp, 0, false},
+	{ 0x005C, "Load Connection Subrate",
+				mgmt_load_conn_subrate_cmd, 2, false,
+				mgmt_null_rsp, 0, true },
 	{ }
 };
 
@@ -16872,7 +17457,7 @@ static void mgmt_device_connected_evt(const void *data, uint16_t size)
 	mgmt_print_address(data, address_type);
 	mgmt_print_device_flags(flags);
 	print_field("Data length: %u", data_len);
-	print_eir(data + 13, size - 13, false);
+	print_eir("Data", data + 13, size - 13, false);
 }
 
 static void mgmt_device_disconnected_evt(const void *data, uint16_t size)
@@ -16966,7 +17551,7 @@ static void mgmt_device_found_evt(const void *data, uint16_t size)
 	print_rssi(rssi);
 	mgmt_print_device_flags(flags);
 	print_field("Data length: %u", data_len);
-	print_eir(data + 14, size - 14, false);
+	print_eir("Data", data + 14, size - 14, false);
 }
 
 static void mgmt_discovering_evt(const void *data, uint16_t size)
@@ -17081,7 +17666,7 @@ static void mgmt_local_oob_ext_data_updated_evt(const void *data, uint16_t size)
 
 	mgmt_print_address_type(type);
 	print_field("Data length: %u", data_len);
-	print_eir(data + 3, size - 3, true);
+	print_eir("Data", data + 3, size - 3, true);
 }
 
 static void mgmt_advertising_added_evt(const void *data, uint16_t size)
@@ -17103,7 +17688,7 @@ static void mgmt_ext_controller_info_changed_evt(const void *data, uint16_t size
 	uint16_t data_len = get_le16(data);
 
 	print_field("Data length: %u", data_len);
-	print_eir(data + 2, size - 2, false);
+	print_eir("Data", data + 2, size - 2, false);
 }
 
 static void mgmt_phy_changed_evt(const void *data, uint16_t size)
@@ -17249,6 +17834,25 @@ static void mgmt_mesh_packet_cmplt_evt(const void *data, uint16_t size)
 	print_field("Handle: %d", handle);
 }
 
+static void mgmt_conn_subrate_evt(const void *data, uint16_t size)
+{
+	uint8_t address_type = get_u8(data + 6);
+	uint8_t status = get_u8(data + 7);
+	uint16_t interval = get_le16(data + 8);
+	uint16_t subrate = get_le16(data + 10);
+	uint16_t latency = get_le16(data + 12);
+	uint16_t cont_num = get_le16(data + 14);
+	uint16_t supv_timeout = get_le16(data + 16);
+
+	mgmt_print_address(data, address_type);
+	mgmt_print_status(status);
+	print_field("Interval: %u", interval);
+	print_field("Subrate: %u", subrate);
+	print_field("Latency: %u", latency);
+	print_field("Continuation number: %u", cont_num);
+	print_field("Supervision timeout: %u", supv_timeout);
+}
+
 static const struct mgmt_data mgmt_event_table[] = {
 	{ 0x0001, "Command Complete",
 			mgmt_command_complete_evt, 3, false },
@@ -17346,6 +17950,8 @@ static const struct mgmt_data mgmt_event_table[] = {
 			mgmt_mesh_device_found_evt, 22, false },
 	{ 0x0032, "Mesh Packet Complete",
 			mgmt_mesh_packet_cmplt_evt, 1, true },
+	{ 0x0033, "Connection Subrate",
+			mgmt_conn_subrate_evt, 18, true },
 	{ }
 };
 

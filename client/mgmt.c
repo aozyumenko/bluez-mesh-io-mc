@@ -67,10 +67,6 @@ static struct {
 
 static int pending_index = 0;
 
-#ifndef MIN
-#define MIN(x, y) ((x) < (y) ? (x) : (y))
-#endif
-
 static void mgmt_menu_pre_run(const struct bt_shell_menu *menu);
 
 #define PROMPT_ON	COLOR_BLUE "[mgmt]" COLOR_OFF "> "
@@ -2373,7 +2369,7 @@ static void cmd_set_flags(int argc, char **argv)
 static uint8_t *str2bytearray(char *arg, uint8_t *val, long *val_len)
 {
 	char *entry;
-	unsigned int i;
+	long i;
 
 	for (i = 0; (entry = strsep(&arg, " \t")) != NULL; i++) {
 		long v;
@@ -2389,7 +2385,7 @@ static uint8_t *str2bytearray(char *arg, uint8_t *val, long *val_len)
 
 		v = strtol(entry, &endptr, 0);
 		if (!endptr || *endptr != '\0' || v > UINT8_MAX) {
-			bt_shell_printf("Invalid value at index %d\n", i);
+			bt_shell_printf("Invalid value at index %ld\n", i);
 			return NULL;
 		}
 
@@ -2747,6 +2743,42 @@ static void cmd_exp_offload_codecs(int argc, char **argv)
 	if (mgmt_send(mgmt, MGMT_OP_SET_EXP_FEATURE, index,
 			sizeof(cp), &cp, exp_offload_rsp, NULL, NULL) == 0) {
 		error("Unable to send offload codecs feature cmd");
+		return bt_shell_noninteractive_quit(EXIT_FAILURE);
+	}
+}
+
+static void exp_iso_rsp(uint8_t status, uint16_t len, const void *param,
+							void *user_data)
+{
+	if (status != 0)
+		error("Set ISO Socket failed with status 0x%02x (%s)", status,
+					mgmt_errstr(status));
+	else
+		print("ISO Socket successfully set");
+
+	bt_shell_noninteractive_quit(EXIT_SUCCESS);
+}
+
+static void cmd_exp_iso(int argc, char **argv)
+{
+	/* 6fbaf188-05e0-496a-9885-d6ddfdb4e03e */
+	static const uint8_t uuid[16] = {
+		0x3e, 0xe0, 0xb4, 0xfd, 0xdd, 0xd6, 0x85, 0x98,
+		0x6a, 0x49, 0xe0, 0x05, 0x88, 0xf1, 0xba, 0x6f
+	};
+	struct mgmt_cp_set_exp_feature cp;
+	uint8_t val;
+
+	if (parse_setting(argc, argv, &val) == false)
+		return bt_shell_noninteractive_quit(EXIT_FAILURE);
+
+	memset(&cp, 0, sizeof(cp));
+	memcpy(cp.uuid, uuid, 16);
+	cp.action = val;
+
+	if (mgmt_send(mgmt, MGMT_OP_SET_EXP_FEATURE, MGMT_INDEX_NONE,
+			sizeof(cp), &cp, exp_iso_rsp, NULL, NULL) == 0) {
+		error("Unable to set ISO Socket experimental feature");
 		return bt_shell_noninteractive_quit(EXIT_FAILURE);
 	}
 }
@@ -3226,7 +3258,7 @@ static const struct option pair_options[] = {
 static void cmd_pair(int argc, char **argv)
 {
 	struct mgmt_cp_pair_device cp;
-	uint8_t cap = 0x01;
+	long cap = 0x01;
 	uint8_t type = BDADDR_BREDR;
 	char addr[18];
 	int opt;
@@ -3235,9 +3267,22 @@ static void cmd_pair(int argc, char **argv)
 	while ((opt = getopt_long(argc, argv, "+c:t:h", pair_options,
 								NULL)) != -1) {
 		switch (opt) {
-		case 'c':
-			cap = strtol(optarg, NULL, 0);
-			break;
+		case 'c': {
+			char *endptr;
+
+			cap = mgmt_parse_io_capability(optarg);
+			if (cap != MGMT_IO_CAPABILITY_INVALID)
+				break;
+
+			errno = 0;
+			cap = strtol(optarg, &endptr, 0);
+			if (!errno && cap >= 0 && cap <= UINT8_MAX
+							&& *endptr == '\0')
+				break;
+
+			bt_shell_printf("Invalid argument %s\n", argv[1]);
+			return bt_shell_noninteractive_quit(EXIT_FAILURE);
+		}
 		case 't':
 			type = strtol(optarg, NULL, 0);
 			break;
@@ -4190,14 +4235,25 @@ static void io_cap_rsp(uint8_t status, uint16_t len, const void *param,
 static void cmd_io_cap(int argc, char **argv)
 {
 	struct mgmt_cp_set_io_capability cp;
-	uint8_t cap;
+	long cap;
 	uint16_t index;
 
 	index = mgmt_index;
 	if (index == MGMT_INDEX_NONE)
 		index = 0;
 
-	cap = strtol(argv[1], NULL, 0);
+	cap = mgmt_parse_io_capability(argv[1]);
+	if (cap == MGMT_IO_CAPABILITY_INVALID) {
+		char *endptr;
+
+		errno = 0;
+		cap = strtol(argv[1], &endptr, 0);
+		if (errno || (cap < 0) || (cap > UINT8_MAX) || *endptr) {
+			bt_shell_printf("Invalid argument %s\n", argv[1]);
+			return bt_shell_noninteractive_quit(EXIT_FAILURE);
+		}
+	}
+
 	memset(&cp, 0, sizeof(cp));
 	cp.io_capability = cap;
 
@@ -5982,6 +6038,90 @@ static void register_mgmt_callbacks(struct mgmt *mgmt, uint16_t index)
 								NULL, NULL);
 }
 
+static void conn_subrate_rsp(uint8_t status, uint16_t len, const void *param,
+							void *user_data)
+{
+	if (status != 0)
+		error("Load Connection Subrate failed with status 0x%02x (%s)",
+						status, mgmt_errstr(status));
+	else
+		print("Connection Subrate loaded successfully");
+
+	bt_shell_noninteractive_quit(EXIT_SUCCESS);
+}
+
+static const struct option conn_subrate_options[] = {
+	{ "help",	0, 0, 'h' },
+	{ "type",	1, 0, 't' },
+	{ 0, 0, 0, 0 }
+};
+
+static void cmd_conn_subrate(int argc, char **argv)
+{
+	struct mgmt_cp_load_conn_subrate *cp;
+	uint8_t type = BDADDR_LE_PUBLIC;
+	int opt;
+	uint16_t index;
+	size_t cp_size;
+
+	while ((opt = getopt_long(argc, argv, "+t:h", conn_subrate_options,
+								NULL)) != -1) {
+		switch (opt) {
+		case 't':
+			type = strtol(optarg, NULL, 0);
+			break;
+		case 'h':
+			bt_shell_usage();
+			optind = 0;
+			return bt_shell_noninteractive_quit(EXIT_SUCCESS);
+		default:
+			bt_shell_usage();
+			optind = 0;
+			return bt_shell_noninteractive_quit(EXIT_FAILURE);
+		}
+	}
+
+	argc -= optind;
+	argv += optind;
+	optind = 0;
+
+	if (argc < 8) {
+		bt_shell_usage();
+		return bt_shell_noninteractive_quit(EXIT_FAILURE);
+	}
+
+	index = mgmt_index;
+	if (index == MGMT_INDEX_NONE)
+		index = 0;
+
+	cp_size = sizeof(*cp) + sizeof(struct mgmt_conn_subrate);
+	cp = malloc0(cp_size);
+	if (!cp) {
+		error("Unable to allocate memory");
+		return bt_shell_noninteractive_quit(EXIT_FAILURE);
+	}
+
+	cp->param_count = cpu_to_le16(1);
+	str2ba(argv[0], &cp->params[0].addr.bdaddr);
+	cp->params[0].addr.type = type;
+	cp->params[0].min_interval = cpu_to_le16(strtol(argv[1], NULL, 0));
+	cp->params[0].max_interval = cpu_to_le16(strtol(argv[2], NULL, 0));
+	cp->params[0].subrate_min = cpu_to_le16(strtol(argv[3], NULL, 0));
+	cp->params[0].subrate_max = cpu_to_le16(strtol(argv[4], NULL, 0));
+	cp->params[0].max_latency = cpu_to_le16(strtol(argv[5], NULL, 0));
+	cp->params[0].cont_num = cpu_to_le16(strtol(argv[6], NULL, 0));
+	cp->params[0].supv_timeout = cpu_to_le16(strtol(argv[7], NULL, 0));
+
+	if (mgmt_send(mgmt, MGMT_OP_LOAD_CONN_SUBRATE, index, cp_size, cp,
+					conn_subrate_rsp, NULL, NULL) == 0) {
+		error("Unable to send load connection subrate command");
+		free(cp);
+		return bt_shell_noninteractive_quit(EXIT_FAILURE);
+	}
+
+	free(cp);
+}
+
 static void cmd_select(int argc, char **argv)
 {
 	mgmt_cancel_all(mgmt);
@@ -6113,7 +6253,8 @@ static const struct bt_shell_menu mgmt_menu = {
 	{ "conn-info",		"[-t type] <remote address>",
 		cmd_conn_info,		"Get connection information"	},
 	{ "io-cap",		"<cap>",
-		cmd_io_cap,		"Set IO Capability"		},
+		cmd_io_cap,		"Set IO Capability",
+		mgmt_iocap_generator					},
 	{ "scan-params",	"<interval> <window>",
 		cmd_scan_params,	"Set Scan Parameters"		},
 	{ "get-clock",		"[address]",
@@ -6166,6 +6307,8 @@ static const struct bt_shell_menu mgmt_menu = {
 		"Set bluetooth quality report feature"			},
 	{ "exp-offload",		"<on/off>",
 		cmd_exp_offload_codecs,	"Toggle codec support"		},
+	{ "exp-iso",		"<on/off>",
+		cmd_exp_iso,	"Toggle ISO support"		},
 	{ "read-sysconfig",	NULL,
 		cmd_read_sysconfig,	"Read System Configuration"	},
 	{ "set-sysconfig",	"<-v|-h> [options...]",
@@ -6174,6 +6317,10 @@ static const struct bt_shell_menu mgmt_menu = {
 		cmd_get_flags,		"Get device flags"		},
 	{ "set-flags",		"[-f flags] [-t type] <address>",
 		cmd_set_flags,		"Set device flags"		},
+	{ "conn-subrate",	"[-t type] <address> <min_interval> "
+				"<max_interval> <subrate_min> <subrate_max> "
+				"<max_latency> <cont_num> <supv_timeout>",
+		cmd_conn_subrate,	"Load Connection Subrate"	},
 	{ "hci-cmd",		"<opcode> [event] [timeout] [param...]",
 		cmd_hci_cmd,	"Send HCI Command and wait for Event"	},
 	{} },

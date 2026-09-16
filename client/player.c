@@ -1890,9 +1890,9 @@ static void append_io_qos(DBusMessageIter *iter, struct bt_bap_io_qos *qos)
 	g_dbus_dict_append_entry(iter, "Interval", DBUS_TYPE_UINT32,
 						&qos->interval);
 
-	bt_shell_printf("PHY 0x%02x\n", qos->phy);
+	bt_shell_printf("PHYs 0x%02x\n", qos->phys);
 
-	g_dbus_dict_append_entry(iter, "PHY", DBUS_TYPE_BYTE, &qos->phy);
+	g_dbus_dict_append_entry(iter, "PHY", DBUS_TYPE_BYTE, &qos->phys);
 
 	bt_shell_printf("SDU %u\n", qos->sdu);
 
@@ -2229,7 +2229,7 @@ static DBusMessage *endpoint_select_properties_reply(struct endpoint *ep,
 	else
 		qos = &preset->qos.ucast.io_qos;
 
-	if (qos->phy) {
+	if (qos->phys) {
 		/* Set QoS parameters */
 		cfg->qos = preset->qos;
 		/* Adjust the SDU size based on the number of
@@ -3506,6 +3506,12 @@ static void endpoint_locations(const char *input, void *user_data)
 				endpoint_supported_context, ep);
 }
 
+static bool endpoint_is_a2dp(struct endpoint *ep)
+{
+	return !strcasecmp(ep->uuid, A2DP_SOURCE_UUID) ||
+			!strcasecmp(ep->uuid, A2DP_SINK_UUID);
+}
+
 static void endpoint_max_transports(const char *input, void *user_data)
 {
 	struct endpoint *ep = user_data;
@@ -3523,6 +3529,12 @@ static void endpoint_max_transports(const char *input, void *user_data)
 		}
 
 		ep->max_transports = value;
+	}
+
+	/* Locations, contexts and ISO settings only apply to LE Audio */
+	if (endpoint_is_a2dp(ep)) {
+		endpoint_register(ep);
+		return;
 	}
 
 	bt_shell_prompt_input(ep->path, "Locations:", endpoint_locations, ep);
@@ -4162,9 +4174,9 @@ static void custom_phy(const char *input, void *user_data)
 		qos = &p->qos.ucast.io_qos;
 
 	if (!strcmp(input, "1M"))
-		qos->phy = 0x01;
+		qos->phys = BIT(0);
 	else if (!strcmp(input, "2M"))
-		qos->phy = 0x02;
+		qos->phys = BIT(1);
 	else {
 		char *endptr = NULL;
 		uint8_t phy = strtol(input, &endptr, 0);
@@ -4177,7 +4189,7 @@ static void custom_phy(const char *input, void *user_data)
 		switch (phy) {
 		case 0x01:
 		case 0x02:
-			qos->phy = phy;
+			qos->phys = phy;
 			break;
 		default:
 			bt_shell_printf("Invalid argument: %s\n", input);
@@ -4629,8 +4641,7 @@ static void endpoint_init_defaults(struct endpoint *ep)
 	ep->max_transports = UINT8_MAX;
 	ep->auto_accept = true;
 
-	if (!strcmp(ep->uuid, A2DP_SOURCE_UUID) ||
-			!strcmp(ep->uuid, A2DP_SOURCE_UUID))
+	if (endpoint_is_a2dp(ep))
 		return;
 
 	ep->iso_group = BT_ISO_QOS_GROUP_UNSET;
@@ -5003,6 +5014,9 @@ static bool transport_recv(struct io *io, void *user_data)
 static void transport_new(GDBusProxy *proxy, int sk, uint16_t mtu[2])
 {
 	struct transport *transport;
+	DBusMessageIter iter;
+	const char *uuid;
+	bool reader = true;
 
 	transport = new0(struct transport, 1);
 	transport->proxy = proxy;
@@ -5014,7 +5028,27 @@ static void transport_new(GDBusProxy *proxy, int sk, uint16_t mtu[2])
 
 	io_set_disconnect_handler(transport->io, transport_disconnected,
 							transport, NULL);
-	io_set_read_handler(transport->io, transport_recv, transport, NULL);
+
+	if (!g_dbus_proxy_get_property(proxy, "UUID", &iter))
+		return;
+
+	dbus_message_iter_get_basic(&iter, &uuid);
+
+	/* For BAP testing, streams may have been manually desynchronized.
+	 * In this case source and sink streams are acquired separately and
+	 * read handler should not be started for source local endpoint.
+	 */
+	if (g_dbus_proxy_get_property(proxy, "Desynchronized", &iter)) {
+		dbus_bool_t desync;
+
+		dbus_message_iter_get_basic(&iter, &desync);
+		if (desync && !strcmp(uuid, PAC_SOURCE_UUID))
+			reader = false;
+	}
+
+	if (reader)
+		io_set_read_handler(transport->io, transport_recv, transport,
+									NULL);
 
 	if (!ios)
 		ios = queue_new();
@@ -5325,6 +5359,7 @@ static void print_transport_properties(GDBusProxy *proxy)
 	print_property(proxy, "QoS");
 	print_property(proxy, "Location");
 	print_property(proxy, "Links");
+	print_property(proxy, "Desynchronized");
 }
 
 static void print_transports(void *data, void *user_data)
@@ -6091,6 +6126,53 @@ static void cmd_metadata_transport(int argc, char *argv[])
 	}
 }
 
+static void desync_cb(const DBusError *error, void *user_data)
+{
+	if (dbus_error_is_set(error)) {
+		bt_shell_printf("Failed to desynchronize: %s\n", error->name);
+		return bt_shell_noninteractive_quit(EXIT_FAILURE);
+	}
+
+	bt_shell_printf("Desynchronize succeeded\n");
+
+	return bt_shell_noninteractive_quit(EXIT_SUCCESS);
+}
+
+static void cmd_desync_transport(int argc, char *argv[])
+{
+	dbus_bool_t desync;
+	GDBusProxy *proxy;
+
+	if (argc < 3) {
+		bt_shell_printf("Missing argument to %s\n", argv[0]);
+		return bt_shell_noninteractive_quit(EXIT_FAILURE);
+	}
+
+	proxy = g_dbus_proxy_lookup(transports, NULL, argv[1],
+					BLUEZ_MEDIA_TRANSPORT_INTERFACE);
+	if (!proxy) {
+		bt_shell_printf("Transport %s not found\n", argv[1]);
+		return bt_shell_noninteractive_quit(EXIT_FAILURE);
+	}
+
+	if (!strcmp(argv[2], "on") || !strcmp(argv[2], "yes")) {
+		desync = TRUE;
+	} else if (!strcmp(argv[2], "off") || !strcmp(argv[2], "no")) {
+		desync = FALSE;
+	} else {
+		bt_shell_printf("Invalid argument %s\n", argv[2]);
+		return bt_shell_noninteractive_quit(EXIT_FAILURE);
+	}
+
+	if (!g_dbus_proxy_set_property_basic(proxy, "Desynchronized",
+							DBUS_TYPE_BOOLEAN,
+							&desync, desync_cb,
+							NULL, NULL)) {
+		bt_shell_printf("Failed to desynchronize transport\n");
+		return bt_shell_noninteractive_quit(EXIT_FAILURE);
+	}
+}
+
 static const struct bt_shell_menu transport_menu = {
 	.name = "transport",
 	.desc = "Media Transport Submenu",
@@ -6125,6 +6207,9 @@ static const struct bt_shell_menu transport_menu = {
 						transport_generator },
 	{ "metadata",    "<transport> [value...]", cmd_metadata_transport,
 						"Get/Set Transport Metadata",
+						transport_generator },
+	{ "desync",      "<transport> <on/off>", cmd_desync_transport,
+						"Desynchronize Transport",
 						transport_generator },
 	{} },
 };

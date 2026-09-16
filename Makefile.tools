@@ -16,7 +16,8 @@ client_bluetoothctl_SOURCES = client/main.c \
 					client/mgmt.h client/mgmt.c \
 					client/assistant.h client/assistant.c \
 					client/hci.h client/hci.c \
-					client/telephony.h client/telephony.c
+					client/telephony.h client/telephony.c \
+					client/cs.h client/cs.c
 client_bluetoothctl_LDADD = lib/libbluetooth-internal.la \
 			gdbus/libgdbus-internal.la src/libshared-glib.la \
 			$(GLIB_LIBS) $(DBUS_LIBS) -lreadline
@@ -61,13 +62,13 @@ monitor_btmon_SOURCES = monitor/main.c monitor/bt.h \
 				src/settings.h src/settings.c
 monitor_btmon_LDADD = lib/libbluetooth-internal.la \
 				src/libshared-mainloop.la \
-				$(GLIB_LIBS) $(UDEV_LIBS) -ldl
+				$(GLIB_LIBS) $(UDEV_LIBS) -ldl -lm
 
 if MANPAGES
-man_MANS += monitor/btmon.1
+man_MANS += doc/btmon.1
 endif
 endif
-manual_pages += monitor/btmon.1
+manual_pages += doc/btmon.1
 
 if LOGGER
 pkglibexec_PROGRAMS += tools/btmon-logger
@@ -243,7 +244,7 @@ noinst_PROGRAMS += tools/bdaddr tools/avinfo tools/avtest \
 			tools/hcieventmask tools/hcisecfilter \
 			tools/btinfo tools/btconfig \
 			tools/btsnoop tools/btproxy \
-			tools/btiotest tools/bneptest tools/mcaptest \
+			tools/btiotest tools/bneptest \
 			tools/cltest tools/oobtest tools/advtest \
 			tools/seq2bseq tools/nokfw tools/rtlfw \
 			tools/bcmfw tools/create-image \
@@ -283,13 +284,6 @@ tools_btproxy_LDADD = src/libshared-mainloop.la
 tools_btiotest_SOURCES = tools/btiotest.c btio/btio.h btio/btio.c
 tools_btiotest_LDADD = lib/libbluetooth-internal.la $(GLIB_LIBS)
 
-tools_mcaptest_SOURCES = tools/mcaptest.c \
-				btio/btio.h btio/btio.c \
-				src/log.c src/log.h \
-				profiles/health/mcap.h profiles/health/mcap.c
-tools_mcaptest_LDADD = lib/libbluetooth-internal.la $(GLIB_LIBS) \
-				src/libshared-mainloop.la -lrt
-
 tools_bneptest_SOURCES = tools/bneptest.c \
 				btio/btio.h btio/btio.c \
 				src/log.h src/log.c \
@@ -328,6 +322,9 @@ tools_btgatt_server_SOURCES = tools/btgatt-server.c src/uuid-helper.c
 tools_btgatt_server_LDADD = src/libshared-mainloop.la \
 						lib/libbluetooth-internal.la
 
+tools_test_runner_CFLAGS = $(WARNING_CFLAGS)
+tools_test_runner_LDFLAGS =
+
 tools_rctest_LDADD = lib/libbluetooth-internal.la
 
 tools_l2test_LDADD = lib/libbluetooth-internal.la
@@ -355,15 +352,15 @@ profiles_iap_iapd_SOURCES = profiles/iap/main.c
 profiles_iap_iapd_LDADD = gdbus/libgdbus-internal.la $(GLIB_LIBS) $(DBUS_LIBS)
 
 if MANPAGES
-man_MANS += tools/rctest.1 tools/l2ping.1 tools/btattach.1 tools/isotest.1 \
-		tools/btmgmt.1 client/bluetoothctl.1 \
-		client/bluetoothctl-mgmt.1 \
-		client/bluetoothctl-monitor.1 client/bluetoothctl-admin.1 \
-		client/bluetoothctl-advertise.1 client/bluetoothctl-endpoint.1 \
-		client/bluetoothctl-gatt.1 client/bluetoothctl-player.1 \
-		client/bluetoothctl-scan.1 client/bluetoothctl-transport.1 \
-		client/bluetoothctl-assistant.1 client/bluetoothctl-hci.1 \
-		client/bluetoothctl-telephony.1
+man_MANS += doc/rctest.1 doc/l2ping.1 doc/btattach.1 doc/isotest.1 \
+		doc/bluetoothctl.1 \
+		doc/bluetoothctl-mgmt.1 \
+		doc/bluetoothctl-monitor.1 doc/bluetoothctl-admin.1 \
+		doc/bluetoothctl-advertise.1 doc/bluetoothctl-endpoint.1 \
+		doc/bluetoothctl-gatt.1 doc/bluetoothctl-player.1 \
+		doc/bluetoothctl-scan.1 doc/bluetoothctl-transport.1 \
+		doc/bluetoothctl-assistant.1 doc/bluetoothctl-hci.1 \
+		doc/bluetoothctl-telephony.1 doc/bluetoothctl-cs.1
 
 endif
 
@@ -393,8 +390,6 @@ tools_meshctl_SOURCES = tools/meshctl.c \
 tools_meshctl_LDADD = gdbus/libgdbus-internal.la src/libshared-glib.la \
 				lib/libbluetooth-internal.la \
 				$(GLIB_LIBS) $(DBUS_LIBS) -ljson-c -lreadline
-
-EXTRA_DIST += tools/mesh-gatt/local_node.json tools/mesh-gatt/prov_db.json
 endif
 
 bin_PROGRAMS +=  tools/mesh-cfgclient
@@ -420,8 +415,10 @@ tools_mesh_cfgtest_LDADD = lib/libbluetooth-internal.la src/libshared-ell.la \
 						$(ell_ldadd)
 endif
 
+EXTRA_DIST += tools/mesh-gatt/local_node.json tools/mesh-gatt/prov_db.json
+
 if DEPRECATED
-bin_PROGRAMS += tools/hciattach tools/hciconfig tools/hcitool tools/hcidump \
+bin_PROGRAMS += tools/hciattach tools/hciconfig tools/hcitool \
 			tools/rfcomm tools/sdptool tools/ciptool
 
 tools_hciattach_SOURCES = tools/hciattach.c tools/hciattach.h \
@@ -440,64 +437,39 @@ tools_hciconfig_LDADD = lib/libbluetooth-internal.la
 tools_hcitool_SOURCES = tools/hcitool.c src/oui.h src/oui.c
 tools_hcitool_LDADD = lib/libbluetooth-internal.la $(UDEV_LIBS)
 
-tools_hcidump_SOURCES = tools/hcidump.c \
-				tools/parser/parser.h tools/parser/parser.c \
-				tools/parser/lmp.c \
-				tools/parser/hci.c \
-				tools/parser/l2cap.h tools/parser/l2cap.c \
-				tools/parser/smp.c \
-				tools/parser/att.c \
-				tools/parser/sdp.h tools/parser/sdp.c \
-				tools/parser/rfcomm.h tools/parser/rfcomm.c \
-				tools/parser/bnep.c \
-				tools/parser/cmtp.c \
-				tools/parser/hidp.c \
-				tools/parser/hcrp.c \
-				tools/parser/avdtp.c \
-				tools/parser/avctp.c \
-				tools/parser/avrcp.c \
-				tools/parser/sap.c \
-				tools/parser/obex.c \
-				tools/parser/capi.c \
-				tools/parser/ppp.c \
-				tools/parser/tcpip.c \
-				tools/parser/ericsson.c \
-				tools/parser/csr.c \
-				tools/parser/bpa.c
-
-tools_sdptool_SOURCES = tools/sdptool.c src/sdp-xml.h src/sdp-xml.c
+tools_sdptool_SOURCES = tools/sdptool.c src/sdp-xml.h src/sdp-xml.c \
+			src/shared/queue.h src/shared/queue.c \
+			src/shared/util.h src/shared/util.c
 tools_sdptool_LDADD = lib/libbluetooth-internal.la $(GLIB_LIBS)
 
 tools_ciptool_LDADD = lib/libbluetooth-internal.la
-tools_hcidump_LDADD = lib/libbluetooth-internal.la
 
 tools_rfcomm_LDADD = lib/libbluetooth-internal.la
 
 if MANPAGES
-man_MANS += tools/hciattach.1 tools/hciconfig.1 \
-			tools/hcitool.1 tools/hcidump.1 \
-			tools/rfcomm.1 tools/sdptool.1 tools/ciptool.1
+man_MANS += doc/hciattach.1 doc/hciconfig.1 doc/hcitool.1 \
+			doc/rfcomm.1 doc/sdptool.1 doc/ciptool.1
 endif
 endif
 endif
-manual_pages += tools/hciattach.1 tools/hciconfig.1 \
-			tools/hcitool.1 tools/hcidump.1 \
-			tools/rfcomm.1 tools/sdptool.1 tools/ciptool.1 \
-			tools/rctest.1 tools/l2ping.1 tools/btattach.1 \
-			tools/bdaddr.1 tools/isotest.1 tools/btmgmt.1 \
-			client/bluetoothctl.1 \
-			client/bluetoothctl-mgmt.1 \
-			client/bluetoothctl-monitor.1 \
-			client/bluetoothctl-admin.1 \
-			client/bluetoothctl-advertise.1 \
-			client/bluetoothctl-endpoint.1 \
-			client/bluetoothctl-gatt.1 \
-			client/bluetoothctl-player.1 \
-			client/bluetoothctl-scan.1 \
-			client/bluetoothctl-transport.1 \
-			client/bluetoothctl-assistant.1 \
-			client/bluetoothctl-hci.1 \
-			client/bluetoothctl-telephony.1
+manual_pages += doc/hciattach.1 doc/hciconfig.1 doc/hcitool.1 \
+			doc/rfcomm.1 doc/sdptool.1 doc/ciptool.1 \
+			doc/rctest.1 doc/l2ping.1 doc/btattach.1 \
+			doc/bdaddr.1 doc/isotest.1 doc/btmgmt.1 \
+			doc/bluetoothctl.1 \
+			doc/bluetoothctl-mgmt.1 \
+			doc/bluetoothctl-monitor.1 \
+			doc/bluetoothctl-admin.1 \
+			doc/bluetoothctl-advertise.1 \
+			doc/bluetoothctl-endpoint.1 \
+			doc/bluetoothctl-gatt.1 \
+			doc/bluetoothctl-player.1 \
+			doc/bluetoothctl-scan.1 \
+			doc/bluetoothctl-transport.1 \
+			doc/bluetoothctl-assistant.1 \
+			doc/bluetoothctl-hci.1 \
+			doc/bluetoothctl-telephony.1 \
+			doc/bluetoothctl-cs.1
 
 if HID2HCI
 udevdir = $(UDEV_DIR)
@@ -507,10 +479,10 @@ udev_PROGRAMS = tools/hid2hci
 tools_hid2hci_LDADD = $(UDEV_LIBS)
 
 if MANPAGES
-man_MANS += tools/hid2hci.1
+man_MANS += doc/hid2hci.1
 endif
 endif
-manual_pages += tools/hid2hci.1
+manual_pages += doc/hid2hci.1
 
 if READLINE
 noinst_PROGRAMS += tools/btmgmt tools/obex-client-tool tools/obex-server-tool \
@@ -538,8 +510,8 @@ tools_obexctl_LDADD = gdbus/libgdbus-internal.la src/libshared-glib.la \
 
 tools_btmgmt_SOURCES = tools/btmgmt.c src/uuid-helper.c client/display.c \
 			client/mgmt.c
-tools_btmgmt_LDADD = lib/libbluetooth-internal.la src/libshared-mainloop.la \
-				-lreadline
+tools_btmgmt_LDADD = lib/libbluetooth-internal.la src/libshared-glib.la \
+				$(GLIB_LIBS) -lreadline
 if DEPRECATED
 noinst_PROGRAMS += attrib/gatttool
 
@@ -575,29 +547,39 @@ profiles_cups_bluetooth_LDADD = $(GLIB_LIBS) $(DBUS_LIBS) \
 				gdbus/libgdbus-internal.la
 endif
 
-test_scripts += test/sap_client.py test/bluezutils.py \
+test_scripts += test/bluezutils.py \
 		test/dbusdef.py test/monitor-bluetooth test/list-devices \
 		test/test-discovery test/test-manager test/test-adapter \
 		test/test-device test/simple-agent \
-		test/simple-endpoint test/test-sap-server \
-		test/test-network test/test-profile test/test-health \
-		test/test-health-sink test/service-record.dtd \
+		test/simple-endpoint \
+		test/test-network test/test-profile test/test-fastpair \
+		test/service-record.dtd \
 		test/service-did.xml test/service-spp.xml test/service-opp.xml \
 		test/service-ftp.xml test/simple-player test/test-nap \
 		test/test-hfp test/opp-client test/ftp-client \
 		test/pbap-client test/map-client test/example-advertisement \
 		test/example-gatt-server test/example-gatt-client \
+		test/example-ranging-provider \
 		test/test-gatt-profile test/test-mesh test/agent.py
 
 if BTPCLIENT
-noinst_PROGRAMS += tools/btpclient tools/btpclientctl
+noinst_PROGRAMS += client/btpclient/btpclient client/btpclient/btpclientctl
 
-tools_btpclient_SOURCES = tools/btpclient.c src/shared/btp.c src/shared/btp.h
-tools_btpclient_LDADD = lib/libbluetooth-internal.la \
+client_btpclient_btpclient_SOURCES = client/btpclient/btpclient.c \
+				client/btpclient/btpclient.h \
+				src/shared/btp.c src/shared/btp.h src/shared/bap-defs.h \
+				client/btpclient/ascs.c client/btpclient/ascs.h \
+				client/btpclient/bap.c client/btpclient/bap.h \
+				client/btpclient/core.c client/btpclient/core.h \
+				client/btpclient/gap.c client/btpclient/gap.h \
+				client/btpclient/gatt.c client/btpclient/gatt.h \
+				client/btpclient/pacs.c client/btpclient/pacs.h \
+				client/btpclient/vendor.c client/btpclient/vendor.h
+client_btpclient_btpclient_LDADD = lib/libbluetooth-internal.la \
 				src/libshared-ell.la $(ell_ldadd)
-tools/btpclient.$(OBJEXT): src/libshared-ell.la ell/internal
+client/btpclient/btpclient.$(OBJEXT): src/libshared-ell.la ell/internal
 
-tools_btpclientctl_SOURCES = tools/btpclientctl.c client/display.c
-tools_btpclientctl_LDADD = src/libshared-mainloop.la src/libshared-glib.la \
+client_btpclient_btpclientctl_SOURCES = client/btpclient/btpclientctl.c client/display.c
+client_btpclient_btpclientctl_LDADD = src/libshared-mainloop.la src/libshared-glib.la \
 				lib/libbluetooth-internal.la -lreadline
 endif

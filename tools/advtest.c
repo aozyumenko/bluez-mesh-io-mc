@@ -39,9 +39,6 @@
 			"\xe1\x23\x99\xc1\xca\x9a\xc3\x31"
 #define SCAN_IRK	"\xfa\x73\x09\x11\x3f\x03\x37\x0f" \
 			"\xf4\xf9\x93\x1e\xf9\xa3\x63\xa6"
-#ifndef MIN
-#define MIN(x, y) ((x) < (y) ? (x) : (y))
-#endif
 
 static struct mgmt *mgmt;
 static uint16_t index1 = MGMT_INDEX_NONE;
@@ -53,7 +50,7 @@ static struct bt_hci *scan_dev;
 
 static void print_rpa(const uint8_t addr[6])
 {
-	printf("  RSI:\t0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x\n",
+	printf("  RSI:\t%02x-%02x-%02x-%02x-%02x-%02x\n",
 					addr[5], addr[4], addr[3],
 					addr[2], addr[1], addr[0]);
 	printf("    Random: %02x%02x%02x\n", addr[3], addr[4], addr[5]);
@@ -75,36 +72,12 @@ static size_t hex2bin(const char *hexstr, uint8_t *buf, size_t buflen)
 	return len;
 }
 
-static bool get_random_bytes(void *buf, size_t num_bytes)
-{
-	ssize_t len;
-	int fd;
-
-	fd = open("/dev/urandom", O_RDONLY);
-	if (fd < 0)
-		return false;
-
-	len = read(fd, buf, num_bytes);
-
-	close(fd);
-
-	if (len < 0)
-		return false;
-
-	return true;
-}
-
 static void generate_rsi(char *val)
 {
-	uint8_t sirk[16], hash[3];
+	uint8_t sirk[16];
 	uint8_t  rsi[6] = {0};
 
 	hex2bin(val, sirk, sizeof(sirk));
-
-	get_random_bytes(&rsi[3], 3);
-
-	rsi[5] &= 0x3f; /* Clear 2 msb */
-	rsi[5] |= 0x40; /* Set 2nd msb */
 
 	crypto = bt_crypto_new();
 	if (!crypto) {
@@ -113,8 +86,7 @@ static void generate_rsi(char *val)
 		return;
 	}
 
-	bt_crypto_ah(crypto, sirk, rsi + 3, hash);
-	memcpy(rsi, hash, 3);
+	bt_crypto_rsi(crypto, sirk, rsi);
 
 	print_rpa(rsi);
 }

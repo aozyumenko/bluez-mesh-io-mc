@@ -275,21 +275,18 @@ static bool ad_replace_uuid128(struct bt_ad *ad, struct iovec *iov)
 
 static bool ad_replace_name(struct bt_ad *ad, struct iovec *iov)
 {
-	char utf8_name[HCI_MAX_NAME_LENGTH + 2];
+	char *utf8_name;
+	bool ret;
 
-	memset(utf8_name, 0, sizeof(utf8_name));
-	strncpy(utf8_name, (const char *)iov->iov_base, iov->iov_len);
+	utf8_name = str2utf8(iov->iov_base, iov->iov_len);
+	if (!utf8_name)
+		return false;
 
-	if (strisutf8(utf8_name, iov->iov_len))
-		goto done;
+	ret = bt_ad_add_name(ad, utf8_name);
 
-	strtoutf8(utf8_name, iov->iov_len);
+	free(utf8_name);
 
-	/* Remove leading and trailing whitespace characters */
-	strstrip(utf8_name);
-
-done:
-	return bt_ad_add_name(ad, utf8_name);
+	return ret;
 }
 
 static bool ad_replace_uuid16_data(struct bt_ad *ad, struct iovec *iov)
@@ -1229,6 +1226,9 @@ static bool data_match(const void *data, const void *user_data)
 	const struct bt_ad_data *d1 = data;
 	const struct bt_ad_data *d2 = user_data;
 
+	if (!d2)
+		return true;
+
 	if (d1->type != d2->type)
 		return false;
 
@@ -1241,13 +1241,11 @@ static bool data_match(const void *data, const void *user_data)
 	return !memcmp(d1->data, d2->data, d1->len);
 }
 
-bool bt_ad_has_data(struct bt_ad *ad, const struct bt_ad_data *data)
+struct bt_ad_data *bt_ad_has_data(struct bt_ad *ad,
+					const struct bt_ad_data *data)
 {
 	if (!ad)
 		return false;
-
-	if (!data)
-		return !queue_isempty(ad->data);
 
 	return queue_find(ad->data, data_match, data);
 }

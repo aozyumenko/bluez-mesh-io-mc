@@ -31,12 +31,33 @@ struct packet_latency {
 	struct timeval min;
 	struct timeval max;
 	struct timeval med;
+	uint64_t count;
+	uint64_t sum_usec;	/* Sum of samples, in usec */
+	uint64_t sum_sq_msec;	/* Sum of squared samples, in msec^2 */
+};
+
+struct packet_loss {
+	uint16_t last_sn;
+	bool have_sn;
+	size_t lost;		/* Samples missing from the SN sequence */
+	size_t invalid;		/* Samples flagged possibly invalid */
+	size_t dropped;		/* Samples flagged as lost data */
+	size_t total;		/* Samples seen, including the lost ones */
 };
 
 struct packet_frame {
 	struct timeval tv;
 	size_t num;
 	size_t len;
+};
+
+enum {
+	BTMON_CONN_ACL = 0x00,
+	BTMON_CONN_LE,
+	BTMON_CONN_SCO,
+	BTMON_CONN_ESCO,
+	BTMON_CONN_CIS,
+	BTMON_CONN_BIS
 };
 
 struct packet_conn_data {
@@ -47,15 +68,22 @@ struct packet_conn_data {
 	uint8_t  type;
 	uint8_t  dst[6];
 	uint8_t  dst_type;
+	union {
+		char *dst_oui;
+		char *dst_rtype;
+	};
 	struct queue *tx_q;
 	struct queue *chan_q;
 	struct packet_latency tx_l;
+	struct packet_loss rx_loss;
 	void     *data;
 	void     (*destroy)(struct packet_conn_data *conn, void *data);
 };
 
 struct packet_conn_data *packet_get_conn_data(uint16_t handle);
 void packet_latency_add(struct packet_latency *latency, struct timeval *delta);
+long long packet_latency_stddev(const struct packet_latency *latency);
+void packet_loss_add(struct packet_loss *loss, uint16_t sn, uint8_t sflags);
 
 bool packet_has_filter(unsigned long filter);
 void packet_set_filter(unsigned long filter);
@@ -105,8 +133,8 @@ void packet_index_info(struct timeval *tv, uint16_t index, const char *label,
 void packet_vendor_diag(struct timeval *tv, uint16_t index,
 					uint16_t manufacturer,
 					const void *data, uint16_t size);
-void packet_system_note(struct timeval *tv, struct ucred *cred,
-					uint16_t index, const void *message);
+void packet_system_note(struct timeval *tv, struct ucred *cred, uint16_t index,
+					const void *data, uint16_t size);
 void packet_user_logging(struct timeval *tv, struct ucred *cred,
 					uint16_t index, uint8_t priority,
 					const char *ident, const void *data,
@@ -121,6 +149,8 @@ void packet_hci_acldata(struct timeval *tv, struct ucred *cred, uint16_t index,
 void packet_hci_scodata(struct timeval *tv, struct ucred *cred, uint16_t index,
 				bool in, const void *data, uint16_t size);
 void packet_hci_isodata(struct timeval *tv, struct ucred *cred, uint16_t index,
+				bool in, const void *data, uint16_t size);
+void packet_hci_vendor(struct timeval *tv, struct ucred *cred, uint16_t index,
 				bool in, const void *data, uint16_t size);
 
 void packet_ctrl_open(struct timeval *tv, struct ucred *cred, uint16_t index,

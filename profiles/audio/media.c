@@ -71,7 +71,11 @@
 #define MEDIA_ENDPOINT_INTERFACE "org.bluez.MediaEndpoint1"
 #define MEDIA_PLAYER_INTERFACE "org.mpris.MediaPlayer2.Player"
 
-#define REQUEST_TIMEOUT (3 * 1000)		/* 3 seconds */
+/* Timeout should be less than avdtp request timeout (4 seconds) */
+#define A2DP_REQUEST_TIMEOUT_MSEC	(3 * 1000)
+
+/* Timeout should be less than ATT timeout (30 seconds) */
+#define BAP_REQUEST_TIMEOUT_MSEC	(3 * 1000)
 
 struct media_app {
 	struct media_adapter	*adapter;
@@ -132,12 +136,14 @@ struct media_endpoint {
 	guint			watch;
 	GSList			*requests;
 	struct media_adapter	*adapter;
+	struct media_app	*app;
 	GSList			*transports;
 	struct endpoint_features	features;
 };
 
 struct local_player {
 	struct media_adapter	*adapter;
+	struct media_app	*app;
 	char			*sender;	/* Player DBus bus id */
 	char			*path;		/* Player object path */
 	GHashTable		*settings;	/* Player settings */
@@ -151,6 +157,7 @@ struct local_player {
 	GTimer			*timer;
 	bool			play;
 	bool			pause;
+	bool			seek;
 	bool			next;
 	bool			previous;
 	bool			control;
@@ -300,6 +307,11 @@ static void media_endpoint_remove(void *data)
 		return;
 	}
 #endif
+
+	if (endpoint->app) {
+		queue_remove(endpoint->app->endpoints, endpoint);
+		endpoint->app = NULL;
+	}
 
 	info("Endpoint unregistered: sender=%s path=%s", endpoint->sender,
 			endpoint->path);
@@ -465,16 +477,16 @@ static gboolean media_endpoint_async_call(DBusMessage *msg,
 					struct media_transport *transport,
 					media_endpoint_cb_t cb,
 					void *user_data,
-					GDestroyNotify destroy)
+					GDestroyNotify destroy,
+					int timeout_msec)
 {
 	struct endpoint_request *request;
 
 	request = g_new0(struct endpoint_request, 1);
 
-	/* Timeout should be less than avdtp request timeout (4 seconds) */
 	if (g_dbus_send_message_with_reply(btd_get_dbus_connection(),
 						msg, &request->call,
-						REQUEST_TIMEOUT) == FALSE) {
+						timeout_msec) == FALSE) {
 		error("D-Bus send failed");
 		g_free(request);
 		return FALSE;
@@ -521,7 +533,7 @@ static gboolean select_configuration(struct media_endpoint *endpoint,
 					DBUS_TYPE_INVALID);
 
 	return media_endpoint_async_call(msg, endpoint, NULL,
-						cb, user_data, destroy);
+						cb, user_data, destroy, -1);
 }
 
 static int transport_device_cmp(gconstpointer data, gconstpointer user_data)
@@ -583,7 +595,7 @@ static gboolean set_configuration(struct media_endpoint *endpoint,
 		return FALSE;
 
 	init_volume = btd_device_get_volume(device);
-	media_transport_update_volume(transport, init_volume);
+	media_transport_set_a2dp_volume(device, init_volume);
 
 	msg = dbus_message_new_method_call(endpoint->sender, endpoint->path,
 						MEDIA_ENDPOINT_INTERFACE,
@@ -604,7 +616,8 @@ static gboolean set_configuration(struct media_endpoint *endpoint,
 	g_dbus_get_properties(conn, path, "org.bluez.MediaTransport1", &iter);
 
 	return media_endpoint_async_call(msg, endpoint, transport,
-						cb, user_data, destroy);
+						cb, user_data, destroy,
+						A2DP_REQUEST_TIMEOUT_MSEC);
 }
 #endif
 
@@ -858,7 +871,7 @@ static int parse_ucast_qos(DBusMessageIter *iter, struct bt_bap_qos *qos)
 			if (var != DBUS_TYPE_BYTE)
 				goto fail;
 
-			dbus_message_iter_get_basic(&value, &io_qos.phy);
+			dbus_message_iter_get_basic(&value, &io_qos.phys);
 		} else if (!strcasecmp(key, "SDU")) {
 			if (var != DBUS_TYPE_UINT16)
 				goto fail;
@@ -1049,7 +1062,7 @@ static int pac_select(struct bt_bap_pac *lpac, struct bt_bap_pac *rpac,
 						metadata->iov_len);
 	}
 
-	if (qos && qos->phy) {
+	if (qos && qos->phys) {
 		DBusMessageIter entry, variant, qos_dict;
 
 		key = "QoS";
@@ -1065,7 +1078,7 @@ static int pac_select(struct bt_bap_pac *lpac, struct bt_bap_pac *rpac,
 							&qos->framing);
 
 		g_dbus_dict_append_entry(&qos_dict, "PHY", DBUS_TYPE_BYTE,
-							&qos->phy);
+							&qos->phys);
 
 		g_dbus_dict_append_entry(&qos_dict, "Retransmissions",
 					DBUS_TYPE_BYTE, &qos->rtn);
@@ -1093,7 +1106,7 @@ static int pac_select(struct bt_bap_pac *lpac, struct bt_bap_pac *rpac,
 	dbus_message_iter_close_container(&iter, &dict);
 
 	if (!media_endpoint_async_call(msg, endpoint, NULL, pac_select_cb,
-								data, free))
+								data, free, -1))
 		return -EIO;
 
 	return 0;
@@ -1233,6 +1246,7 @@ static int pac_config(struct bt_bap_stream *stream, struct iovec *cfg,
 	DBusMessage *msg;
 	DBusMessageIter iter;
 	const char *path;
+	int timeout_msec;
 
 	DBG("endpoint %p stream %p", endpoint, stream);
 
@@ -1243,9 +1257,16 @@ static int pac_config(struct bt_bap_stream *stream, struct iovec *cfg,
 	switch (bt_bap_stream_get_type(stream)) {
 	case BT_BAP_STREAM_TYPE_UCAST:
 		transport = pac_ucast_config(stream, cfg, endpoint);
+		timeout_msec = BAP_REQUEST_TIMEOUT_MSEC;
 		break;
 	case BT_BAP_STREAM_TYPE_BCAST:
 		transport = pac_bcast_config(stream, cfg, endpoint);
+
+		/* If we are sink, BASS remote may be waiting: custom timeout */
+		if (bt_bap_stream_get_dir(stream) == BT_BAP_SOURCE)
+			timeout_msec = BAP_REQUEST_TIMEOUT_MSEC;
+		else
+			timeout_msec = -1;
 		break;
 	default:
 		transport = NULL;
@@ -1279,7 +1300,8 @@ static int pac_config(struct bt_bap_stream *stream, struct iovec *cfg,
 	g_dbus_get_properties(conn, path, "org.bluez.MediaTransport1", &iter);
 
 	if (!media_endpoint_async_call(msg, endpoint, transport,
-						pac_config_cb, data, free))
+						pac_config_cb, data, free,
+						timeout_msec))
 		return -EIO;
 
 	return 0;
@@ -1361,17 +1383,16 @@ static bool endpoint_init_pac(struct media_endpoint *endpoint, uint8_t type,
 		metadata->iov_len = endpoint->metadata_size;
 	}
 
-	endpoint->pac = bt_bap_add_vendor_pac(db, name, type, endpoint->codec,
-				endpoint->cid, endpoint->vid, &endpoint->qos,
-				&data, metadata);
+	endpoint->pac = bt_bap_add_vendor_pac_full(db, name, type,
+				endpoint->codec, endpoint->cid, endpoint->vid,
+				&endpoint->qos, &data, metadata,
+				&pac_ops, endpoint);
 	if (!endpoint->pac) {
 		error("Unable to create PAC");
 		free(name);
 		free(metadata);
 		return false;
 	}
-
-	bt_bap_pac_set_ops(endpoint->pac, &pac_ops, endpoint);
 
 	DBG("PAC %s registered", name);
 
@@ -1810,7 +1831,7 @@ static int parse_properties(DBusMessageIter *props, const char **uuid,
 		} else if (strcasecmp(key, "PHY") == 0) {
 			if (var != DBUS_TYPE_BYTE)
 				return -EINVAL;
-			dbus_message_iter_get_basic(&value, &qos->phy);
+			dbus_message_iter_get_basic(&value, &qos->phys);
 		} else if (strcasecmp(key, "Retransmissions") == 0) {
 			if (var != DBUS_TYPE_BYTE)
 				return -EINVAL;
@@ -2063,6 +2084,11 @@ static void local_player_remove(void *data)
 {
 	struct local_player *mp = data;
 
+	if (mp->app) {
+		queue_remove(mp->app->players, mp);
+		mp->app = NULL;
+	}
+
 	info("Player unregistered: sender=%s path=%s", mp->sender, mp->path);
 
 	local_player_destroy(mp);
@@ -2269,6 +2295,29 @@ bool local_player_pause(struct local_player *mp)
 		return false;
 
 	return local_player_send(mp, "Pause");
+}
+
+bool local_player_seek(struct local_player *mp, int64_t offset_usec)
+{
+	DBusMessage *msg;
+
+	DBG("");
+
+	if (!mp->seek || !mp->control)
+		return false;
+
+	msg = dbus_message_new_method_call(mp->sender, mp->path,
+					MEDIA_PLAYER_INTERFACE, "Seek");
+	if (msg == NULL) {
+		error("Couldn't allocate D-Bus message");
+		return false;
+	}
+
+	dbus_message_append_args(msg, DBUS_TYPE_INT64, &offset_usec,
+					DBUS_TYPE_INVALID);
+	g_dbus_send_message(btd_get_dbus_connection(), msg);
+
+	return true;
 }
 
 bool local_player_next(struct local_player *mp)
@@ -2647,6 +2696,9 @@ static gboolean set_player_property(struct local_player *mp, const char *key,
 
 	if (strcasecmp(key, "CanPause") == 0)
 		return set_flag(mp, &var, &mp->pause);
+
+	if (strcasecmp(key, "CanSeek") == 0)
+		return set_flag(mp, &var, &mp->seek);
 
 	if (strcasecmp(key, "CanGoNext") == 0)
 		return set_flag(mp, &var, &mp->next);
@@ -3073,7 +3125,7 @@ static void app_register_endpoint(void *data, void *user_data)
 		if (dbus_message_iter_get_arg_type(&iter) != DBUS_TYPE_BYTE)
 			goto fail;
 
-		dbus_message_iter_get_basic(&iter, &qos.phy);
+		dbus_message_iter_get_basic(&iter, &qos.phys);
 	}
 
 	if (g_dbus_proxy_get_property(proxy, "MaximumLatency", &iter)) {
@@ -3150,10 +3202,19 @@ static void app_register_endpoint(void *data, void *user_data)
 						metadata, metadata_size,
 						&features, &app->err);
 	if (!endpoint) {
+		if (app->err == -EPERM) {
+			info("Skipping endpoint %s:%s (%s) blocked by admin allowlist",
+				app->sender, path, uuid);
+			app->err = 0;
+			return;
+		}
+
 		error("Unable to register endpoint %s:%s: %s", app->sender,
 						path, strerror(-app->err));
 		return;
 	}
+
+	endpoint->app = app;
 
 	queue_push_tail(app->endpoints, endpoint);
 
@@ -3182,6 +3243,8 @@ static void app_register_player(void *data, void *user_data)
 							&app->err);
 	if (!player)
 		return;
+
+	player->app = app;
 
 	if (g_dbus_proxy_get_property(proxy, "PlaybackStatus", &iter)) {
 		if (!set_status(player, &iter))
@@ -3215,6 +3278,11 @@ static void app_register_player(void *data, void *user_data)
 
 	if (g_dbus_proxy_get_property(proxy, "CanPause", &iter)) {
 		if (!set_flag(player, &iter, &player->pause))
+			goto fail;
+	}
+
+	if (g_dbus_proxy_get_property(proxy, "CanSeek", &iter)) {
+		if (!set_flag(player, &iter, &player->seek))
 			goto fail;
 	}
 
@@ -3752,7 +3820,7 @@ const struct media_endpoint *media_endpoint_get_asha(void)
 	 */
 	static struct media_endpoint asha_endpoint =  {
 		.uuid = ASHA_PROFILE_UUID,
-		.codec = 0x2, /* Currently on G.722 is defined by the spec */
+		.codec = 0x1, /* Currently on G.722 is defined by the spec */
 	};
 
 	return &asha_endpoint;

@@ -30,6 +30,7 @@
 #include "bluetooth/sdp.h"
 #include "bluetooth/uuid.h"
 
+#include "src/shared/att-types.h"
 #include "src/shared/util.h"
 #include "btio/btio.h"
 #include "att.h"
@@ -159,7 +160,7 @@ static void connect_cb(GIOChannel *io, GError *err, gpointer user_data)
 		mtu = ATT_DEFAULT_LE_MTU;
 	}
 
-	if (cid == ATT_CID)
+	if (cid == BT_ATT_CID)
 		mtu = ATT_DEFAULT_LE_MTU;
 
 	attrib = g_attrib_new(iochannel, mtu, false);
@@ -171,7 +172,7 @@ static void connect_cb(GIOChannel *io, GError *err, gpointer user_data)
 	rl_printf("Connection successful\n");
 }
 
-static void disconnect_io()
+static void disconnect_io(void)
 {
 	if (conn_state == STATE_DISCONNECTED)
 		return;

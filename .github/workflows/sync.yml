@@ -2,6 +2,7 @@ name: Sync Repositories and Patchwork
 on:
   schedule:
     - cron: "*/5 * * * *"
+  workflow_dispatch:
 
 jobs:
   bluez:
@@ -39,6 +40,7 @@ jobs:
       with:
         task: cleanup
         github_token: ${{ secrets.ACTION_TOKEN }}
+        email_token: ${{ secrets.EMAIL_TOKEN }}
 
     - name: Sync Patchwork
       uses: bluez/action-ci@main

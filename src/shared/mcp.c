@@ -30,6 +30,8 @@
 #include "src/shared/mcp.h"
 #include "src/shared/mcs.h"
 
+#define BT_MCS_ERROR_VALUE_CHANGED_DURING_READ_LONG	0x80
+
 #define DBG_MCP(mcp, fmt, ...) \
 	mcp_debug(mcp, "%s:%s() mcp %p | " fmt, __FILE__, __func__, mcp, \
 								##__VA_ARGS__)
@@ -76,22 +78,19 @@ struct bt_mcs_db {
 	struct gatt_db_attribute *ccid;
 };
 
-struct bt_mcs_client {
+struct bt_mcs_session {
+	struct bt_mcs *mcs;
 	struct bt_att *att;
+	unsigned int disconn_id;
 
-	/* Per-client state.
-	 *
-	 * Concurrency is not specified in MCS v1.0.1, everything currently
-	 * implemented seems OK to be in global state.
-	 *
-	 * TODO: Search Results ID likely should go here
-	 */
+	/* Per-client state */
+	struct queue *changed;
 };
 
 struct bt_mcs {
 	struct gatt_db *db;
 	struct bt_mcs_db ldb;
-	struct queue *clients;
+	struct queue *sessions;
 
 	uint8_t media_state;
 
@@ -344,6 +343,11 @@ static void write_media_cp(struct gatt_db_attribute *attrib,
 		rsp.result = BT_MCS_RESULT_OP_NOT_SUPPORTED;
 		goto respond;
 	}
+	if (cmd->int32_arg && !util_iov_pull_le32(&iov, (uint32_t *)&arg)) {
+		ret = BT_ATT_ERROR_INVALID_ATTRIBUTE_VALUE_LEN;
+		rsp.op = 0;
+		goto respond;
+	}
 
 	DBG_MCS(mcs, "Command %s", cmd->name);
 
@@ -366,7 +370,7 @@ respond:
 							ret, rsp.result);
 
 	gatt_db_attribute_write_result(attrib, id, ret);
-	if (!rsp.op)
+	if (ret)
 		return;
 
 	/* Make state transition immediately if command was successful and has
@@ -557,11 +561,87 @@ static bool set_playing_order(struct bt_mcs *mcs, void *data)
 	return false;
 }
 
+static bool match_session_att(const void *data, const void *match_data)
+{
+	const struct bt_mcs_session *session = data;
+
+	return session->att == match_data;
+}
+
+static void session_destroy(void *data)
+{
+	struct bt_mcs_session *session = data;
+	struct bt_mcs *mcs = session->mcs;
+
+	if (mcs)
+		queue_remove(mcs->sessions, session);
+	queue_destroy(session->changed, NULL);
+	free(session);
+}
+
+static void session_remove(void *user_data)
+{
+	struct bt_mcs_session *session = user_data;
+
+	session->mcs = NULL;
+	bt_att_unregister_disconnect(session->att, session->disconn_id);
+}
+
+static struct bt_mcs_session *get_session(struct bt_mcs *mcs,
+							struct bt_att *att)
+{
+	struct bt_mcs_session *session;
+
+	session = queue_find(mcs->sessions, match_session_att, att);
+	if (session)
+		return session;
+
+	session = new0(struct bt_mcs_session, 1);
+	session->disconn_id = bt_att_register_disconnect(att, NULL, session,
+							session_destroy);
+	if (!session->disconn_id) {
+		free(session);
+		return NULL;
+	}
+
+	session->mcs = mcs;
+	session->att = att;
+	session->changed = queue_new();
+
+	queue_push_tail(mcs->sessions, session);
+	return session;
+}
+
+static void session_changed(void *data, void *user_data)
+{
+	struct bt_mcs_session *session = data;
+	struct gatt_db_attribute *attrib = user_data;
+
+	if (!queue_find(session->changed, NULL, attrib))
+		queue_push_tail(session->changed, attrib);
+}
+
 static void read_result(struct bt_mcs *mcs, struct gatt_db_attribute *attrib,
-			unsigned int id, uint16_t offset, mcs_get_func_t get)
+			unsigned int id, uint16_t offset, struct bt_att *att,
+			mcs_get_func_t get)
 {
 	uint8_t buf[BT_ATT_MAX_VALUE_LEN];
 	struct iovec iov = { .iov_base = buf, .iov_len = 0 };
+	struct bt_mcs_session *session = get_session(mcs, att);
+
+	if (!session) {
+		gatt_db_attribute_read_result(attrib, id,
+						BT_ATT_ERROR_UNLIKELY, NULL, 0);
+		return;
+	}
+
+	if (!offset) {
+		queue_remove(session->changed, attrib);
+	} else if (queue_find(session->changed, NULL, attrib)) {
+		gatt_db_attribute_read_result(attrib, id,
+			BT_MCS_ERROR_VALUE_CHANGED_DURING_READ_LONG, NULL, 0);
+		return;
+	}
 
 	get(mcs, &iov, sizeof(buf));
 
@@ -582,7 +662,7 @@ static void read_result(struct bt_mcs *mcs, struct gatt_db_attribute *attrib,
 				void *user_data) \
 	{ \
 		DBG_MCS(user_data, ""); \
-		read_result(user_data, attrib, id, offset, get_ ##name); \
+		read_result(user_data, attrib, id, offset, att, get_ ##name); \
 	}
 
 READ_FUNC(media_player_name)
@@ -683,7 +763,9 @@ void bt_mcs_changed(struct bt_mcs *mcs, uint16_t chrc_uuid)
 		if (bt_uuid_cmp(&uuid_attr, &uuid))
 			continue;
 
-		DBG_MCS(mcs, "Notify %u", chrc_uuid);
+		queue_foreach(mcs->sessions, session_changed, attrs[i].attr);
+
+		DBG_MCS(mcs, "Notify 0x%04x", chrc_uuid);
 
 		attrs[i].get(mcs, &iov, sizeof(buf));
 
@@ -925,6 +1007,7 @@ struct bt_mcs *bt_mcs_register(struct gatt_db *db, bool is_gmcs,
 	mcs->user_data = user_data;
 
 	mcs->media_state = BT_MCS_STATE_INACTIVE;
+	mcs->sessions = queue_new();
 
 	if (!mcs_init_db(mcs, is_gmcs)) {
 		free(mcs);
@@ -958,6 +1041,8 @@ void bt_mcs_unregister(struct bt_mcs *mcs)
 		queue_destroy(servers, NULL);
 		servers = NULL;
 	}
+
+	queue_destroy(mcs->sessions, session_remove);
 
 	free(mcs);
 }
@@ -1366,6 +1451,12 @@ static void update_media_player_name(bool success, uint8_t att_ecode,
 				void *user_data)
 {
 	struct bt_mcp_service *service = user_data;
+
+	if (!success) {
+		DBG_SVC(service, "Unable to read Media Player Name: "
+						"error 0x%02x", att_ecode);
+		return;
+	}
 
 	DBG_SVC(service, "Media Player Name");
 
@@ -2032,4 +2123,9 @@ bool bt_mcp_add_listener(struct bt_mcp *mcp, uint8_t ccid,
 
 	queue_push_tail(service->listeners, listener);
 	return true;
+}
+
+struct bt_gatt_client *bt_mcp_test_util_get_client(struct bt_mcp *mcp)
+{
+	return mcp->client;
 }

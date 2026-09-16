@@ -506,11 +506,49 @@ static bool parse_service_data_sr(DBusMessageIter *iter,
 	return parse_service_data(iter, client->scan);
 }
 
+static bool validate_rsi(const uint8_t *data, uint8_t len)
+{
+	struct bt_crypto *crypto;
+	uint8_t zero[16] = {};
+	uint8_t hash[3];
+	bool ret;
+
+	if (!data || len != 6)
+		return false;
+
+	/* Check if a valid SIRK has been set */
+	if (!memcmp(btd_opts.csis.sirk, zero, sizeof(zero)))
+		return false;
+
+	crypto = bt_crypto_new();
+	if (!crypto)
+		return false;
+
+	/* Generate a hash using SIRK and prand as input */
+	ret = bt_crypto_sih(crypto, btd_opts.csis.sirk, data + 3, hash);
+	if (!ret)
+		goto done;
+
+	/* Check if hash matches  */
+	ret = !(memcmp(hash, data, 3));
+	if (!ret) {
+		error("RSI set invalid: hash mismatch");
+		goto done;
+	}
+
+	DBG("RSI validated");
+
+done:
+	bt_crypto_unref(crypto);
+	return ret;
+}
+
 static bool set_rsi(struct btd_adv_client *client)
 {
 	struct bt_crypto *crypto;
 	uint8_t zero[16] = {};
 	struct bt_ad_data rsi = { .type = BT_AD_CSIP_RSI };
+	struct bt_ad_data *ad;
 	uint8_t data[6];
 	bool ret;
 
@@ -518,27 +556,28 @@ static bool set_rsi(struct btd_adv_client *client)
 	if (!memcmp(btd_opts.csis.sirk, zero, sizeof(zero)))
 		return false;
 
-	/* Check if RSI needs to be set or data already contains RSI data */
-	if (!client || bt_ad_has_data(client->data, &rsi))
+	if (!client)
 		return true;
+
+	/* Check if RSI needs to be set or data already contains RSI data */
+	ad = bt_ad_has_data(client->data, &rsi);
+	if (ad) {
+		ret = validate_rsi(ad->data, ad->len);
+		return ret;
+	}
 
 	crypto = bt_crypto_new();
 	if (!crypto)
 		return false;
 
-	ret = bt_crypto_random_bytes(crypto, data + 3, sizeof(data) - 3);
-	if (!ret)
-		goto done;
+	ret = bt_crypto_rsi(crypto, btd_opts.csis.sirk, data);
 
-	ret = bt_crypto_sih(crypto, btd_opts.csis.sirk, data + 3, data);
-	if (!ret)
-		goto done;
-
-	ret = bt_ad_add_data(client->data, BT_AD_CSIP_RSI, data, sizeof(data));
-
-done:
 	bt_crypto_unref(crypto);
-	return ret;
+
+	if (!ret)
+		return ret;
+
+	return bt_ad_add_data(client->data, BT_AD_CSIP_RSI, data, sizeof(data));
 }
 
 static struct adv_include {
@@ -756,6 +795,13 @@ static bool parse_data(DBusMessageIter *iter, struct bt_ad *ad)
 		dbus_message_iter_get_fixed_array(&array, &data, &len);
 
 		DBG("Adding Data for type 0x%02x len %u", type, len);
+
+		switch (type) {
+		case BT_AD_CSIP_RSI:
+			if (!validate_rsi(data, len))
+				goto fail;
+			break;
+		}
 
 		if (!bt_ad_add_data(ad, type, data, len))
 			goto fail;
@@ -1344,8 +1390,19 @@ static void add_client_complete(struct btd_adv_client *client, uint8_t status)
 		queue_remove(client->manager->clients, client);
 		g_idle_add(client_free_idle_cb, client);
 
-	} else
+	} else {
+		DBusMessageIter iter;
+
+		/* Check if the attribute has the Instance property */
+		if (g_dbus_proxy_get_property(client->proxy, "Instance",
+								&iter)) {
+			g_dbus_proxy_set_property_basic(client->proxy,
+				"Instance", DBUS_TYPE_BYTE, &client->instance,
+				NULL, NULL, NULL);
+		}
+
 		reply = dbus_message_new_method_return(client->reg);
+	}
 
 	g_dbus_send_message(btd_get_dbus_connection(), reply);
 	dbus_message_unref(client->reg);
@@ -1441,8 +1498,7 @@ static void add_adv_params_callback(uint8_t status, uint16_t length,
 		}
 	}
 
-	param_len = sizeof(struct mgmt_cp_add_advertising) + adv_data_len +
-							scan_rsp_len;
+	param_len = sizeof(*cp) + adv_data_len + scan_rsp_len;
 
 	cp = malloc0(param_len);
 	if (!cp) {

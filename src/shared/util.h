@@ -15,12 +15,20 @@
 #include <stdbool.h>
 #include <alloca.h>
 #include <byteswap.h>
+#include <errno.h>
 #include <string.h>
 #include <sys/types.h>
 #include <sys/uio.h>
+#include <unistd.h>
 
 #define ARRAY_SIZE(arr) (sizeof(arr) / sizeof((arr)[0]))
 #define BIT(n)  (1 << (n))
+
+#undef MIN
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
+
+#undef MAX
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
 
 #if __BYTE_ORDER == __LITTLE_ENDIAN
 #define le16_to_cpu(val) (val)
@@ -87,6 +95,45 @@ do {						\
 #define newa(t, n) ((t*) alloca(sizeof(t)*(n)))
 #define malloc0(n) (calloc(1, (n)))
 
+static inline void freep(void *p)
+{
+	free(*(void **) p);
+}
+
+static inline void *_steal_(void *p)
+{
+	void **orig = (void **) p;
+	void *ret = *orig;
+	*orig = NULL;
+	return ret;
+}
+
+static inline int _steal_fd_(int *fdp)
+{
+	int fd = *fdp;
+	*fdp = -1;
+	return fd;
+}
+
+static inline void closefd(int *fdp)
+{
+	int errno_save = errno;
+	int fd = *fdp;
+	*fdp = -1;
+	if (fd < 0)
+		return;
+	close(fd);
+	errno = errno_save;
+}
+
+#define CLEANUP_FREEFUNC(type, func) \
+	static inline void cleanup_##type (type **_ptr) { (func) (*_ptr); }
+
+#define _cleanup_(f) __attribute__((cleanup(f)))
+#define _cleanup_type_(type) __attribute__((cleanup(cleanup_##type)))
+#define _cleanup_free_ _cleanup_(freep)
+#define _cleanup_fd_ _cleanup_(closefd)
+
 char *strdelimit(char *str, char *del, char c);
 int strsuffix(const char *str, const char *suffix);
 char *strstrip(char *str);
@@ -95,6 +142,13 @@ size_t strnlenutf8(const char *str, size_t len);
 bool strisutf8(const char *str, size_t length);
 bool argsisutf8(int argc, char *argv[]);
 char *strtoutf8(char *str, size_t len);
+
+/*
+ * Return a newly allocated, NUL terminated and whitespace stripped UTF-8
+ * copy of the first len bytes of str, with each ill-formed sequence replaced
+ * by U+FFFD REPLACEMENT CHARACTER. The result must be freed with free().
+ */
+char *str2utf8(const uint8_t *str, size_t len);
 
 void *util_malloc(size_t size);
 void *util_memdup(const void *src, size_t size);

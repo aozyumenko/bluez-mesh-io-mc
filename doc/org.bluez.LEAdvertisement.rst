@@ -35,6 +35,7 @@ versions of the same UUID will be used in the advertising data as appropriate.
 :Service:	org.bluez
 :Interface:	org.bluez.LEAdvertisement1
 :Object path:	freely definable
+:Used by:	**bluetoothctl-advertise(1)**
 
 Methods
 -------
@@ -234,3 +235,9 @@ The provided value is used only if the "CanSetTxPower" feature is enabled on the
 **org.bluez.LEAdvertisingManager(5)**.
 
 Values must be in range [-127 to +20], where units are in dBm.
+
+byte Instance [read-write, optional]
+``````````````````````````````````````
+
+Instance of the advertisement. Set by bluetoothd after advertisement is registered with
+**org.bluez.LEAdvertisingManager(5)**.

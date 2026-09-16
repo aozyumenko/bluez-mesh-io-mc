@@ -811,6 +811,20 @@ static void reverse_discover(struct avdtp *session, GSList *seps, int err,
 	DBG("err %d", err);
 }
 
+static bool a2dp_sep_policy_allowed(struct avdtp *session,
+					const struct a2dp_sep *sep)
+{
+	struct btd_adapter *adapter = avdtp_get_adapter(session);
+	const char *uuid;
+
+	if (sep->type == AVDTP_SEP_TYPE_SOURCE)
+		uuid = A2DP_SOURCE_UUID;
+	else
+		uuid = A2DP_SINK_UUID;
+
+	return btd_adapter_is_uuid_allowed(adapter, uuid);
+}
+
 static gboolean endpoint_setconf_ind(struct avdtp *session,
 						struct avdtp_local_sep *sep,
 						struct avdtp_stream *stream,
@@ -826,6 +840,9 @@ static gboolean endpoint_setconf_ind(struct avdtp *session,
 		DBG("Sink %p: Set_Configuration_Ind", sep);
 	else
 		DBG("Source %p: Set_Configuration_Ind", sep);
+
+	if (!a2dp_sep_policy_allowed(session, a2dp_sep))
+		return FALSE;
 
 	a2dp_stream = a2dp_stream_get(a2dp_sep, session);
 	if (!a2dp_stream)
@@ -905,6 +922,11 @@ static gboolean endpoint_getcap_ind(struct avdtp *session,
 	else
 		DBG("Source %p: Get_Capability_Ind", sep);
 
+	if (!a2dp_sep_policy_allowed(session, a2dp_sep)) {
+		*err = AVDTP_BAD_ACP_SEID;
+		return FALSE;
+	}
+
 	*caps = NULL;
 
 	media_transport = avdtp_service_cap_new(AVDTP_MEDIA_TRANSPORT,
@@ -971,7 +993,7 @@ static void store_remote_sep(void *data, void *user_data)
 {
 	struct a2dp_remote_sep *sep = data;
 	GKeyFile *key_file = user_data;
-	char seid[4], value[256];
+	char seid[4], value[9 + 512];
 	struct avdtp_service_capability *service = avdtp_get_codec(sep->sep);
 	struct avdtp_media_codec_capability *codec;
 	unsigned int i;
@@ -2373,7 +2395,7 @@ static void load_remote_sep(struct a2dp_channel *chan, GKeyFile *key_file,
 		uint8_t codec;
 		uint8_t delay_reporting;
 		GSList *l = NULL;
-		char caps[256];
+		char caps[513];
 		uint8_t data[128];
 		int i, size;
 
@@ -2386,10 +2408,10 @@ static void load_remote_sep(struct a2dp_channel *chan, GKeyFile *key_file,
 			continue;
 
 		/* Try loading with delay_reporting first */
-		if (sscanf(value, "%02hhx:%02hhx:%02hhx:%s", &type, &codec,
+		if (sscanf(value, "%02hhx:%02hhx:%02hhx:%512s", &type, &codec,
 					&delay_reporting, caps) != 4) {
 			/* Try old format */
-			if (sscanf(value, "%02hhx:%02hhx:%s", &type, &codec,
+			if (sscanf(value, "%02hhx:%02hhx:%512s", &type, &codec,
 								caps) != 3) {
 				warn("Unable to load Endpoint: seid %u", rseid);
 				g_free(value);
@@ -2398,7 +2420,16 @@ static void load_remote_sep(struct a2dp_channel *chan, GKeyFile *key_file,
 			delay_reporting = false;
 		}
 
-		for (i = 0, size = strlen(caps); i < size; i += 2) {
+		size = strlen(caps);
+
+		g_free(value);
+
+		if (size % 2 || size / 2 > (int) sizeof(data)) {
+			warn("Unable to load Endpoint: seid %u", rseid);
+			continue;
+		}
+
+		for (i = 0; i < size; i += 2) {
 			uint8_t *tmp = data + i / 2;
 
 			if (sscanf(caps + i, "%02hhx", tmp) != 1) {
@@ -2406,8 +2437,6 @@ static void load_remote_sep(struct a2dp_channel *chan, GKeyFile *key_file,
 				break;
 			}
 		}
-
-		g_free(value);
 
 		if (i != size)
 			continue;
@@ -2851,6 +2880,7 @@ struct a2dp_sep *a2dp_add_sep(struct btd_adapter *adapter, uint8_t type,
 	GSList **l;
 	uint32_t *record_id;
 	sdp_record_t *record;
+	int ret;
 
 	server = find_server(servers, adapter);
 	if (server == NULL) {
@@ -2911,12 +2941,13 @@ struct a2dp_sep *a2dp_add_sep(struct btd_adapter *adapter, uint8_t type,
 		return NULL;
 	}
 
-	if (adapter_service_add(server->adapter, record) < 0) {
+	ret = adapter_service_add(server->adapter, record);
+	if (ret < 0) {
 		error("Unable to register A2DP service record");
 		sdp_record_free(record);
 		a2dp_unregister_sep(sep);
 		if (err)
-			*err = -EINVAL;
+			*err = ret;
 		return NULL;
 	}
 
@@ -3680,8 +3711,11 @@ static void a2dp_source_server_remove(struct btd_profile *p,
 	if (!server)
 		return;
 
+	server->source_enabled = FALSE;
+
 	g_slist_free_full(server->sources,
 					(GDestroyNotify) a2dp_unregister_sep);
+	server->sources = NULL;
 
 	if (server->source_record_id) {
 		adapter_service_remove(server->adapter,
@@ -3689,7 +3723,7 @@ static void a2dp_source_server_remove(struct btd_profile *p,
 		server->source_record_id = 0;
 	}
 
-	if (server->sink_record_id)
+	if (server->sink_enabled)
 		return;
 
 	a2dp_server_unregister(server);
@@ -3727,14 +3761,17 @@ static void a2dp_sink_server_remove(struct btd_profile *p,
 	if (!server)
 		return;
 
+	server->sink_enabled = FALSE;
+
 	g_slist_free_full(server->sinks, (GDestroyNotify) a2dp_unregister_sep);
+	server->sinks = NULL;
 
 	if (server->sink_record_id) {
 		adapter_service_remove(server->adapter, server->sink_record_id);
 		server->sink_record_id = 0;
 	}
 
-	if (server->source_record_id)
+	if (server->source_enabled)
 		return;
 
 	a2dp_server_unregister(server);
@@ -3769,6 +3806,9 @@ static struct btd_profile a2dp_source_profile = {
 
 	.adapter_probe	= a2dp_sink_server_probe,
 	.adapter_remove	= a2dp_sink_server_remove,
+
+	/* Connect source after sink, to prefer sink when conflicting */
+	.after_services = BTD_PROFILE_UUID_CB(NULL, A2DP_SINK_UUID),
 };
 
 static struct btd_profile a2dp_sink_profile = {
@@ -3795,9 +3835,19 @@ static struct btd_adapter_driver media_driver = {
 
 static int a2dp_init(void)
 {
+	int err;
+
 	btd_register_adapter_driver(&media_driver);
-	btd_profile_register(&a2dp_source_profile);
-	btd_profile_register(&a2dp_sink_profile);
+
+	err = btd_profile_register(&a2dp_source_profile);
+	if (err)
+		return err;
+
+	err = btd_profile_register(&a2dp_sink_profile);
+	if (err) {
+		btd_profile_unregister(&a2dp_source_profile);
+		return err;
+	}
 
 	return 0;
 }

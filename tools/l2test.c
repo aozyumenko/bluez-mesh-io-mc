@@ -72,7 +72,7 @@ static int imtu = 672;
 static int omtu = 0;
 
 /* Default FCS option */
-static int fcs = 0x01;
+static int fcs = L2CAP_FCS_CRC16;
 
 /* Default Transmission Window */
 static int txwin_size = 63;
@@ -289,7 +289,7 @@ static int getopts(int sk, struct l2cap_options *opts, bool connected)
 
 	memset(opts, 0, sizeof(*opts));
 
-	if (bdaddr_type == BDADDR_BREDR || rfcmode) {
+	if (bdaddr_type == BDADDR_BREDR) {
 		optlen = sizeof(*opts);
 		return getsockopt(sk, SOL_L2CAP, L2CAP_OPTIONS, opts, &optlen);
 	}
@@ -317,6 +317,13 @@ static int setopts(int sk, struct l2cap_options *opts)
 			return -errno;
 		}
 	}
+
+	/* Older kernel versions may not support BT_SNDMTU so don't check its
+	 * return.
+	 */
+	if (opts->omtu)
+		setsockopt(sk, SOL_BLUETOOTH, BT_SNDMTU, &opts->omtu,
+				sizeof(opts->omtu));
 
 	return setsockopt(sk, SOL_BLUETOOTH, BT_RCVMTU, &opts->imtu,
 							sizeof(opts->imtu));
@@ -351,7 +358,8 @@ static int print_info(int sk, struct l2cap_options *opts)
 	struct sockaddr_l2 addr;
 	socklen_t optlen;
 	struct l2cap_conninfo conn;
-	int prio, phy;
+	int prio;
+	uint32_t phy;
 	char ba[18];
 
 	/* Get connection information */
@@ -406,6 +414,8 @@ static int print_info(int sk, struct l2cap_options *opts)
 		conn.hci_handle, conn.dev_class[2], conn.dev_class[1],
 		conn.dev_class[0], prio, rcvbuf);
 
+
+	optlen = sizeof(phy);
 
 	if (!getsockopt(sk, SOL_BLUETOOTH, BT_PHY, &phy, &optlen)) {
 		syslog(LOG_INFO, "Supported PHY: 0x%08x", phy);
@@ -651,7 +661,7 @@ static void do_listen(void (*handler)(int sk))
 	}
 
 	/* Enable deferred setup */
-	opt = defer_setup;
+	opt = !!defer_setup;
 
 	if (opt && setsockopt(sk, SOL_BLUETOOTH, BT_DEFER_SETUP,
 						&opt, sizeof(opt)) < 0) {
@@ -761,6 +771,8 @@ static void do_listen(void (*handler)(int sk))
 
 		/* Handle deferred setup */
 		if (defer_setup) {
+			int len;
+
 			syslog(LOG_INFO, "Waiting for %d seconds",
 							abs(defer_setup) - 1);
 			sleep(abs(defer_setup) - 1);
@@ -769,6 +781,13 @@ static void do_listen(void (*handler)(int sk))
 				close(nsk);
 				goto error;
 			}
+
+			len = read(sk, buf, buffer_size);
+			if (len < 0)
+				syslog(LOG_ERR, "Initial read error: %s (%d)",
+							strerror(errno), errno);
+			else
+				syslog(LOG_INFO, "Initial bytes %d", len);
 		}
 
 		handler(nsk);
@@ -790,15 +809,6 @@ static void dump_mode(int sk)
 
 	if (data_size < 0)
 		data_size = imtu;
-
-	if (defer_setup) {
-		len = read(sk, buf, data_size);
-		if (len < 0)
-			syslog(LOG_ERR, "Initial read error: %s (%d)",
-						strerror(errno), errno);
-		else
-			syslog(LOG_INFO, "Initial bytes %d", len);
-	}
 
 	syslog(LOG_INFO, "Receiving ...");
 	while (1) {
@@ -850,15 +860,6 @@ static void recv_mode(int sk)
 
 	if (data_size < 0)
 		data_size = imtu;
-
-	if (defer_setup) {
-		len = read(sk, buf, data_size);
-		if (len < 0)
-			syslog(LOG_ERR, "Initial read error: %s (%d)",
-						strerror(errno), errno);
-		else
-			syslog(LOG_INFO, "Initial bytes %d", len);
-	}
 
 	if (recv_delay)
 		usleep(recv_delay);
@@ -1334,6 +1335,9 @@ static void usage(void)
 		"\t[-I imtu] [-O omtu]\n"
 		"\t[-L seconds] enable SO_LINGER\n"
 		"\t[-W seconds] enable deferred setup\n"
+		"\t   0: don't enable (default)\n"
+		"\t  >0: authorize after <seconds>\n"
+		"\t  <0: deny after abs(<seconds>)\n"
 		"\t[-B filename] use data packets from file\n"
 		"\t[-N num] send num frames (default = infinite)\n"
 		"\t[-C num] send num frames before delay (default = 1)\n"
@@ -1342,7 +1346,7 @@ static void usage(void)
 		"\t[-g milliseconds] delay before disconnecting (default = 0)\n"
 		"\t[-X mode] l2cap mode (help for list, default = basic)\n"
 		"\t[-a policy] chan policy (help for list, default = bredr)\n"
-		"\t[-F fcs] use CRC16 check (default = 1)\n"
+		"\t[-F fcs] use CRC16 check (default = 1, affects BR/EDR only)\n"
 		"\t[-Q num] Max Transmit value (default = 3)\n"
 		"\t[-Z size] Transmission Window size (default = 63)\n"
 		"\t[-Y priority] socket priority\n"

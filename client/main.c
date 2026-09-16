@@ -39,6 +39,7 @@
 #include "assistant.h"
 #include "hci.h"
 #include "telephony.h"
+#include "cs.h"
 
 /* String display constants */
 #define COLORED_NEW	COLOR_GREEN "NEW" COLOR_OFF
@@ -68,6 +69,8 @@ static char *default_local_attr;
 static GDBusProxy *default_attr;
 static GList *ctrl_list;
 static GList *battery_proxies;
+static GList *ranging_proxies;
+static GList *ranging_manager_proxies;
 
 static const char *agent_arguments[] = {
 	"on",
@@ -120,10 +123,16 @@ static void disconnect_handler(DBusConnection *connection, void *user_data)
 
 	g_list_free_full(ctrl_list, proxy_leak);
 	g_list_free_full(battery_proxies, proxy_leak);
+	g_list_free_full(ranging_proxies, proxy_leak);
+	g_list_free_full(ranging_manager_proxies, proxy_leak);
 	ctrl_list = NULL;
 	battery_proxies = NULL;
+	ranging_proxies = NULL;
+	ranging_manager_proxies = NULL;
 
 	default_ctrl = NULL;
+	cs_set_device_list(NULL);
+	cs_disconnected();
 }
 
 static void print_adapter(GDBusProxy *proxy, const char *description)
@@ -356,6 +365,65 @@ static void battery_removed(GDBusProxy *proxy)
 	battery_proxies = g_list_remove(battery_proxies, proxy);
 }
 
+static void ranging_added(GDBusProxy *proxy)
+{
+	ranging_proxies = g_list_append(ranging_proxies, proxy);
+}
+
+static void ranging_removed(GDBusProxy *proxy)
+{
+	ranging_proxies = g_list_remove(ranging_proxies, proxy);
+}
+
+static GDBusProxy *find_proxies_by_path(GList *source, const char *path);
+
+/* Hand cs.c the RangingProviderManager1 of the default controller, if it
+ * has one. Called whenever either side changes, since the manager proxy
+ * and the adapter proxy can arrive in either order and the default
+ * controller can be changed later with "select".
+ */
+static void update_ranging_manager(void)
+{
+	GDBusProxy *manager = NULL;
+
+	if (default_ctrl)
+		manager = find_proxies_by_path(ranging_manager_proxies,
+				g_dbus_proxy_get_path(default_ctrl->proxy));
+
+	cs_set_ranging_manager(manager);
+}
+
+static void ranging_manager_added(GDBusProxy *proxy)
+{
+	ranging_manager_proxies = g_list_append(ranging_manager_proxies,
+									proxy);
+	update_ranging_manager();
+}
+
+static void ranging_manager_removed(GDBusProxy *proxy)
+{
+	ranging_manager_proxies = g_list_remove(ranging_manager_proxies,
+									proxy);
+	update_ranging_manager();
+}
+
+static void print_distance_cm(GDBusProxy *proxy, const char *label)
+{
+	DBusMessageIter iter;
+	dbus_uint32_t mm;
+
+	if (g_dbus_proxy_get_property(proxy, "Distance",
+						&iter) == FALSE)
+		return;
+
+	if (dbus_message_iter_get_arg_type(&iter) != DBUS_TYPE_UINT32)
+		return;
+
+	dbus_message_iter_get_basic(&iter, &mm);
+
+	bt_shell_printf("\t%s: %.1f cm\n", label, mm / 10.0);
+}
+
 static void device_added(GDBusProxy *proxy)
 {
 	DBusMessageIter iter;
@@ -391,8 +459,11 @@ static struct adapter *adapter_new(GDBusProxy *proxy)
 
 	ctrl_list = g_list_append(ctrl_list, adapter);
 
-	if (!default_ctrl)
+	if (!default_ctrl) {
 		default_ctrl = adapter;
+		cs_set_device_list(&adapter->devices);
+		update_ranging_manager();
+	}
 
 	return adapter;
 }
@@ -525,6 +596,12 @@ static void proxy_added(GDBusProxy *proxy, void *user_data)
 		bearer_added(proxy);
 	} else if (!strcmp(interface, "org.bluez.Bearer.LE1")) {
 		bearer_added(proxy);
+	} else if (!strcmp(interface, "org.bluez.ChannelSounding1")) {
+		cs_proxy_added(proxy);
+	} else if (!strcmp(interface, "org.bluez.Ranging1")) {
+		ranging_added(proxy);
+	} else if (!strcmp(interface, "org.bluez.RangingProviderManager1")) {
+		ranging_manager_added(proxy);
 	}
 }
 
@@ -656,6 +733,12 @@ static void proxy_removed(GDBusProxy *proxy, void *user_data)
 		bearer_removed(proxy);
 	} else if (!strcmp(interface, "org.bluez.Bearer.LE1")) {
 		bearer_removed(proxy);
+	} else if (!strcmp(interface, "org.bluez.ChannelSounding1")) {
+		cs_proxy_removed(proxy);
+	} else if (!strcmp(interface, "org.bluez.Ranging1")) {
+		ranging_removed(proxy);
+	} else if (!strcmp(interface, "org.bluez.RangingProviderManager1")) {
+		ranging_manager_removed(proxy);
 	}
 }
 
@@ -687,6 +770,14 @@ static GDBusProxy *find_proxies_by_path(GList *source, const char *path)
 	return NULL;
 }
 
+static bool filter_match_pattern(const char *pattern)
+{
+	if (!filter.active || !filter.pattern || !pattern)
+		return false;
+
+	return !strcmp(filter.pattern, pattern);
+}
+
 static void property_changed(GDBusProxy *proxy, const char *name,
 					DBusMessageIter *iter, void *user_data)
 {
@@ -699,12 +790,11 @@ static void property_changed(GDBusProxy *proxy, const char *name,
 		if (default_ctrl && proxy_is_child(proxy,
 					default_ctrl->proxy) == TRUE) {
 			DBusMessageIter addr_iter;
+			const char *address = NULL;
 			char *str;
 
 			if (g_dbus_proxy_get_property(proxy, "Address",
 							&addr_iter) == TRUE) {
-				const char *address;
-
 				dbus_message_iter_get_basic(&addr_iter,
 								&address);
 				str = g_strdup_printf("[" COLORED_CHG
@@ -721,6 +811,23 @@ static void property_changed(GDBusProxy *proxy, const char *name,
 					set_default_device(proxy, NULL);
 				else if (!connected && default_dev == proxy)
 					set_default_device(NULL, NULL);
+
+				if (!connected)
+					cs_device_disconnected(
+						g_dbus_proxy_get_path(proxy));
+
+				/* If the device is connected and the filter
+				 * is auto_connect and it matches the pattern,
+				 * stop discovery.
+				 */
+				if (connected && filter.auto_connect &&
+						filter_match_pattern(address))
+					g_dbus_proxy_method_call(
+							default_ctrl->proxy,
+							"StopDiscovery",
+							NULL, NULL,
+							GUINT_TO_POINTER(false),
+							NULL);
 			}
 
 			print_iter(str, name, iter);
@@ -801,6 +908,23 @@ static void property_changed(GDBusProxy *proxy, const char *name,
 			print_iter(str, name, iter);
 			g_free(str);
 		}
+	} else if (!strcmp(interface, "org.bluez.ChannelSounding1")) {
+		if (!strcmp(name, "Active")) {
+			dbus_bool_t active;
+
+			dbus_message_iter_get_basic(iter, &active);
+			if (active)
+				cs_measurement_started(proxy);
+			else
+				cs_measurement_stopped(proxy);
+		}
+	} else if (!strcmp(interface, "org.bluez.Ranging1")) {
+		if (!strcmp(name, "Distance")) {
+			const char *path = g_dbus_proxy_get_path(proxy);
+			const char *leaf = strrchr(path, '/');
+
+			print_distance_cm(proxy, leaf ? leaf + 1 : path);
+		}
 	}
 }
 
@@ -859,6 +983,14 @@ static struct adapter *find_ctrl_by_address(GList *source, const char *address)
 	}
 
 	return NULL;
+}
+
+GDBusProxy *bluetoothctl_get_default_controller(void)
+{
+	if (!default_ctrl)
+		return NULL;
+
+	return default_ctrl->proxy;
 }
 
 static GDBusProxy *find_proxies_by_iface(GList *source, const char *path,
@@ -1070,6 +1202,8 @@ static void cmd_select(int argc, char *argv[])
 		return bt_shell_noninteractive_quit(EXIT_SUCCESS);
 
 	default_ctrl = adapter;
+	cs_set_device_list(&adapter->devices);
+	update_ranging_manager();
 	print_adapter(adapter->proxy, NULL);
 
 	return bt_shell_noninteractive_quit(EXIT_SUCCESS);
@@ -1839,6 +1973,8 @@ static void cmd_info(int argc, char *argv[])
 {
 	GDBusProxy *proxy;
 	GDBusProxy *battery_proxy;
+	GDBusProxy *cs_proxy;
+	GDBusProxy *ranging_proxy;
 	GDBusProxy *bearer;
 	DBusMessageIter iter;
 	const char *address;
@@ -1890,6 +2026,16 @@ static void cmd_info(int argc, char *argv[])
 					g_dbus_proxy_get_path(proxy));
 	print_property_with_label(battery_proxy, "Percentage",
 					"Battery Percentage");
+
+	cs_proxy = cs_find_proxy(g_dbus_proxy_get_path(proxy));
+	if (cs_proxy)
+		print_property_with_label(cs_proxy, "Active",
+				"CS Session Active");
+
+	ranging_proxy = find_proxies_by_path(ranging_proxies,
+				g_dbus_proxy_get_path(proxy));
+	if (ranging_proxy)
+		print_distance_cm(ranging_proxy, "Ranging Distance");
 
 	bearer = find_proxies_by_iface(default_ctrl->bearers,
 				      g_dbus_proxy_get_path(proxy),
@@ -2210,12 +2356,45 @@ static void connect_reply(DBusMessage *message, void *user_data)
 	return bt_shell_noninteractive_quit(EXIT_SUCCESS);
 }
 
+static void prompt_scan_connect(const char *input, void *user_data)
+{
+	char *address = user_data;
+
+	if (!strcmp(input, "yes") || !strcmp(input, "y")) {
+		dbus_bool_t enable = TRUE;
+
+		free(filter.pattern);
+		filter.pattern = address;
+		filter.auto_connect = true;
+
+		filter.set = false;
+		set_discovery_filter(false);
+
+		if (!g_dbus_proxy_method_call(default_ctrl->proxy,
+						"StartDiscovery",
+						NULL, start_discovery_reply,
+						GUINT_TO_POINTER(enable),
+						NULL)) {
+			bt_shell_printf("Failed to start discovery\n");
+			return bt_shell_noninteractive_quit(EXIT_FAILURE);
+		}
+
+		return;
+	}
+
+	free(address);
+
+	return bt_shell_noninteractive_quit(EXIT_FAILURE);
+}
+
 static void cmd_connect(int argc, char *argv[])
 {
 	struct connection_data *data;
 	const char *method = "Connect";
 	char profile[128] = "";
 	GDBusProxy *proxy;
+	dbus_bool_t discovering;
+	DBusMessageIter iter;
 
 	if (check_default_ctrl() == FALSE)
 		return bt_shell_noninteractive_quit(EXIT_FAILURE);
@@ -2223,7 +2402,19 @@ static void cmd_connect(int argc, char *argv[])
 	proxy = find_proxy_by_address(default_ctrl->devices, argv[1]);
 	if (!proxy) {
 		bt_shell_printf("Device %s not available\n", argv[1]);
-		return bt_shell_noninteractive_quit(EXIT_FAILURE);
+
+		if (g_dbus_proxy_get_property(default_ctrl->proxy,
+					"Discovering", &iter)) {
+			dbus_message_iter_get_basic(&iter, &discovering);
+
+			if (!discovering)
+				bt_shell_prompt_input(argv[1],
+					"Scan and connect (yes,no):",
+					prompt_scan_connect,
+					strdup(argv[1]));
+
+		}
+		return;
 	}
 
 	data = new0(struct connection_data, 1);
@@ -2867,6 +3058,17 @@ static char *scan_generator(const char *text, int state)
 	return argument_generator(text, state, scan_arguments);
 }
 
+static const char *public_broadcast_arguments[] = {
+	"sq",
+	"hq",
+	NULL
+};
+
+static char *public_broadcast_generator(const char *text, int state)
+{
+	return argument_generator(text, state, public_broadcast_arguments);
+}
+
 static void cmd_advertise(int argc, char *argv[])
 {
 	dbus_bool_t enable;
@@ -2915,6 +3117,11 @@ static void cmd_advertise_manufacturer(int argc, char *argv[])
 static void cmd_advertise_data(int argc, char *argv[])
 {
 	ad_advertise_data(dbus_conn, AD_TYPE_AD, argc, argv);
+}
+
+static void cmd_advertise_public_broadcast(int argc, char *argv[])
+{
+	ad_advertise_public_broadcast(dbus_conn, argc, argv);
 }
 
 static void cmd_advertise_sr_uuids(int argc, char *argv[])
@@ -3135,6 +3342,11 @@ static void cmd_advertise_rsi(int argc, char *argv[])
 		return bt_shell_noninteractive_quit(EXIT_FAILURE);
 
 	ad_advertise_rsi(dbus_conn, &value);
+}
+
+static void cmd_advertise_instance(int argc, char *argv[])
+{
+	ad_advertise_instance();
 }
 
 static void ad_clear_uuids(void)
@@ -3600,6 +3812,9 @@ static const struct bt_shell_menu advertise_menu = {
 			"Set/Get advertise manufacturer data" },
 	{ "data", "[type] [data=xx xx ...]", cmd_advertise_data,
 			"Set/Get advertise data" },
+	{ "public-broadcast", "[sq/hq]", cmd_advertise_public_broadcast,
+			"Set/Get BLE Audio Public Broadcast Announcement",
+			public_broadcast_generator },
 	{ "sr-uuids", "[uuid1 uuid2 ...]", cmd_advertise_sr_uuids,
 			"Set/Get scan response uuids" },
 	{ "sr-solicit", "[uuid1 uuid2 ...]", cmd_advertise_sr_solicit,
@@ -3633,6 +3848,8 @@ static const struct bt_shell_menu advertise_menu = {
 			"Set/Get advertise interval range" },
 	{ "rsi", "[on/off]", cmd_advertise_rsi,
 			"Show/Enable/Disable RSI to be advertised", NULL },
+	{ "instance", NULL, cmd_advertise_instance,
+					"Show advertisement instance number" },
 	{ "clear", "[uuids/service/manufacturer/config-name...]", cmd_ad_clear,
 			"Clear advertise config" },
 	{ } },
@@ -3924,6 +4141,7 @@ int main(int argc, char *argv[])
 	assistant_add_submenu();
 	hci_add_submenu();
 	telephony_add_submenu();
+	cs_add_submenu();
 	bt_shell_set_prompt(PROMPT_OFF, NULL);
 
 	bt_shell_handle_non_interactive_help();
@@ -3935,6 +4153,7 @@ int main(int argc, char *argv[])
 
 	dbus_conn = g_dbus_setup_bus(DBUS_BUS_SYSTEM, NULL, NULL);
 	g_dbus_attach_object_manager(dbus_conn);
+	cs_set_dbus_conn(dbus_conn);
 
 	bt_shell_set_env("DBUS_CONNECTION", dbus_conn);
 
@@ -3965,6 +4184,7 @@ int main(int argc, char *argv[])
 	assistant_remove_submenu();
 	hci_remove_submenu();
 	telephony_remove_submenu();
+	cs_remove_submenu();
 
 	g_dbus_client_unref(client);
 

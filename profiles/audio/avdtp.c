@@ -1556,6 +1556,12 @@ static gboolean avdtp_setconf_cmd(struct avdtp *session, uint8_t transaction,
 		goto failed;
 	}
 
+	/* check if SEID is in use */
+	if (find_stream_by_lsep(session, sep)) {
+		err = AVDTP_SEP_IN_USE;
+		goto failed;
+	}
+
 	switch (sep->info.type) {
 	case AVDTP_SEP_TYPE_SOURCE:
 		service = btd_device_get_service(session->device,
@@ -1641,7 +1647,6 @@ static gboolean avdtp_getconf_cmd(struct avdtp *session, uint8_t transaction,
 					struct seid_req *req, int size)
 {
 	GSList *l;
-	struct avdtp_local_sep *sep = NULL;
 	struct avdtp_stream *stream;
 	int rsp_size;
 	uint8_t err;
@@ -1656,7 +1661,7 @@ static gboolean avdtp_getconf_cmd(struct avdtp *session, uint8_t transaction,
 	memset(buf, 0, sizeof(buf));
 
 	stream = find_stream_by_lseid(session, req->acp_seid);
-	if (!sep) {
+	if (!stream) {
 		err = AVDTP_BAD_ACP_SEID;
 		goto failed;
 	}
@@ -1772,13 +1777,14 @@ static gboolean avdtp_open_cmd(struct avdtp *session, uint8_t transaction,
 		return FALSE;
 	}
 
-	stream = find_stream_by_lseid(session, req->acp_seid);
-	if (!stream) {
+	sep = find_local_sep_by_seid(session, req->acp_seid);
+	if (!sep) {
 		err = AVDTP_BAD_ACP_SEID;
 		goto failed;
 	}
 
-	if (stream->state != AVDTP_STATE_CONFIGURED) {
+	stream = find_stream_by_lsep(session, sep);
+	if (!stream || stream->state != AVDTP_STATE_CONFIGURED) {
 		err = AVDTP_BAD_STATE;
 		goto failed;
 	}
@@ -1791,7 +1797,6 @@ static gboolean avdtp_open_cmd(struct avdtp *session, uint8_t transaction,
 							AVDTP_OPEN, NULL, 0);
 	}
 
-	sep = stream->lsep;
 	if (sep->ind && sep->ind->open && !session->pending_open) {
 		if (!sep->ind->open(session, sep, stream, &err,
 					sep->user_data))

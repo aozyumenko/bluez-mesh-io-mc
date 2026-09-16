@@ -407,7 +407,8 @@ static const unsigned char invalid_utf8_name_data[] = {
 static const struct test_data invalid_utf8_name_test = {
 	.eir_data = invalid_utf8_name_data,
 	.eir_size = sizeof(invalid_utf8_name_data),
-	.name = "test परी",
+	/* The truncated sequence is replaced by U+FFFD, the rest is kept */
+	.name = "test परी" "\xef\xbf\xbd" "्षा invalid",
 	.name_complete = true,
 	.tx_power = 127,
 };
@@ -435,10 +436,70 @@ static const unsigned char iso_2022_jp_name_data[] = {
 static const struct test_data iso_2022_jp_name_test = {
 	.eir_data = iso_2022_jp_name_data,
 	.eir_size = sizeof(iso_2022_jp_name_data),
-	.name = "test \033$B",
+	/* The 4 JIS bytes are replaced by U+FFFD, the escapes are ASCII */
+	.name = "test \033$B" "\xef\xbf\xbd\xef\xbf\xbd\xef\xbf\xbd\xef\xbf\xbd"
+								"\033(B OK",
 	.name_complete = true,
 	.tx_power = 127,
 };
+
+/*
+ * A complete local name of HCI_MAX_NAME_LENGTH bytes, the longest one that
+ * fits the buffer eir_parse() copies the name into.
+ */
+static unsigned char max_name_data[HCI_MAX_NAME_LENGTH + 2];
+static char max_name[HCI_MAX_NAME_LENGTH + 1];
+
+static const struct test_data max_name_test = {
+	.eir_data = max_name_data,
+	.eir_size = sizeof(max_name_data),
+	.name = max_name,
+	.name_complete = true,
+	.tx_power = 127,
+};
+
+static void max_name_setup(const void *data)
+{
+	max_name_data[0] = sizeof(max_name_data) - 1;
+	max_name_data[1] = EIR_NAME_COMPLETE;
+	memset(max_name_data + 2, 'A', HCI_MAX_NAME_LENGTH);
+
+	memset(max_name, 'A', HCI_MAX_NAME_LENGTH);
+	max_name[HCI_MAX_NAME_LENGTH] = '\0';
+
+	tester_setup_complete();
+}
+
+/*
+ * The longest complete local name eir_parse() can be handed at all, which is
+ * bounded by the EIR length being a single byte. That is 253 bytes, more than
+ * the buffer it is copied into, so this used to overflow it.
+ */
+static unsigned char long_name_data[255];
+static char long_name[sizeof(long_name_data) - 2 + 1];
+
+/* str2utf8() does not clamp, so the whole name is kept */
+#define LONG_NAME_LEN	(sizeof(long_name_data) - 2)
+
+static const struct test_data long_name_test = {
+	.eir_data = long_name_data,
+	.eir_size = sizeof(long_name_data),
+	.name = long_name,
+	.name_complete = true,
+	.tx_power = 127,
+};
+
+static void long_name_setup(const void *data)
+{
+	long_name_data[0] = sizeof(long_name_data) - 1;
+	long_name_data[1] = EIR_NAME_COMPLETE;
+	memset(long_name_data + 2, 'B', sizeof(long_name_data) - 2);
+
+	memset(long_name, 'B', LONG_NAME_LEN);
+	long_name[LONG_NAME_LEN] = '\0';
+
+	tester_setup_complete();
+}
 
 static const unsigned char bluesc_data[] = {
 		0x02, 0x01, 0x06, 0x03, 0x02, 0x16, 0x18, 0x12,
@@ -587,7 +648,7 @@ static void print_debug(const char *str, void *user_data)
 static void test_ad(const struct test_data *test, struct eir_data *eir)
 {
 	struct bt_ad *ad;
-	GSList *list;
+	const struct queue_entry *q;
 
 	ad = bt_ad_new_with_data(test->eir_size, test->eir_data);
 	g_assert(ad);
@@ -607,8 +668,8 @@ static void test_ad(const struct test_data *test, struct eir_data *eir)
 		}
 	}
 
-	for (list = eir->msd_list; list; list = list->next) {
-		struct eir_msd *msd = list->data;
+	for (q = queue_get_entries(eir->msd_list); q; q = q->next) {
+		struct eir_msd *msd = q->data;
 		struct bt_ad_manufacturer_data adm;
 
 		adm.manufacturer_id = msd->company;
@@ -618,8 +679,8 @@ static void test_ad(const struct test_data *test, struct eir_data *eir)
 		g_assert(bt_ad_has_manufacturer_data(ad, &adm));
 	}
 
-	for (list = eir->sd_list; list; list = list->next) {
-		struct eir_sd *sd = list->data;
+	for (q = queue_get_entries(eir->sd_list); q; q = q->next) {
+		struct eir_sd *sd = q->data;
 		struct bt_ad_service_data ads;
 
 		bt_string_to_uuid(&ads.uuid, sd->uuid);
@@ -636,7 +697,7 @@ static void test_parsing(gconstpointer data)
 {
 	const struct test_data *test = data;
 	struct eir_data eir;
-	GSList *list;
+	const struct queue_entry *q;
 
 	memset(&eir, 0, sizeof(eir));
 
@@ -646,8 +707,8 @@ static void test_parsing(gconstpointer data)
 	tester_debug("Name: %s", eir.name);
 	tester_debug("TX power: %d", eir.tx_power);
 
-	for (list = eir.services; list; list = list->next) {
-		char *uuid_str = list->data;
+	for (q = queue_get_entries(eir.services); q; q = q->next) {
+		char *uuid_str = q->data;
 
 		tester_debug("UUID: %s", uuid_str);
 	}
@@ -664,11 +725,10 @@ static void test_parsing(gconstpointer data)
 	g_assert(eir.tx_power == test->tx_power);
 
 	if (test->uuid) {
-		GSList *list;
 		int n = 0;
 
-		for (list = eir.services; list; list = list->next, n++) {
-			char *uuid_str = list->data;
+		for (q = queue_get_entries(eir.services); q; q = q->next, n++) {
+			char *uuid_str = q->data;
 			g_assert(test->uuid[n]);
 			g_assert_cmpstr(test->uuid[n], ==, uuid_str);
 		}
@@ -676,16 +736,16 @@ static void test_parsing(gconstpointer data)
 		g_assert(eir.services == NULL);
 	}
 
-	for (list = eir.msd_list; list; list = list->next) {
-		struct eir_msd *msd = list->data;
+	for (q = queue_get_entries(eir.msd_list); q; q = q->next) {
+		struct eir_msd *msd = q->data;
 
 		tester_debug("Manufacturer ID: 0x%04x", msd->company);
 		util_hexdump(' ', msd->data, msd->data_len, print_debug,
 							"Manufacturer Data:");
 	}
 
-	for (list = eir.sd_list; list; list = list->next) {
-		struct eir_sd *sd = list->data;
+	for (q = queue_get_entries(eir.sd_list); q; q = q->next) {
+		struct eir_sd *sd = q->data;
 
 		tester_debug("Service UUID: %s", sd->uuid);
 		util_hexdump(' ', sd->data, sd->data_len, print_debug,
@@ -756,6 +816,10 @@ int main(int argc, char *argv[])
 	tester_add("/eir/utf16-name", &utf16_name_test, NULL, test_parsing,
 									NULL);
 	tester_add("/eir/iso-2022-jp-name", &iso_2022_jp_name_test, NULL,
+							test_parsing, NULL);
+	tester_add("/eir/max-name", &max_name_test, max_name_setup,
+							test_parsing, NULL);
+	tester_add("/eir/long-name", &long_name_test, long_name_setup,
 							test_parsing, NULL);
 	tester_add("/ad/bluesc", &bluesc_test, NULL, test_parsing, NULL);
 	tester_add("/ad/wahooscale", &wahoo_scale_test, NULL, test_parsing,

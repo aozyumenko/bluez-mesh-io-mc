@@ -55,7 +55,6 @@ tools/hciconfig
 tools/hcieventmask
 tools/hcisecfilter
 tools/hcitool
-tools/hcidump
 tools/hid2hci
 tools/rfcomm
 tools/l2ping
@@ -93,21 +92,22 @@ tools/btgatt-server
 tools/create-image
 tools/test-runner
 tools/check-selftest
-tools/mcaptest
 tools/bneptest
 tools/isotest
 tools/iso-tester
-test/sap_client.pyc
 test/bluezutils.pyc
 unit/test-tester
 unit/test-ringbuf
 unit/test-queue
+unit/test-util
 unit/test-eir
 unit/test-uuid
 unit/test-crc
 unit/test-textfile
 unit/test-gdbus-client
+unit/test-media-player
 unit/test-sdp
+unit/test-sdp-xml
 unit/test-lib
 unit/test-mgmt
 unit/test-uhid
@@ -118,9 +118,11 @@ unit/test-hog
 unit/test-bap
 unit/test-bass
 unit/test-battery
+unit/test-fastpair
 unit/test-tmap
 unit/test-gmap
 unit/test-mcp
+unit/test-rap
 unit/test-profile
 tools/mgmt-tester
 tools/smp-tester
@@ -134,8 +136,8 @@ tools/btattach
 tools/btconfig
 tools/btmgmt
 tools/btsnoop
-tools/btpclient
-tools/btpclientctl
+client/btpclient/btpclient
+client/btpclient/btpclientctl
 tools/btmon-logger
 tools/bluetooth-logger.service
 tools/mpris-proxy.service
@@ -150,9 +152,9 @@ tools/mesh-cfgclient
 tools/mesh-cfgtest
 tools/mesh-tester
 mesh/bluetooth-meshd
-mesh/bluetooth-meshd.rst
+doc/bluetooth-meshd.rst
 
-src/bluetoothd.rst
+doc/bluetoothd.rst
 src/bluetooth.service
 mesh/bluetooth-mesh.service
 

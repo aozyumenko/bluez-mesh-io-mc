@@ -334,7 +334,7 @@ static int bass_build_bcast_src(struct bt_bcast_src *bcast_src,
 	if (num_subgroups == 0)
 		goto done;
 
-	subgroup_data = new0(struct bt_bass_subgroup_data, 1);
+	subgroup_data = new0(struct bt_bass_subgroup_data, num_subgroups);
 	if (!subgroup_data) {
 		DBG(bcast_src->bass, "Unable to allocate memory");
 		return -1;
@@ -1929,6 +1929,12 @@ int bt_bass_clear_bis_sync(struct bt_bcast_src *bcast_src, uint8_t bis)
 
 		if (sgrp->bis_sync & bitmask) {
 			sgrp->bis_sync &= ~bitmask;
+
+			/* If there are no BIS index left then reset encryption
+			 * state to no encryption.
+			 */
+			if (!sgrp->bis_sync)
+				bcast_src->enc = BT_BASS_BIG_ENC_STATE_NO_ENC;
 
 			iov = bass_parse_bcast_src(bcast_src);
 			if (!iov)

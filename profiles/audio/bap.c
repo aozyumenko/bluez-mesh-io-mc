@@ -139,6 +139,8 @@ struct bap_data {
 	struct queue *bcast_snks;
 	struct queue *server_streams;
 	GIOChannel *listen_io;
+	bool pa_synced;
+	unsigned int pa_timer;
 	unsigned int io_id;
 	unsigned int cig_update_id;
 	bool services_ready;
@@ -174,6 +176,11 @@ static void setup_free(void *data);
 
 static void bap_data_free(struct bap_data *data)
 {
+	struct queue *bcast_snks = data->bcast_snks;
+
+	if (data->pa_timer)
+		g_source_remove(data->pa_timer);
+
 	if (data->listen_io) {
 		g_io_channel_shutdown(data->listen_io, TRUE, NULL);
 		g_io_channel_unref(data->listen_io);
@@ -189,7 +196,9 @@ static void bap_data_free(struct bap_data *data)
 	queue_destroy(data->srcs, ep_unregister);
 	queue_destroy(data->bcast, ep_unregister);
 	queue_destroy(data->server_streams, NULL);
-	queue_destroy(data->bcast_snks, setup_free);
+	data->bcast_snks = NULL;
+	queue_destroy(bcast_snks, setup_free);
+
 	bt_bap_ready_unregister(data->bap, data->ready_id);
 	bt_bap_state_unregister(data->bap, data->state_id);
 	bt_bap_pac_unregister(data->bap, data->pac_id);
@@ -424,15 +433,15 @@ static gboolean get_qos(const GDBusPropertyTable *property,
 		return FALSE;
 
 	dict_append_entry(&dict, "Framing", DBUS_TYPE_BYTE, &qos->framing);
-	dict_append_entry(&dict, "PHY", DBUS_TYPE_BYTE, &qos->phy);
+	dict_append_entry(&dict, "PHY", DBUS_TYPE_BYTE, &qos->phys);
 	dict_append_entry(&dict, "Retransmissions", DBUS_TYPE_BYTE, &qos->rtn);
 	dict_append_entry(&dict, "MaximumLatency", DBUS_TYPE_UINT16,
 					&qos->latency);
-	dict_append_entry(&dict, "MimimumDelay", DBUS_TYPE_UINT32,
+	dict_append_entry(&dict, "MinimumDelay", DBUS_TYPE_UINT32,
 					&qos->pd_min);
 	dict_append_entry(&dict, "MaximumDelay", DBUS_TYPE_UINT32,
 					&qos->pd_max);
-	dict_append_entry(&dict, "PreferredMimimumDelay", DBUS_TYPE_UINT32,
+	dict_append_entry(&dict, "PreferredMinimumDelay", DBUS_TYPE_UINT32,
 					&qos->ppd_min);
 	dict_append_entry(&dict, "PreferredMaximumDelay", DBUS_TYPE_UINT32,
 					&qos->ppd_max);
@@ -590,7 +599,7 @@ static int parse_io_qos(const char *key, int var, DBusMessageIter *iter,
 		if (var != DBUS_TYPE_BYTE)
 			return -EINVAL;
 
-		dbus_message_iter_get_basic(iter, &qos->phy);
+		dbus_message_iter_get_basic(iter, &qos->phys);
 	} else if (!strcasecmp(key, "SDU")) {
 		if (var != DBUS_TYPE_UINT16)
 			return -EINVAL;
@@ -1104,6 +1113,9 @@ static void setup_free(void *data)
 	if (setup->ep)
 		queue_remove(setup->ep->setups, setup);
 
+	if (setup->data)
+		queue_remove(setup->data->bcast_snks, setup);
+
 	setup_io_close(setup, NULL);
 
 	util_iov_free(setup->caps, 1);
@@ -1138,7 +1150,7 @@ static bool match_io_qos(const struct bt_bap_io_qos *io_qos,
 	if (io_qos->sdu != match->sdu)
 		return false;
 
-	if (io_qos->phy != match->phy)
+	if (io_qos->phys != match->phys)
 		return false;
 
 	if (io_qos->rtn != match->rtn)
@@ -1467,7 +1479,10 @@ static void iso_bcast_confirm_cb(GIOChannel *io, GError *err, void *user_data)
 	int fd;
 	struct bap_data *bap_data = setup->data;
 
-	DBG("BIG Sync completed");
+	if (err)
+		error("BIG Sync failed: %s", err->message);
+	else
+		DBG("BIG Sync completed");
 
 	/* The order of the BIS fds notified from kernel corresponds
 	 * to the order of the BISes that were enqueued before
@@ -1495,6 +1510,7 @@ static void iso_bcast_confirm_cb(GIOChannel *io, GError *err, void *user_data)
 
 static void create_stream_for_bis(struct bap_data *bap_data,
 				struct bt_bap_pac *lpac, uint8_t sid,
+				uint8_t bis, uint8_t sgrp,
 				struct bt_bap_qos *qos, struct iovec *caps,
 				struct iovec *meta, char *path)
 {
@@ -1505,6 +1521,8 @@ static void create_stream_for_bis(struct bap_data *bap_data,
 
 	/* Create an internal copy for bcode */
 	setup->qos.bcast.bcode = util_iov_dup(qos->bcast.bcode, 1);
+	setup->qos.bcast.big = sgrp;
+	setup->qos.bcast.bis = bis;
 
 	setup->data = bap_data;
 
@@ -1543,7 +1561,65 @@ static void bis_handler(uint8_t sid, uint8_t bis, uint8_t sgrp,
 			sid, bis) < 0)
 		return;
 
-	create_stream_for_bis(data, lpac, sid, qos, caps, meta, path);
+	create_stream_for_bis(data, lpac, sid, bis, sgrp, qos, caps, meta,
+									path);
+}
+
+/* Time a PA sync is kept around waiting for a stream to be enabled,
+ * before it is released.
+ */
+#define PA_SYNC_GRACE_TIMEOUT 5
+
+static void pa_sync_release(struct bap_data *data)
+{
+	if (!data->pa_synced)
+		return;
+
+	DBG("Release PA sync");
+
+	if (data->pa_timer) {
+		g_source_remove(data->pa_timer);
+		data->pa_timer = 0;
+	}
+
+	if (data->listen_io) {
+		g_io_channel_shutdown(data->listen_io, TRUE, NULL);
+		g_io_channel_unref(data->listen_io);
+		data->listen_io = NULL;
+	}
+
+	data->pa_synced = false;
+}
+
+static gboolean pa_sync_timeout(gpointer user_data)
+{
+	struct bap_data *data = user_data;
+
+	data->pa_timer = 0;
+	pa_sync_release(data);
+
+	return FALSE;
+}
+
+static bool pa_sync_pending(const void *data, const void *match_data)
+{
+	const struct bap_data *bdata = data;
+
+	if (bdata == match_data)
+		return false;
+
+	/* A session with a listener that has not synced yet is still
+	 * discovering a Broadcast Source.
+	 */
+	return bdata->listen_io && !bdata->pa_synced;
+}
+
+static void pa_sync_release_session(void *data, void *user_data)
+{
+	struct bap_data *bdata = data;
+
+	if (bdata != user_data)
+		pa_sync_release(bdata);
 }
 
 static gboolean big_info_report_cb(GIOChannel *io, GIOCondition cond,
@@ -1577,10 +1653,21 @@ static gboolean big_info_report_cb(GIOChannel *io, GIOCondition cond,
 	g_io_channel_unref(data->listen_io);
 	data->listen_io = NULL;
 
-	/* For short-lived PA, the sync is no longer needed at
-	 * this point, so the io can be closed.
-	 */
-	g_io_channel_shutdown(io, TRUE, NULL);
+	if (queue_find(sessions, pa_sync_pending, data)) {
+		/* Other Broadcast Sources are still being discovered, so the
+		 * sync is closed to not hold the resources needed for them.
+		 */
+		g_io_channel_shutdown(io, TRUE, NULL);
+	} else {
+		/* Nothing else to discover: keep the sync for a while, as
+		 * syncing to the BIG requires one, so it does not have to be
+		 * established again if a stream is enabled.
+		 */
+		data->listen_io = g_io_channel_ref(io);
+		data->pa_synced = true;
+		data->pa_timer = g_timeout_add_seconds(PA_SYNC_GRACE_TIMEOUT,
+							pa_sync_timeout, data);
+	}
 
 	/* Analyze received BASE data and create remote media endpoints for each
 	 * BIS matching our capabilities
@@ -2235,7 +2322,7 @@ static void bap_iso_qos(struct bt_bap_qos *qos, struct bt_iso_io_qos *io)
 	io->interval = qos->ucast.io_qos.interval;
 	io->latency = qos->ucast.io_qos.latency;
 	io->sdu = qos->ucast.io_qos.sdu;
-	io->phy = qos->ucast.io_qos.phy;
+	io->phys = qos->ucast.io_qos.phys;
 	io->rtn = qos->ucast.io_qos.rtn;
 }
 
@@ -3578,6 +3665,11 @@ static int pa_sync(struct bap_data *data)
 
 	DBG("Create PA sync with this source");
 
+	/* Release any sync kept by another session, as it is not needed
+	 * to discover this source.
+	 */
+	queue_foreach(sessions, pa_sync_release_session, data);
+
 	data->listen_io = bt_io_listen(NULL, iso_pa_sync_confirm_cb, data,
 		NULL, &err,
 		BT_IO_OPT_SOURCE_BDADDR,
@@ -3636,7 +3728,8 @@ static void setup_refresh_qos(void *data, void *user_data)
 	setup->qos = *bt_bap_stream_get_qos(stream);
 }
 
-static void iso_do_big_sync(GIOChannel *io, void *user_data)
+static gboolean iso_do_big_sync(GIOChannel *io, GIOCondition cond,
+						void *user_data)
 {
 	GError *err = NULL;
 	struct bap_setup *setup = user_data;
@@ -3645,12 +3738,14 @@ static void iso_do_big_sync(GIOChannel *io, void *user_data)
 	struct bt_iso_qos qos;
 	struct queue *links = bt_bap_stream_io_get_links(setup->stream);
 
-	DBG("PA Sync done");
+	DBG("BIG info received, do BIG sync");
 
-	g_io_channel_unref(data->listen_io);
-	g_io_channel_shutdown(data->listen_io, TRUE, NULL);
-	data->listen_io = io;
-	g_io_channel_ref(data->listen_io);
+	if (data->listen_io != io) {
+		g_io_channel_unref(data->listen_io);
+		g_io_channel_shutdown(data->listen_io, TRUE, NULL);
+		data->listen_io = io;
+		g_io_channel_ref(data->listen_io);
+	}
 
 	/* Append each linked BIS to the BIG sync request */
 	append_setup(setup->stream, &iso_bc_addr);
@@ -3679,6 +3774,20 @@ static void iso_do_big_sync(GIOChannel *io, void *user_data)
 		error("bt_io_bcast_accept: %s", err->message);
 		g_error_free(err);
 	}
+
+	return FALSE;
+}
+
+static void long_pa_sync_confirm_cb(GIOChannel *io, void *user_data)
+{
+	struct bap_setup *setup = user_data;
+	struct bap_data *data = setup->data;
+
+	DBG("Long PA Sync done");
+
+	/* store io and add watch that will call iso_do_big_sync */
+	data->io_id = g_io_add_watch(io, G_IO_OUT, iso_do_big_sync,
+							setup);
 }
 
 static void pa_and_big_sync(struct bap_setup *setup)
@@ -3686,8 +3795,27 @@ static void pa_and_big_sync(struct bap_setup *setup)
 	GError *err = NULL;
 	struct bap_data *bap_data = setup->data;
 
+	if (bap_data->pa_synced) {
+		DBG("Reuse PA sync with this source");
+
+		/* The sync is in use from now on, so it is not released
+		 * while the BIG sync is being set up.
+		 */
+		bap_data->pa_synced = false;
+
+		if (bap_data->pa_timer) {
+			g_source_remove(bap_data->pa_timer);
+			bap_data->pa_timer = 0;
+		}
+
+		bap_data->io_id = g_io_add_watch(bap_data->listen_io, G_IO_OUT,
+							iso_do_big_sync, setup);
+		return;
+	}
+
 	DBG("Create PA sync with this source");
-	bap_data->listen_io = bt_io_listen(NULL, iso_do_big_sync, setup,
+
+	bap_data->listen_io = bt_io_listen(NULL, long_pa_sync_confirm_cb, setup,
 			NULL, &err,
 			BT_IO_OPT_SOURCE_BDADDR,
 			btd_adapter_get_address(bap_data->adapter),
@@ -3801,6 +3929,7 @@ static void bap_bcast_remove(struct btd_service *service)
 {
 	struct btd_device *device = btd_service_get_device(service);
 	struct bap_data *data;
+	struct queue *bcast_snks;
 	char addr[18];
 
 	ba2str(device_get_address(device), addr);
@@ -3813,6 +3942,13 @@ static void bap_bcast_remove(struct btd_service *service)
 	if (!data) {
 		error("BAP service not handled by profile");
 		return;
+	}
+
+	/* Clean up before bis_remove and data_remove */
+	if (data->bcast_snks) {
+		bcast_snks = data->bcast_snks;
+		data->bcast_snks = NULL;
+		queue_destroy(bcast_snks, setup_free);
 	}
 
 	bt_bap_bis_remove(data->bap);
@@ -3922,6 +4058,7 @@ static int bap_disconnect(struct btd_service *service)
 static int bap_bcast_disconnect(struct btd_service *service)
 {
 	struct bap_data *data;
+	struct queue *bcast_snks;
 
 	/* Lookup the bap session for this service since in case of
 	 * bass_delegator its user data is set by bass plugin.
@@ -3930,6 +4067,12 @@ static int bap_bcast_disconnect(struct btd_service *service)
 	if (!data) {
 		error("BAP service not handled by profile");
 		return -EINVAL;
+	}
+	/* Clean up broadcast sinks before detach (like unicast does) */
+	if (data->bcast_snks) {
+		bcast_snks = data->bcast_snks;
+		data->bcast_snks = NULL;
+		queue_destroy(bcast_snks, setup_free);
 	}
 
 	bt_bap_detach(data->bap);

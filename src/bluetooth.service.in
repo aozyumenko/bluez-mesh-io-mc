@@ -10,7 +10,7 @@ ExecStart=@PKGLIBEXECDIR@/bluetoothd
 NotifyAccess=main
 #WatchdogSec=10
 #Restart=on-failure
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 LimitNPROC=1
 
 # Filesystem lockdown
@@ -22,7 +22,7 @@ ProtectControlGroups=true
 StateDirectory=bluetooth
 StateDirectoryMode=0700
 ConfigurationDirectory=bluetooth
-ConfigurationDirectoryMode=0555
+ConfigurationDirectoryMode=0755
 
 # Execute Mappings
 MemoryDenyWriteExecute=true

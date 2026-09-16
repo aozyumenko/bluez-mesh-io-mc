@@ -179,19 +179,16 @@ static const struct bt_shell_menu *find_menu(const char *name, size_t len,
 
 static char *menu_generator(const char *text, int state)
 {
-	static unsigned int index, len;
+	static unsigned int len;
 	static struct queue_entry *entry;
 
 	if (!state) {
-		index = 0;
 		len = strlen(text);
 		entry = (void *) queue_get_entries(data.submenus);
 	}
 
 	for (; entry; entry = entry->next) {
 		struct bt_shell_menu *menu = entry->data;
-
-		index++;
 
 		if (!strncmp(menu->name, text, len)) {
 			entry = entry->next;
@@ -269,8 +266,6 @@ static void cmd_export(int argc, char *argv[])
 
 static int bt_shell_queue_exec(char *line)
 {
-	int err;
-
 	/* Ignore comments */
 	if (line[0] == '#')
 		return 0;
@@ -288,12 +283,9 @@ static int bt_shell_queue_exec(char *line)
 	}
 
 	bt_shell_printf("%s\n", line);
+	data.line = strdup(line);
 
-	err = bt_shell_exec(line);
-	if (!err)
-		data.line = strdup(line);
-
-	return err;
+	return bt_shell_exec(line);
 }
 
 static bool bt_shell_input_line(struct input *input)
@@ -530,6 +522,7 @@ static int cmd_exec(const struct bt_shell_menu_entry *entry,
 	wordexp_t w;
 	size_t len;
 	char *man, *opt;
+	const char *man2, *opt2;
 	int flags = WRDE_NOCMD;
 	bool optargs = false;
 
@@ -552,24 +545,24 @@ static int cmd_exec(const struct bt_shell_menu_entry *entry,
 	}
 
 	/* Find last mandatory arguments */
-	man = strrchr(entry->arg, '>');
-	if (!man) {
+	man2 = strrchr(entry->arg, '>');
+	if (!man2) {
 		opt = strdup(entry->arg);
 		goto optional;
 	}
 
-	len = man - entry->arg;
+	len = man2 - entry->arg;
 	if (entry->arg[0] == '<')
 		man = strndup(entry->arg, len + 1);
 	else {
 		/* Find where mandatory arguments start */
-		opt = strrchr(entry->arg, '<');
+		opt2 = strrchr(entry->arg, '<');
 		/* Skip if mandatory arguments are not in the right format */
-		if (!opt || opt > man) {
+		if (!opt2 || opt2 > man2) {
 			opt = strdup(entry->arg);
 			goto optional;
 		}
-		man = strndup(opt, man - opt + 1);
+		man = strndup(opt2, man2 - opt2 + 1);
 		optargs = true;
 	}
 
@@ -977,6 +970,7 @@ static char *cmd_generator(const char *text, int state)
 	static bool default_menu_enabled, menu_enabled, submenu_enabled;
 	static const struct bt_shell_menu *menu;
 	char *cmd;
+	const char *cmd2;
 
 	if (!state) {
 		index = 0;
@@ -1014,11 +1008,11 @@ static char *cmd_generator(const char *text, int state)
 		if (cmd || menu != data.main)
 			return cmd;
 
-		cmd = strrchr(text, '.');
-		if (!cmd)
+		cmd2 = strrchr(text, '.');
+		if (!cmd2)
 			return NULL;
 
-		menu = find_menu(text, cmd - text, NULL);
+		menu = find_menu(text, cmd2 - text, NULL);
 		if (!menu)
 			return NULL;
 
@@ -1125,6 +1119,9 @@ static char **menu_completion(const struct bt_shell_menu_entry *entry,
 {
 	char **matches = NULL;
 
+	if (argc == 0)
+		return NULL;
+
 	for (; entry->cmd; entry++) {
 		if (strcmp(entry->cmd, input_cmd))
 			continue;
@@ -1148,6 +1145,9 @@ static char **submenu_completion(const char *text, int argc, char *input_cmd)
 	char *cmd;
 
 	if (data.main != data.menu)
+		return NULL;
+
+	if (!input_cmd)
 		return NULL;
 
 	cmd = strrchr(input_cmd, '.');
@@ -1654,9 +1654,15 @@ bool bt_shell_attach(int fd)
 	if (data.mode == MODE_INTERACTIVE) {
 		io_set_read_handler(input->io, input_read, input, NULL);
 		io_set_disconnect_handler(input->io, input_hup, input, NULL);
-	}
 
-	if (data.mode == MODE_NON_INTERACTIVE) {
+		if (data.init_fd >= 0) {
+			int fd = data.init_fd;
+
+			data.init_fd = -1;
+			if (!bt_shell_attach(fd))
+				return false;
+		}
+	} else {
 		if (shell_exec(data.argc, data.argv) < 0) {
 			bt_shell_noninteractive_quit(EXIT_FAILURE);
 			return true;
@@ -1665,12 +1671,6 @@ bool bt_shell_attach(int fd)
 		if (data.timeout)
 			timeout_add(data.timeout * 1000, shell_quit, NULL,
 								NULL);
-	} else if (data.init_fd >= 0) {
-		int fd = data.init_fd;
-
-		data.init_fd = -1;
-		if (!bt_shell_attach(fd))
-			return false;
 	}
 
 	return true;

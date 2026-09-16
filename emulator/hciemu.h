@@ -22,6 +22,7 @@ enum hciemu_type {
 	HCIEMU_TYPE_BREDRLE50,
 	HCIEMU_TYPE_BREDRLE52,
 	HCIEMU_TYPE_BREDRLE60,
+	HCIEMU_TYPE_BREDRLE62,
 };
 
 enum hciemu_hook_type {
@@ -31,8 +32,17 @@ enum hciemu_hook_type {
 	HCIEMU_HOOK_POST_EVT,
 };
 
+typedef void (*hciemu_debug_func_t)(const char *str, void *user_data);
+typedef void (*hciemu_destroy_func_t)(void *user_data);
+
 struct hciemu *hciemu_new(enum hciemu_type type);
 struct hciemu *hciemu_new_num(enum hciemu_type type, uint8_t num);
+struct hciemu *hciemu_new_debug(enum hciemu_type type,
+			hciemu_debug_func_t callback, void *user_data,
+			hciemu_destroy_func_t destroy);
+struct hciemu *hciemu_new_num_debug(enum hciemu_type type, uint8_t num,
+			hciemu_debug_func_t callback, void *user_data,
+			hciemu_destroy_func_t destroy);
 
 struct hciemu *hciemu_ref(struct hciemu *hciemu);
 void hciemu_unref(struct hciemu *hciemu);
@@ -43,8 +53,6 @@ const uint8_t *hciemu_client_bdaddr(struct hciemu_client *client);
 bool hciemu_set_client_bdaddr(struct hciemu_client *client,
 				const uint8_t *bdaddr);
 
-typedef void (*hciemu_debug_func_t)(const char *str, void *user_data);
-typedef void (*hciemu_destroy_func_t)(void *user_data);
 bool hciemu_set_debug(struct hciemu *hciemu, hciemu_debug_func_t callback,
 			void *user_data, hciemu_destroy_func_t destroy);
 

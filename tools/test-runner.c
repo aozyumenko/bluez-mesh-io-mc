@@ -21,8 +21,10 @@
 #include <stdbool.h>
 #include <signal.h>
 #include <string.h>
+#include <stdarg.h>
 #include <getopt.h>
 #include <poll.h>
+#include <dirent.h>
 #include <limits.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
@@ -30,6 +32,11 @@
 #include <sys/mount.h>
 #include <sys/param.h>
 #include <sys/reboot.h>
+
+#if defined(__GNUC__) && (defined(__i386__) || defined(__amd64__))
+#include <cpuid.h>
+#define HAVE_GET_CPUID
+#endif
 
 #include "bluetooth/bluetooth.h"
 #include "bluetooth/hci.h"
@@ -40,7 +47,12 @@
 #define WAIT_ANY (-1)
 #endif
 
+#define ARRAY_SIZE(arr) (sizeof(arr) / sizeof((arr)[0]))
+
+#define _cleanup_(f) __attribute__((cleanup(f)))
+
 #define CMDLINE_MAX (2048 * 10)
+#define EXTRA_OPT_MAX 64
 
 static const char *own_binary;
 static char **test_argv;
@@ -50,14 +62,71 @@ static bool run_auto = false;
 static bool start_dbus = false;
 static bool start_dbus_session;
 static bool start_daemon = false;
-static bool start_emulator = false;
 static bool start_monitor = false;
 static bool qemu_host_cpu = false;
 static int num_devs = 0;
+static int num_emulator = 0;
+static const char *device_path = "/tmp/bt-server-bredr";
 static const char *qemu_binary = NULL;
 static const char *kernel_image = NULL;
 static char *audio_server;
 static char *usb_dev;
+static char *pcie_dev;
+static char *extra_opts[EXTRA_OPT_MAX];
+static int num_extra_opts;
+static const char *virtiofsd = "/usr/libexec/virtiofsd";
+
+struct strv {
+	char **strv;
+	size_t size;
+	size_t i;
+};
+
+#define STRV_ERROR(s) ((s).size == 0)
+
+static void __attribute__((format(printf, 2, 3)))
+strv_append(struct strv *s, const char *fmt, ...)
+{
+	va_list ap;
+	int ret;
+
+	if (s->size == 0 || s->i >= s->size - 1)
+		goto fail;
+
+	va_start(ap, fmt);
+	ret = vasprintf(&s->strv[s->i], fmt, ap);
+	va_end(ap);
+
+	if (ret < 0) {
+		perror("vasprintf");
+		s->strv[s->i] = NULL;
+		goto fail;
+	}
+
+	s->strv[++s->i] = NULL;
+	return;
+
+fail:
+	s->size = 0;
+}
+
+static void strv_concat(struct strv *s, const char *const *str)
+{
+	while (*str) {
+		strv_append(s, "%s", *str);
+		str++;
+	}
+}
+
+static void strv_cleanup(struct strv *s)
+{
+	size_t i;
+
+	for (i = 0; i < s->i; ++i)
+		free(s->strv[i]);
+
+	memset(s, 0, sizeof(*s));
+}
 
 static const char *qemu_table[] = {
 	"qemu-system-x86_64",
@@ -89,18 +158,31 @@ static const char *kernel_table[] = {
 	NULL
 };
 
-static const char *find_kernel(void)
+static bool find_kernel(const char *root, char path[PATH_MAX])
 {
+	struct stat st;
 	int i;
 
-	for (i = 0; kernel_table[i]; i++) {
-		struct stat st;
-
-		if (!stat(kernel_table[i], &st))
-			return kernel_table[i];
+	if (root) {
+		snprintf(path, PATH_MAX, "%s", root);
+		if (stat(path, &st))
+			return false;
+		if (!(st.st_mode & S_IFDIR))
+			return true;
 	}
 
-	return NULL;
+	for (i = 0; kernel_table[i]; i++) {
+		if (root)
+			snprintf(path, PATH_MAX, "%s/%s", root,
+						kernel_table[i]);
+		else
+			snprintf(path, PATH_MAX, "%s",
+						kernel_table[i]);
+		if (!stat(path, &st))
+			return true;
+	}
+
+	return false;
 }
 
 static const struct {
@@ -206,8 +288,7 @@ static void prepare_sandbox(void)
 	enable_printk();
 }
 
-static char *const qemu_argv[] = {
-	"",
+static const char *const qemu_argv[] = {
 	"-nodefaults",
 	"-no-user-config",
 	"-monitor", "none",
@@ -216,11 +297,10 @@ static char *const qemu_argv[] = {
 	"-m", "256M",
 	"-net", "none",
 	"-no-reboot",
-	"-fsdev", "local,id=fsdev-root,path=/,readonly=on,security_model=none,"
-	"multidevs=remap",
-	"-device", "virtio-9p-pci,fsdev=fsdev-root,mount_tag=/dev/root",
 	"-chardev", "stdio,id=con,mux=on",
 	"-serial", "chardev:con",
+	"-device", "virtio-serial",
+	"-device", "virtconsole,chardev=con,name=console.0",
 	NULL
 };
 
@@ -231,22 +311,446 @@ static char *const qemu_envp[] = {
 
 static void check_virtualization(void)
 {
-#if defined(__GNUC__) && (defined(__i386__) || defined(__amd64__))
-	uint32_t ecx;
+#ifdef HAVE_GET_CPUID
+	unsigned int eax, ebx, ecx, edx;
 
-	__asm__ __volatile__("cpuid" : "=c" (ecx) : "a" (1) : "memory");
-
-	if (!!(ecx & (1 << 5)))
+	if (__get_cpuid(1, &eax, &ebx, &ecx, &edx) && (ecx & (1 << 5)))
 		printf("Found support for Virtual Machine eXtensions\n");
 #endif
 }
 
-static void start_qemu(void)
+#define PCI_DEVICES_PATH "/sys/bus/pci/devices"
+
+static char pcie_bdf[16];
+static char pcie_driver[64];
+
+static bool sysfs_write(const char *path, const char *value)
+{
+	int fd;
+	ssize_t len;
+
+	fd = open(path, O_WRONLY);
+	if (fd < 0) {
+		perror(path);
+		return false;
+	}
+
+	len = write(fd, value, strlen(value));
+	close(fd);
+
+	if (len < 0) {
+		perror(path);
+		return false;
+	}
+
+	return true;
+}
+
+static bool pcie_parse_bdf(const char *opts, char *bdf, size_t size)
+{
+	unsigned int domain, bus, dev, func;
+	const char *ptr;
+	char addr[32];
+	size_t len;
+
+	ptr = strstr(opts, "host=");
+	if (!ptr)
+		return false;
+
+	ptr += 5;
+	len = strcspn(ptr, ",");
+	if (!len || len >= sizeof(addr))
+		return false;
+
+	memcpy(addr, ptr, len);
+	addr[len] = '\0';
+
+	if (sscanf(addr, "%x:%x:%x.%x", &domain, &bus, &dev, &func) != 4) {
+		domain = 0;
+		if (sscanf(addr, "%x:%x.%x", &bus, &dev, &func) != 3) {
+			fprintf(stderr, "Invalid PCI address %s\n", addr);
+			return false;
+		}
+	}
+
+	snprintf(bdf, size, "%04x:%02x:%02x.%x", domain, bus, dev, func);
+
+	return true;
+}
+
+static void load_module(const char *name)
+{
+	pid_t pid;
+
+	pid = fork();
+	if (pid < 0)
+		return;
+
+	if (pid == 0) {
+		char *argv[3] = { "/sbin/modprobe", (char *) name, NULL };
+
+		execv(argv[0], argv);
+		exit(EXIT_FAILURE);
+	}
+
+	waitpid(pid, NULL, 0);
+}
+
+/* Returns the name of the driver currently bound to the given device, or
+ * NULL if the device is not bound to any driver.
+ */
+static const char *pcie_get_driver(const char *bdf, char *buf, size_t size)
+{
+	char path[PATH_MAX], link[PATH_MAX];
+	const char *name;
+	ssize_t len;
+
+	snprintf(path, sizeof(path), PCI_DEVICES_PATH "/%s/driver", bdf);
+
+	len = readlink(path, link, sizeof(link) - 1);
+	if (len < 0)
+		return NULL;
+
+	link[len] = '\0';
+
+	name = strrchr(link, '/');
+	name = name ? name + 1 : link;
+
+	snprintf(buf, size, "%.*s", (int) size - 1, name);
+
+	return buf;
+}
+
+static bool pcie_probe(const char *bdf)
+{
+	return sysfs_write("/sys/bus/pci/drivers_probe", bdf);
+}
+
+/* VFIO can only pass through a device if every other device in its IOMMU
+ * group is either unbound or already handled by VFIO, so check that before
+ * taking the device away from its driver.
+ */
+static bool pcie_group_viable(const char *bdf)
+{
+	char path[PATH_MAX], driver[64];
+	struct dirent *entry;
+	bool viable = true;
+	DIR *dir;
+
+	snprintf(path, sizeof(path),
+			PCI_DEVICES_PATH "/%s/iommu_group/devices", bdf);
+
+	dir = opendir(path);
+	if (!dir) {
+		fprintf(stderr, "No IOMMU group for %s, "
+				"is the IOMMU enabled?\n", bdf);
+		return false;
+	}
+
+	while ((entry = readdir(dir))) {
+		const char *name = entry->d_name;
+
+		if (name[0] == '.' || !strcmp(name, bdf))
+			continue;
+
+		if (!pcie_get_driver(name, driver, sizeof(driver)) ||
+				!strcmp(driver, "vfio-pci") ||
+				!strcmp(driver, "pci-stub"))
+			continue;
+
+		fprintf(stderr, "Device %s in the same IOMMU group is bound "
+				"to %s\n", name, driver);
+		viable = false;
+	}
+
+	closedir(dir);
+
+	if (!viable)
+		fprintf(stderr, "IOMMU group of %s is not viable for "
+				"passthrough\n", bdf);
+
+	return viable;
+}
+
+/* Binds the device given with -P to vfio-pci so it can be handed to the
+ * guest, remembering the driver it was bound to so it can be restored once
+ * the guest is done with it.
+ */
+static void pcie_bind_vfio(void)
+{
+	char path[PATH_MAX];
+	const char *driver;
+	struct stat st;
+
+	if (!pcie_parse_bdf(pcie_dev, pcie_bdf, sizeof(pcie_bdf)))
+		return;
+
+	snprintf(path, sizeof(path), PCI_DEVICES_PATH "/%s", pcie_bdf);
+	if (stat(path, &st) < 0) {
+		fprintf(stderr, "PCI device %s not found\n", pcie_bdf);
+		exit(EXIT_FAILURE);
+	}
+
+	load_module("vfio-pci");
+
+	driver = pcie_get_driver(pcie_bdf, pcie_driver, sizeof(pcie_driver));
+	if (driver && !strcmp(driver, "vfio-pci")) {
+		printf("Device %s already bound to vfio-pci\n", pcie_bdf);
+		pcie_bdf[0] = '\0';
+		return;
+	}
+
+	if (!pcie_group_viable(pcie_bdf))
+		exit(EXIT_FAILURE);
+
+	if (driver) {
+		printf("Unbinding %s from %s\n", pcie_bdf, driver);
+
+		snprintf(path, sizeof(path),
+				PCI_DEVICES_PATH "/%s/driver/unbind", pcie_bdf);
+		if (!sysfs_write(path, pcie_bdf)) {
+			fprintf(stderr, "Failed to unbind %s\n", pcie_bdf);
+			exit(EXIT_FAILURE);
+		}
+	} else {
+		pcie_driver[0] = '\0';
+	}
+
+	printf("Binding %s to vfio-pci\n", pcie_bdf);
+
+	snprintf(path, sizeof(path),
+			PCI_DEVICES_PATH "/%s/driver_override", pcie_bdf);
+	if (!sysfs_write(path, "vfio-pci") || !pcie_probe(pcie_bdf)) {
+		fprintf(stderr, "Failed to bind %s to vfio-pci\n", pcie_bdf);
+		exit(EXIT_FAILURE);
+	}
+}
+
+/* Undoes pcie_bind_vfio() */
+static void pcie_unbind_vfio(void)
+{
+	char path[PATH_MAX];
+
+	if (!pcie_bdf[0])
+		return;
+
+	printf("Unbinding %s from vfio-pci\n", pcie_bdf);
+
+	snprintf(path, sizeof(path),
+			PCI_DEVICES_PATH "/%s/driver/unbind", pcie_bdf);
+	sysfs_write(path, pcie_bdf);
+
+	snprintf(path, sizeof(path),
+			PCI_DEVICES_PATH "/%s/driver_override", pcie_bdf);
+	sysfs_write(path, "\n");
+
+	if (!pcie_driver[0])
+		return;
+
+	printf("Binding %s back to %s\n", pcie_bdf, pcie_driver);
+
+	pcie_probe(pcie_bdf);
+}
+
+static bool check_virtiofsd(void)
+{
+	if (!virtiofsd)
+		return false;
+
+	if (access(virtiofsd, X_OK)) {
+		fprintf(stderr, "%s not available: virtiofs disabled\n",
+								virtiofsd);
+		return false;
+	}
+
+	return true;
+}
+
+struct rootfs {
+	char tmpdir[PATH_MAX - 16];
+	pid_t pid;
+};
+
+static volatile sig_atomic_t terminate;
+
+static void terminate_signal(int sig)
+{
+	terminate = 1;
+}
+
+static bool rootfs_setup(struct rootfs *r, struct strv *argv)
+{
+	const char *mem = "256M";
+	size_t i;
+
+	memset(r, 0, sizeof(*r));
+
+	if (!virtiofsd) {
+		strv_append(argv, "-fsdev");
+		strv_append(argv, "local,id=fsdev-root,path=/,readonly=on,"
+					"security_model=none,multidevs=remap");
+		strv_append(argv, "-device");
+		strv_append(argv, "virtio-9p-pci,fsdev=fsdev-root,"
+							"mount_tag=/dev/root");
+		return true;
+	}
+
+	/* Make sure to clean up the tmpdir always on SIGINT */
+	signal(SIGINT, terminate_signal);
+	signal(SIGTERM, terminate_signal);
+	signal(SIGHUP, terminate_signal);
+
+	snprintf(r->tmpdir, ARRAY_SIZE(r->tmpdir),
+					"/tmp/bluez-test-runner.XXXXXX");
+	if (!mkdtemp(r->tmpdir)) {
+		perror("mkdtemp failed");
+		return false;
+	}
+
+	strv_append(argv, "-chardev");
+	strv_append(argv, "socket,id=virtiofs0,path=%s/virtiofs", r->tmpdir);
+	strv_append(argv, "-device");
+	strv_append(argv, "vhost-user-fs-pci,queue-size=1024,"
+					"chardev=virtiofs0,tag=/dev/root");
+
+	/* Find out memory size */
+	for (i = 0; i + 1 < argv->i; ++i) {
+		if (strcmp(argv->strv[i], "-m") == 0)
+			mem = argv->strv[i+1];
+	}
+	for (i = 0; i + 1 < (size_t)num_extra_opts; ++i) {
+		if (strcmp(extra_opts[i], "-m") == 0)
+			mem = extra_opts[i+1];
+	}
+	if (!mem[0] || !strchr("kKmMgGtT", mem[strlen(mem) - 1])) {
+		fprintf(stderr, "Can't parse -m %s for virtiofs\n", mem);
+		return false;
+	}
+
+	strv_append(argv, "-object");
+	strv_append(argv, "memory-backend-memfd,id=mem0,size=%s,share=on", mem);
+	strv_append(argv, "-numa");
+	strv_append(argv, "node,memdev=mem0");
+
+	return true;
+}
+
+static bool rootfs_start(struct rootfs *r)
+{
+	pid_t pid;
+	char path[PATH_MAX];
+	struct stat st;
+
+	if (!virtiofsd)
+		return true;
+
+	printf("Using virtiofsd %s\n", virtiofsd);
+
+	snprintf(path, sizeof(path), "%s/virtiofs", r->tmpdir);
+
+	pid = fork();
+	if (pid < 0) {
+		perror("fork");
+		return false;
+	}
+
+	if (pid == 0) {
+		char *envp[1];
+		const char *cmd[] = {
+			virtiofsd,
+			"--socket-path", path,
+			"--shared-dir", "/",
+			"--readonly",
+			"--tag", "/dev/root",
+			/* Drop unnecessary capabilities, if run as root */
+			"--modcaps=-chown:-dac_override:-fowner:-fsetid:"
+					"-setgid:-setuid:-mknod:-setfcap",
+			/*
+			 * Disabling namespace sandbox is needed to allow the
+			 * guest to mount other virtio/9p filesystems.
+			 */
+			"--sandbox", "none",
+			NULL
+		};
+
+		envp[0] = NULL;
+		execve(cmd[0], (char **)cmd, envp);
+		exit(EXIT_FAILURE);
+	}
+
+	r->pid = pid;
+
+	while (!terminate) {
+		int status;
+		pid_t ret;
+
+		if (!stat(path, &st))
+			break;
+
+		ret = waitpid(pid, &status, WNOHANG);
+		if (ret < 0 && errno == EINTR) {
+			continue;
+		} else if (ret < 0) {
+			perror("waitpid");
+			return false;
+		} else if (ret) {
+			fprintf(stderr, "%s failed to start\n", virtiofsd);
+			r->pid = 0;
+			return false;
+		}
+
+		sleep(1);
+	}
+
+	return !terminate;
+}
+
+static void rootfs_cleanup(struct rootfs *r)
+{
+	char path[PATH_MAX];
+	int status;
+
+	if (r->pid > 0) {
+		kill(r->pid, SIGTERM);
+		while (waitpid(r->pid, &status, 0) < 0) {
+			if (errno != EINTR)
+				break;
+		}
+	}
+
+	if (r->tmpdir[0]) {
+		snprintf(path, sizeof(path), "%s/virtiofs", r->tmpdir);
+		unlink(path);
+		snprintf(path, sizeof(path), "%s/virtiofs.pid", r->tmpdir);
+		unlink(path);
+		rmdir(r->tmpdir);
+	}
+
+	memset(r, 0, sizeof(*r));
+}
+
+static pid_t qemu_pid;
+
+/* Forwards the signal to QEMU so it can shutdown, the host driver is then
+ * restored once it is reaped.
+ */
+static void qemu_signal(int sig)
+{
+	if (qemu_pid > 0)
+		kill(qemu_pid, sig);
+}
+
+static int start_qemu(void)
 {
 	char cwd[PATH_MAX/2], initcmd[PATH_MAX], testargs[PATH_MAX];
+	const char *fscmdline;
 	char cmdline[CMDLINE_MAX];
-	char **argv;
-	int i, pos;
+	char *argv_strv[EXTRA_OPT_MAX + 64];
+	struct strv _cleanup_(strv_cleanup) argv = { argv_strv,
+							ARRAY_SIZE(argv_strv) };
+	struct rootfs _cleanup_(rootfs_cleanup) rootfs = {{0}};
+	int i, pos, status = 0;
+	pid_t pid;
 
 	check_virtualization();
 
@@ -267,77 +771,132 @@ static void start_qemu(void)
 		if (n < 0 || n >= len) {
 			fprintf(stderr, "Buffer overflow detected in "
 					"testargs\n");
-			exit(EXIT_FAILURE);
+			return EXIT_FAILURE;
 		}
 
 		pos += n;
 	}
 
+	if (!virtiofsd)
+		fscmdline = "rootfstype=9p "
+				"rootflags=trans=virtio,version=9p2000.u";
+	else
+		fscmdline = "rootfstype=virtiofs root=/dev/root";
+
 	snprintf(cmdline, sizeof(cmdline),
-				"console=ttyS0,115200n8 earlyprintk=serial "
-				"no_hash_pointers=1 rootfstype=9p "
-				"rootflags=trans=virtio,version=9p2000.u "
-				"acpi=off pci=noacpi noapic quiet ro init=%s "
+				"console=hvc0 earlyprintk=serial "
+				"no_hash_pointers=1 %s %s quiet ro init=%s "
 				"TESTHOME=%s TESTDBUS=%u TESTDAEMON=%u "
 				"TESTDBUSSESSION=%u XDG_RUNTIME_DIR=/run/user/0 "
 				"TESTMONITOR=%u TESTEMULATOR=%u TESTDEVS=%d "
 				"TESTAUTO=%u TESTAUDIO='%s' TESTARGS=\'%s\'",
+				fscmdline,
+				/* PCIe passthrough requires ACPI and APIC for
+				 * device enumeration and MSI interrupts.
+				 */
+				pcie_dev ? "" : "acpi=off pci=noacpi noapic",
 				initcmd, cwd, start_dbus, start_daemon,
 				start_dbus_session,
-				start_monitor, start_emulator, num_devs,
+				start_monitor, num_emulator, num_devs,
 				run_auto, audio_server ? audio_server : "",
 				testargs);
-
-	argv = alloca(sizeof(qemu_argv) +
-			(sizeof(char *) * (6 + (num_devs * 4))) +
-			(sizeof(char *) * (usb_dev ? 4 : 0)));
-	memcpy(argv, qemu_argv, sizeof(qemu_argv));
-
-	pos = (sizeof(qemu_argv) / sizeof(char *)) - 1;
 
 	/* Make sure qemu_binary is not null */
 	if (!qemu_binary) {
 		fprintf(stderr, "No QEMU binary is set\n");
-		exit(1);
+		return EXIT_FAILURE;
 	}
-	argv[0] = (char *) qemu_binary;
+
+	strv_append(&argv, "%s", qemu_binary);
+	strv_concat(&argv, qemu_argv);
 
 	if (qemu_host_cpu) {
-		argv[pos++] = "-cpu";
-		argv[pos++] = "host";
+		strv_append(&argv, "-cpu");
+		strv_append(&argv, "host");
 	}
 
-	argv[pos++] = "-kernel";
-	argv[pos++] = (char *) kernel_image;
-	argv[pos++] = "-append";
-	argv[pos++] = (char *) cmdline;
+	strv_append(&argv, "-kernel");
+	strv_append(&argv, "%s", kernel_image);
+	strv_append(&argv, "-append");
+	strv_append(&argv, "%s", cmdline);
 
 	for (i = 0; i < num_devs; i++) {
-		const char *path = "/tmp/bt-server-bredr";
-		char *chrdev, *serdev;
-
-		chrdev = alloca(48 + strlen(path));
-		sprintf(chrdev, "socket,path=%s,id=bt%d", path, i);
-
-		serdev = alloca(48);
-		sprintf(serdev, "pci-serial,chardev=bt%d", i);
-
-		argv[pos++] = "-chardev";
-		argv[pos++] = chrdev;
-		argv[pos++] = "-device";
-		argv[pos++] = serdev;
+		strv_append(&argv, "-chardev");
+		strv_append(&argv, "socket,path=%s,id=bt%d", device_path, i);
+		strv_append(&argv, "-device");
+		strv_append(&argv, "virtconsole,chardev=bt%d,name=bt.%d", i, i);
 	}
 
 	if (usb_dev) {
-		argv[pos++] = "-device";
-		argv[pos++] = "qemu-xhci";
-		argv[pos++] = "-device";
-		argv[pos++] = usb_dev;
+		strv_append(&argv, "-device");
+		strv_append(&argv, "qemu-xhci");
+		strv_append(&argv, "-device");
+		strv_append(&argv, "%s", usb_dev);
 	}
 
-	argv[pos] = NULL;
+	if (pcie_dev) {
+		strv_append(&argv, "-device");
+		strv_append(&argv, "%s", pcie_dev);
+	}
 
-	execve(argv[0], argv, qemu_envp);
+	if (!rootfs_setup(&rootfs, &argv))
+		return EXIT_FAILURE;
+
+	for (i = 0; i < num_extra_opts; ++i)
+		strv_append(&argv, "%s", extra_opts[i]);
+
+	if (STRV_ERROR(argv)) {
+		fprintf(stderr, "Failed to build argument list\n");
+		return EXIT_FAILURE;
+	}
+
+	if (!rootfs_start(&rootfs))
+		return EXIT_FAILURE;
+
+	/* Exec directly if no setup/cleanup needed */
+	if (!pcie_dev && !rootfs.pid) {
+		execve(argv.strv[0], argv.strv, qemu_envp);
+		return EXIT_FAILURE;
+	}
+
+	if (pcie_dev)
+		pcie_bind_vfio();
+
+	pid = fork();
+	if (pid < 0) {
+		perror("Failed to fork new process");
+		pcie_unbind_vfio();
+		return EXIT_FAILURE;
+	}
+
+	if (pid == 0) {
+		execve(argv.strv[0], argv.strv, qemu_envp);
+		exit(EXIT_FAILURE);
+	}
+
+	qemu_pid = pid;
+
+	/* Terminate QEMU rather than this process, so the host driver can be
+	 * restored below.
+	 */
+	signal(SIGINT, qemu_signal);
+	signal(SIGTERM, qemu_signal);
+	signal(SIGHUP, qemu_signal);
+
+	if (terminate)
+		kill(qemu_pid, SIGTERM);
+
+	while (waitpid(pid, &status, 0) < 0) {
+		if (errno != EINTR)
+			break;
+	}
+
+	qemu_pid = -1;
+
+	if (pcie_dev)
+		pcie_unbind_vfio();
+
+	return WIFEXITED(status) ? WEXITSTATUS(status) : EXIT_FAILURE;
 }
 
 static int open_serial(const char *path)
@@ -716,10 +1275,11 @@ static const char *btvirt_table[] = {
 	NULL
 };
 
-static pid_t start_btvirt(const char *home)
+static pid_t start_btvirt(const char *home, int num)
 {
 	const char *btvirt = NULL;
 	char *argv[3];
+	char strnum[16];
 	pid_t pid;
 	int i;
 
@@ -742,10 +1302,12 @@ static pid_t start_btvirt(const char *home)
 		return -1;
 	}
 
+	snprintf(strnum, sizeof(strnum), "-l%d", num);
+
 	printf("Using %s\n", btvirt);
 
 	argv[0] = (char *) btvirt;
-	argv[1] = "-l";
+	argv[1] = strnum;
 	argv[2] = NULL;
 
 	printf("Starting Emulator\n");
@@ -887,7 +1449,7 @@ static void run_command(char *cmdname, char *home)
 	}
 
 	if (num_devs) {
-		const char *node = "/dev/ttyS1";
+		const char *node = "/dev/hvc1";
 		unsigned int basic_flags, extra_flags;
 
 		printf("Attaching BR/EDR controller to %s\n", node);
@@ -922,8 +1484,8 @@ static void run_command(char *cmdname, char *home)
 	else
 		monitor_pid = -1;
 
-	if (start_emulator)
-		emulator_pid = start_btvirt(home);
+	if (num_emulator)
+		emulator_pid = start_btvirt(home, num_emulator);
 	else
 		emulator_pid = -1;
 
@@ -1150,10 +1712,14 @@ static void run_tests(void)
 		start_monitor = true;
 	}
 
-	ptr = strstr(cmdline, "TESTEMULATOR=1");
+	ptr = strstr(cmdline, "TESTEMULATOR=");
 	if (ptr) {
-		printf("Emulator requested\n");
-		start_emulator = true;
+		const char *strnum = ptr + 13;
+		char *endptr = NULL;
+
+		num_emulator = strtol(strnum, &endptr, 0);
+		if (num_emulator > 0)
+			printf("Emulator %u requested\n", num_emulator);
 	}
 
 	ptr = strstr(cmdline, "TESTAUDIO='");
@@ -1184,18 +1750,21 @@ static void usage(void)
 		"Usage:\n");
 	printf("\ttest-runner [options] [--] <command> [args]\n");
 	printf("Options:\n"
-		"\t-a, --auto             Find tests and run them\n"
+		"\t-a, --all,--auto       Find tests and run them\n"
 		"\t-b, --dbus             Start D-Bus system daemon\n"
 		"\t-s, --dbus-session     Start D-Bus session daemon\n"
 		"\t-d, --daemon           Start bluetoothd\n"
 		"\t-m, --monitor          Start btmon\n"
-		"\t-l, --emulator         Start btvirt\n"
+		"\t-l, --emulator[=num]   Start btvirt\n"
 		"\t-A, --audio[=path]     Start audio server\n"
-		"\t-u, --unix [path]      Provide serial device\n"
-		"\t-U, --usb [qemu_args]  Provide USB device\n"
+		"\t-u, --unix[=path]      Provide serial device\n"
+		"\t-U, --usb <qemu_args>  Provide USB device\n"
+		"\t-P, --pcie <qemu_args> Provide PCIe device\n"
 		"\t-q, --qemu <path>      QEMU binary\n"
 		"\t-H, --qemu-host-cpu    Use host CPU (requires KVM support)\n"
-		"\t-k, --kernel <image>   Kernel image (bzImage)\n"
+		"\t-k, --kernel <image>   Kernel bzImage or source tree path\n"
+		"\t-F, --virtiofs[=<path>]  Virtiofsd path or 'no'\n"
+		"\t-o, --option <opt>     Additional argument passed to QEMU\n"
 		"\t-h, --help             Show help options\n");
 }
 
@@ -1204,7 +1773,7 @@ static const struct option main_options[] = {
 	{ "auto",    no_argument,       NULL, 'a' },
 	{ "dbus",    no_argument,       NULL, 'b' },
 	{ "dbus-session", no_argument,  NULL, 's' },
-	{ "unix",    no_argument,       NULL, 'u' },
+	{ "unix",    optional_argument, NULL, 'u' },
 	{ "daemon",  no_argument,       NULL, 'd' },
 	{ "emulator", no_argument,      NULL, 'l' },
 	{ "monitor", no_argument,       NULL, 'm' },
@@ -1213,6 +1782,9 @@ static const struct option main_options[] = {
 	{ "kernel",  required_argument, NULL, 'k' },
 	{ "audio",   optional_argument, NULL, 'A' },
 	{ "usb",     required_argument, NULL, 'U' },
+	{ "pcie",    required_argument, NULL, 'P' },
+	{ "option",  required_argument, NULL, 'o' },
+	{ "virtiofs", optional_argument, NULL, 'F' },
 	{ "version", no_argument,       NULL, 'v' },
 	{ "help",    no_argument,       NULL, 'h' },
 	{ }
@@ -1220,6 +1792,9 @@ static const struct option main_options[] = {
 
 int main(int argc, char *argv[])
 {
+	char kernel_path[PATH_MAX];
+	bool virtiofs_auto = true;
+
 	if (getpid() == 1 && getppid() == 0) {
 		prepare_sandbox();
 		run_tests();
@@ -1232,7 +1807,7 @@ int main(int argc, char *argv[])
 	for (;;) {
 		int opt;
 
-		opt = getopt_long(argc, argv, "aubdslmq:Hk:A::U:vh",
+		opt = getopt_long(argc, argv, "au::bdsl::mq:Hk:A::U:P:o:F::vh",
 						main_options, NULL);
 		if (opt < 0)
 			break;
@@ -1243,6 +1818,8 @@ int main(int argc, char *argv[])
 			break;
 		case 'u':
 			num_devs = 1;
+			if (optarg)
+				device_path = optarg;
 			break;
 		case 'b':
 			start_dbus = true;
@@ -1255,7 +1832,7 @@ int main(int argc, char *argv[])
 			start_daemon = true;
 			break;
 		case 'l':
-			start_emulator = true;
+			num_emulator = optarg ? atoi(optarg) : 1;
 			break;
 		case 'm':
 			start_monitor = true;
@@ -1275,6 +1852,25 @@ int main(int argc, char *argv[])
 		case 'U':
 			usb_dev = optarg;
 			break;
+		case 'P':
+			pcie_dev = optarg;
+			break;
+		case 'o':
+			if (num_extra_opts >= EXTRA_OPT_MAX) {
+				fprintf(stderr, "Too many -o\n");
+				return EXIT_FAILURE;
+			}
+			extra_opts[num_extra_opts++] = optarg;
+			break;
+		case 'F':
+			virtiofs_auto = false;
+			if (optarg) {
+				if (strcmp(optarg, "no") == 0)
+					virtiofsd = NULL;
+				else
+					virtiofsd = optarg;
+			}
+			break;
 		case 'v':
 			printf("%s\n", VERSION);
 			return EXIT_SUCCESS;
@@ -1285,6 +1881,9 @@ int main(int argc, char *argv[])
 			return EXIT_FAILURE;
 		}
 	}
+
+	if (virtiofs_auto && !check_virtiofsd())
+		virtiofsd = NULL;
 
 	if (run_auto) {
 		if (argc - optind > 0) {
@@ -1310,18 +1909,15 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	if (!kernel_image) {
-		kernel_image = find_kernel();
-		if (!kernel_image) {
-			fprintf(stderr, "No default kernel image found\n");
-			return EXIT_FAILURE;
-		}
+	if (!find_kernel(kernel_image, kernel_path)) {
+		fprintf(stderr, "No kernel image found\n");
+		return EXIT_FAILURE;
 	}
+
+	kernel_image = kernel_path;
 
 	printf("Using QEMU binary %s\n", qemu_binary);
 	printf("Using kernel image %s\n", kernel_image);
 
-	start_qemu();
-
-	return EXIT_SUCCESS;
+	return start_qemu();
 }

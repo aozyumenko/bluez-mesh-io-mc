@@ -15,7 +15,6 @@
 #endif
 
 #define _GNU_SOURCE
-#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -412,11 +411,23 @@ static bool match_cache_id(const void *data, const void *match_data)
 	return !bacmp(&cache->id, id);
 }
 
-static void gatt_cache_add(struct packet_conn_data *conn, struct gatt_db *db)
+static void gatt_cache_add(struct packet_conn_data *conn, struct gatt_db *ldb,
+							struct gatt_db *rdb)
 {
 	struct gatt_cache *cache;
 	bdaddr_t id;
 	uint8_t id_type;
+
+	/* Attempt to cache local db if not empty */
+	if (!gatt_db_isempty(ldb)) {
+		cache = new0(struct gatt_cache, 1);
+		bacpy(&cache->id, (bdaddr_t *)conn->src);
+		cache->db = gatt_db_ref(ldb);
+		queue_push_tail(cache_list, cache);
+	}
+
+	if (gatt_db_isempty(rdb))
+		return;
 
 	if (!keys_resolve_identity(conn->dst, id.b, &id_type))
 		bacpy(&id, (bdaddr_t *)conn->dst);
@@ -429,7 +440,7 @@ static void gatt_cache_add(struct packet_conn_data *conn, struct gatt_db *db)
 
 	cache = new0(struct gatt_cache, 1);
 	bacpy(&cache->id, &id);
-	cache->db = gatt_db_ref(db);
+	cache->db = gatt_db_ref(rdb);
 	queue_push_tail(cache_list, cache);
 }
 
@@ -437,8 +448,7 @@ static void att_conn_data_free(struct packet_conn_data *conn, void *data)
 {
 	struct att_conn_data *att_data = data;
 
-	if (!gatt_db_isempty(att_data->rdb))
-		gatt_cache_add(conn, att_data->rdb);
+	gatt_cache_add(conn, att_data->ldb, att_data->rdb);
 
 	gatt_db_unref(att_data->rdb);
 	gatt_db_unref(att_data->ldb);
@@ -520,6 +530,10 @@ static void load_gatt_db(struct packet_conn_data *conn)
 		cache = queue_find(cache_list, match_cache_id, &id);
 		if (cache)
 			data->rdb = gatt_db_ref(cache->db);
+
+		cache = queue_find(cache_list, match_cache_id, &conn->src);
+		if (cache)
+			data->ldb = gatt_db_ref(cache->db);
 	}
 }
 
@@ -2310,40 +2324,15 @@ static void vol_flag_notify(const struct l2cap_frame *frame)
 	print_vcs_flag(frame);
 }
 
-static char *name2utf8(const uint8_t *name, uint16_t len)
-{
-	char utf8_name[HCI_MAX_NAME_LENGTH + 2];
-	int i;
-
-	if (g_utf8_validate((const char *) name, len, NULL))
-		return g_strndup((char *) name, len);
-
-	len = MIN(len, sizeof(utf8_name) - 1);
-
-	memset(utf8_name, 0, sizeof(utf8_name));
-	strncpy(utf8_name, (char *) name, len);
-
-	/* Assume ASCII, and replace all non-ASCII with spaces */
-	for (i = 0; utf8_name[i] != '\0'; i++) {
-		if (!isascii(utf8_name[i]))
-			utf8_name[i] = ' ';
-	}
-
-	/* Remove leading and trailing whitespace characters */
-	g_strstrip(utf8_name);
-
-	return g_strdup(utf8_name);
-}
-
 static void print_mp_name(const struct l2cap_frame *frame)
 {
 	char *name;
 
-	name = name2utf8((uint8_t *)frame->data, frame->size);
+	name = str2utf8(frame->data, frame->size);
 
 	print_field("  Media Player Name: %s", name);
 
-	g_free(name);
+	free(name);
 }
 
 static void mp_name_read(const struct l2cap_frame *frame)
@@ -2370,11 +2359,11 @@ static void print_track_title(const struct l2cap_frame *frame)
 {
 	char *name;
 
-	name = name2utf8((uint8_t *)frame->data, frame->size);
+	name = str2utf8(frame->data, frame->size);
 
 	print_field("  Track Title: %s", name);
 
-	g_free(name);
+	free(name);
 }
 
 static void track_title_read(const struct l2cap_frame *frame)
@@ -2505,11 +2494,11 @@ static void print_bearer_name(const struct l2cap_frame *frame)
 {
 	char *name;
 
-	name = name2utf8((uint8_t *)frame->data, frame->size);
+	name = str2utf8(frame->data, frame->size);
 
 	print_field("  Bearer Name: %s", name);
 
-	g_free(name);
+	free(name);
 }
 
 static void bearer_name_read(const struct l2cap_frame *frame)
@@ -2526,11 +2515,11 @@ static void bearer_uci_read(const struct l2cap_frame *frame)
 {
 	char *name;
 
-	name = name2utf8((uint8_t *)frame->data, frame->size);
+	name = str2utf8(frame->data, frame->size);
 
 	print_field("  Bearer Uci Name: %s", name);
 
-	g_free(name);
+	free(name);
 }
 
 static void print_technology_name(const struct l2cap_frame *frame)
@@ -2597,11 +2586,11 @@ static void print_uri_scheme_list(const struct l2cap_frame *frame)
 {
 	char *name;
 
-	name = name2utf8((uint8_t *)frame->data, frame->size);
+	name = str2utf8(frame->data, frame->size);
 
 	print_field("  Uri scheme Name: %s", name);
 
-	g_free(name);
+	free(name);
 }
 
 static void bearer_uri_schemes_list_read(const struct l2cap_frame *frame)
@@ -2711,11 +2700,11 @@ static void print_call_list(const struct l2cap_frame *frame)
 
 	print_field("  call_flag: 0x%x", call_flag);
 
-	call_uri = name2utf8((uint8_t *)frame->data, frame->size);
+	call_uri = str2utf8(frame->data, frame->size);
 
 	print_field("  call_uri: %s", call_uri);
 
-	g_free(call_uri);
+	free(call_uri);
 
 done:
 	if (frame->size)
@@ -2801,11 +2790,11 @@ static void print_target_uri(const struct l2cap_frame *frame)
 
 	print_field("  call_idx: %x", call_idx);
 
-	name = name2utf8((uint8_t *)frame->data, frame->size);
+	name = str2utf8(frame->data, frame->size);
 
 	print_field("  Uri: %s", name);
 
-	g_free(name);
+	free(name);
 
 done:
 	if (frame->size)
@@ -2913,9 +2902,9 @@ static void print_call_cp(const struct l2cap_frame *frame)
 		break;
 	case 0x04:
 		str = "Originate";
-		name = name2utf8((uint8_t *)frame->data, frame->size);
+		name = str2utf8(frame->data, frame->size);
 		print_field("  Operation: %s  Uri: %s", str, name);
-		g_free(name);
+		free(name);
 		break;
 	case 0x05:
 		str = "Join";
@@ -3109,11 +3098,11 @@ static void print_incom_call(const struct l2cap_frame *frame)
 
 	print_field("  Call Index: %u", call_id);
 
-	name = name2utf8((uint8_t *)frame->data, frame->size);
+	name = str2utf8(frame->data, frame->size);
 
 	print_field("  call_string: %s", name);
 
-	g_free(name);
+	free(name);
 
 done:
 	if (frame->size)
@@ -3142,11 +3131,11 @@ static void print_call_friendly_name(const struct l2cap_frame *frame)
 
 	print_field("  Call Index: %u", call_id);
 
-	name = name2utf8((uint8_t *)frame->data, frame->size);
+	name = str2utf8(frame->data, frame->size);
 
 	print_field("  Friendly Name: %s", name);
 
-	g_free(name);
+	free(name);
 
 done:
 	if (frame->size)
@@ -4055,12 +4044,1039 @@ static void bgr_features_read(const struct l2cap_frame *frame)
 								mask);
 }
 
+static const struct bitfield_data ras_features_table[] = {
+	{  0, "Real-time Ranging Data (0x00000001)"		},
+	{  1, "Retrieve Lost Ranging Data Segments (0x00000002)"	},
+	{  2, "Abort Operation (0x00000004)"			},
+	{  3, "Filter Ranging Data (0x00000008)"		},
+	{ }
+};
+
+static const struct bitfield_data antenna_paths_table[] = {
+	{  0, "Antenna Path 1 (0x01)"	},
+	{  1, "Antenna Path 2 (0x02)"	},
+	{  2, "Antenna Path 3 (0x04)"	},
+	{  3, "Antenna Path 4 (0x08)"	},
+	{ }
+};
+
+static void ras_features_read(const struct l2cap_frame *frame)
+{
+	uint32_t features;
+	uint32_t mask;
+
+	if (!l2cap_frame_get_le32((void *)frame, &features)) {
+		print_text(COLOR_ERROR, "    Features: invalid size");
+		goto done;
+	}
+
+	print_field("    Features: 0x%8.8x", features);
+
+	mask = print_bitfield(6, features, ras_features_table);
+	if (mask)
+		print_text(COLOR_WHITE_BG, "    RFU fields (0x%8.8x)",
+								mask);
+
+done:
+	if (frame->size)
+		print_hex_field("  Data", frame->data, frame->size);
+}
+
+static void print_ras_segmentation_header(uint8_t header)
+{
+	bool first_segment = header & 0x01;
+	bool last_segment = (header >> 1) & 0x01;
+	uint8_t segment_index = (header >> 2) & 0x3F;
+
+	print_field("  Segmentation Header: 0x%2.2x", header);
+	print_field("    First Segment: %s", first_segment ? "True" : "False");
+	print_field("    Last Segment: %s", last_segment ? "True" : "False");
+	print_field("    Segment Index: %u", segment_index);
+}
+
+static uint8_t print_ras_ranging_header(const struct l2cap_frame *frame)
+{
+	uint16_t ranging_counter_config;
+	uint8_t selected_tx_power;
+	uint8_t antenna_paths_mask;
+	uint8_t mask;
+	uint8_t num_antenna_paths = 0;
+	uint8_t i;
+
+	if (!l2cap_frame_get_le16((void *)frame, &ranging_counter_config)) {
+		print_text(COLOR_ERROR, "    Ranging Header: invalid size");
+		return 0;
+	}
+
+	/* Lower 12 bits: Ranging Counter, Upper 4 bits: Configuration ID */
+	print_field("    Ranging Counter: 0x%3.3x",
+					ranging_counter_config & 0x0FFF);
+	print_field("    Configuration ID: %u",
+					(ranging_counter_config >> 12) & 0x0F);
+
+	if (!l2cap_frame_get_u8((void *)frame, &selected_tx_power)) {
+		print_text(COLOR_ERROR, "    Selected TX Power: invalid size");
+		return 0;
+	}
+
+	print_field("    Selected TX Power: %d dBm", (int8_t)selected_tx_power);
+
+	if (!l2cap_frame_get_u8((void *)frame, &antenna_paths_mask)) {
+		print_text(COLOR_ERROR, "    Antenna Paths Mask: invalid size");
+		return 0;
+	}
+
+	print_field("    Antenna Paths Mask: 0x%2.2x", antenna_paths_mask);
+
+	mask = print_bitfield(6, antenna_paths_mask,
+					antenna_paths_table);
+
+	if (mask)
+		print_text(COLOR_WHITE_BG, "      RFU (0x%2.2x)", mask);
+
+	/* Count the number of set bits in antenna_paths_mask */
+	for (i = 0; i < 4; i++) {
+		if (antenna_paths_mask & (1 << i))
+			num_antenna_paths++;
+	}
+
+	return num_antenna_paths;
+}
+
+static const char *ras_ranging_done_status_str(uint8_t status)
+{
+	switch (status) {
+	case 0x0:
+		return "All results complete";
+	case 0x1:
+		return "Partial results, more to follow";
+	case 0xF:
+		return "All subsequent procedures aborted";
+	default:
+		return "RFU";
+	}
+}
+
+static const char *ras_subevent_done_status_str(uint8_t status)
+{
+	switch (status) {
+	case 0x0:
+		return "All results complete";
+	case 0xF:
+		return "Current subevent aborted";
+	default:
+		return "RFU";
+	}
+}
+
+static const char *ras_abort_reason_str(uint8_t reason)
+{
+	switch (reason) {
+	case 0x0:
+		return "No abort";
+	case 0x1:
+		return "Local/remote request";
+	case 0x2:
+		return "Filtered channel map < 15 channels";
+	case 0x3:
+		return "Channel map update instant passed";
+	case 0xF:
+		return "Unspecified";
+	default:
+		return "RFU";
+	}
+}
+
+static uint8_t print_ras_subevent_header(const struct l2cap_frame *frame)
+{
+	uint16_t start_acl_conn_event;
+	uint16_t freq_compensation;
+	uint8_t status_byte1, status_byte2;
+	uint8_t ranging_done_status, subevent_done_status;
+	uint8_t ranging_abort_reason, subevent_abort_reason;
+	uint8_t ref_power_level;
+	uint8_t num_steps_reported;
+
+	if (!l2cap_frame_get_le16((void *)frame, &start_acl_conn_event)) {
+		print_text(COLOR_ERROR,
+			"      Start ACL Connection Event: invalid size");
+		return 0;
+	}
+
+	print_field("      Start ACL Connection Event: %u",
+						start_acl_conn_event);
+
+	if (!l2cap_frame_get_le16((void *)frame, &freq_compensation)) {
+		print_text(COLOR_ERROR,
+			"      Frequency Compensation: invalid size");
+		return 0;
+	}
+
+	print_field("      Frequency Compensation: %d (0.01 ppm)",
+					(int16_t)freq_compensation);
+
+	if (!l2cap_frame_get_u8((void *)frame, &status_byte1)) {
+		print_text(COLOR_ERROR, "      Status: invalid size");
+		return 0;
+	}
+
+	ranging_done_status = status_byte1 & 0x0F;
+	subevent_done_status = (status_byte1 >> 4) & 0x0F;
+
+	print_field("      Ranging Done Status: %s (0x%x)",
+			ras_ranging_done_status_str(ranging_done_status),
+			ranging_done_status);
+	print_field("      Subevent Done Status: %s (0x%x)",
+			ras_subevent_done_status_str(subevent_done_status),
+			subevent_done_status);
+
+	if (!l2cap_frame_get_u8((void *)frame, &status_byte2)) {
+		print_text(COLOR_ERROR, "      Abort Reasons: invalid size");
+		return 0;
+	}
+
+	ranging_abort_reason = status_byte2 & 0x0F;
+	subevent_abort_reason = (status_byte2 >> 4) & 0x0F;
+
+	print_field("      Ranging Abort Reason: %s (0x%x)",
+			ras_abort_reason_str(ranging_abort_reason),
+			ranging_abort_reason);
+	print_field("      Subevent Abort Reason: %s (0x%x)",
+			ras_abort_reason_str(subevent_abort_reason),
+			subevent_abort_reason);
+
+	if (!l2cap_frame_get_u8((void *)frame, &ref_power_level)) {
+		print_text(COLOR_ERROR,
+			"      Reference Power Level: invalid size");
+		return 0;
+	}
+
+	print_field("      Reference Power Level: %d dBm",
+					(int8_t)ref_power_level);
+
+	if (!l2cap_frame_get_u8((void *)frame, &num_steps_reported)) {
+		print_text(COLOR_ERROR,
+			"      Number of Steps Reported: invalid size");
+		return 0;
+	}
+
+	print_field("      Number of Steps Reported: %u", num_steps_reported);
+
+	return num_steps_reported;
+}
+
+static const char *packet_quality_str(uint8_t quality)
+{
+	switch (quality & 0x03) {
+	case 0x00:
+		return "CS Access Address check is successful, and all bits "
+			"match the expected sequence";
+	case 0x01:
+		return "CS Access Address check is successful, but some bits "
+			"do not match the expected sequence";
+	case 0x02:
+		return "CS Access Address check failed";
+	default:
+		return "Reserved";
+	}
+}
+
+static const char *tone_quality_str(uint8_t quality)
+{
+	switch (quality & 0x03) {
+	case 0x00:
+		return "Tone quality is high";
+	case 0x01:
+		return "Tone quality is medium";
+	case 0x02:
+		return "Tone quality is low";
+	case 0x03:
+		return "Tone quality indication is not available";
+	default:
+		return "Reserved";
+	}
+}
+
+static const char *tone_extension_str(uint8_t quality)
+{
+	switch ((quality >> 4) & 0x03) {
+	case 0x00:
+		return "Not tone extension slot";
+	case 0x01:
+		return "Tone extension slot; tone not expected to be present";
+	case 0x02:
+		return "Tone extension slot; tone expected to be present";
+	default:
+		return "Reserved";
+	}
+}
+
+static void print_step_mode_0(const struct l2cap_frame *frame, uint8_t len)
+{
+	uint8_t quality, rssi, antenna;
+	uint16_t freq_offset;
+
+	if (len < 3) {
+		print_hex_field("          Raw step data", frame->data, len);
+		return;
+	}
+
+	if (!l2cap_frame_get_u8((void *)frame, &quality)) {
+		print_text(COLOR_ERROR,
+			"          Packet Quality: invalid");
+		return;
+	}
+
+	print_field("          Packet Quality: 0x%02x", quality);
+	print_field("            %s", packet_quality_str(quality));
+	print_field("            Bit errors: %u", (quality >> 2) & 0x3F);
+
+	if (!l2cap_frame_get_u8((void *)frame, &rssi)) {
+		print_text(COLOR_ERROR, "          Packet RSSI: invalid");
+		return;
+	}
+
+	print_field("          Packet RSSI: %d", (int8_t)rssi);
+
+	if (!l2cap_frame_get_u8((void *)frame, &antenna)) {
+		print_text(COLOR_ERROR,
+			"          Packet Antenna: invalid");
+		return;
+	}
+
+	print_field("          Packet Antenna: %u", antenna);
+
+	if (len == 5) {
+		if (!l2cap_frame_get_le16((void *)frame, &freq_offset)) {
+			print_text(COLOR_ERROR,
+				"          Measured Freq Offset: invalid size");
+			return;
+		}
+
+		print_field("          Measured Freq Offset: %d (0.01 ppm)",
+						(int16_t)freq_offset);
+	}
+}
+
+static void print_step_mode_1(const struct l2cap_frame *frame, uint8_t len)
+{
+	uint8_t quality, nadm, rssi, antenna;
+	uint16_t toa_tod;
+
+	if (len < 6) {
+		print_hex_field("          Raw step data", frame->data, len);
+		return;
+	}
+
+	if (!l2cap_frame_get_u8((void *)frame, &quality)) {
+		print_text(COLOR_ERROR, "          Packet Quality: invalid");
+		return;
+	}
+
+	print_field("          Packet Quality: 0x%02x", quality);
+	print_field("            %s", packet_quality_str(quality));
+	print_field("            Bit errors: %u", (quality >> 2) & 0x3F);
+
+	if (!l2cap_frame_get_u8((void *)frame, &nadm)) {
+		print_text(COLOR_ERROR, "          Packet NADM: invalid");
+		return;
+	}
+
+	if (nadm == 0xFF)
+		print_field("          Packet NADM: Unknown NADM (0xff)");
+	else
+		print_field("          Packet NADM: %u", nadm);
+
+	if (!l2cap_frame_get_u8((void *)frame, &rssi)) {
+		print_text(COLOR_ERROR, "          Packet RSSI: invalid");
+		return;
+	}
+
+	print_field("          Packet RSSI: %d", (int8_t)rssi);
+
+	if (!l2cap_frame_get_le16((void *)frame, &toa_tod)) {
+		print_text(COLOR_ERROR, "          ToA_ToD: invalid");
+		return;
+	}
+
+	print_field("          ToA_ToD: 0x%08x", (uint32_t)(int16_t)toa_tod);
+
+	if (!l2cap_frame_get_u8((void *)frame, &antenna)) {
+		print_text(COLOR_ERROR, "          Packet Antenna: invalid");
+		return;
+	}
+
+	print_field("          Packet Antenna: %u", antenna);
+}
+
+static void print_step_mode_2(const struct l2cap_frame *frame, uint8_t len,
+				uint8_t num_antenna_paths)
+{
+	uint8_t ant_perm_idx;
+	uint8_t i;
+	uint32_t pct;
+	uint16_t i_sample, q_sample;
+	uint8_t quality;
+
+	if (len < 1) {
+		print_hex_field("          Raw step data", frame->data, len);
+		return;
+	}
+
+	if (!l2cap_frame_get_u8((void *)frame, &ant_perm_idx)) {
+		print_text(COLOR_ERROR, "          Antenna Permutation Index: "
+							"invalid size");
+		return;
+	}
+
+	print_field("          Antenna Permutation Index: %u", ant_perm_idx);
+
+	/* Use the antenna paths count from ranging header */
+	for (i = 0; i < (num_antenna_paths + 1); i++) {
+		if (frame->size < 4) {
+			print_text(COLOR_ERROR,
+				"            Insufficient data for path %u",
+				i);
+			return;
+		}
+
+		if (!l2cap_frame_get_le24((void *)frame, &pct)) {
+			print_text(COLOR_ERROR, "            PCT: invalid");
+			return;
+		}
+
+		/* Extract 12-bit I and Q samples from 24-bit PCT */
+		i_sample = pct & 0x0FFF;
+		q_sample = (pct >> 12) & 0x0FFF;
+
+		print_field("          Path %u", i);
+		print_field("            PCT: 0x%06x", pct);
+		print_field("              I: 0x%03x", i_sample);
+		print_field("              Q: 0x%03x", q_sample);
+
+		if (!l2cap_frame_get_u8((void *)frame, &quality)) {
+			print_text(COLOR_ERROR,
+				"            Tone quality indicator: "
+				"invalid size");
+			return;
+		}
+
+		print_field("            Tone quality indicator: 0x%02x",
+				quality);
+		print_field("              %s (0x%02x)",
+				tone_quality_str(quality),
+				quality & 0x03);
+		print_field("              %s (0x%02x)",
+				tone_extension_str(quality),
+				(quality >> 4) & 0x03);
+	}
+}
+
+static void print_step_mode_3(const struct l2cap_frame *frame, uint8_t len,
+				uint8_t num_antenna_paths)
+{
+	uint8_t mode2_len;
+
+	/* Mode 3 = Mode 1 (6 bytes) + Mode 2 (variable) */
+	if (len < 6) {
+		print_hex_field("          Raw step data", frame->data, len);
+		return;
+	}
+
+	/* Parse Mode 1 portion */
+	print_step_mode_1(frame, 6);
+
+	if (frame->size < 1)
+		return;
+
+	/* Parse Mode 2 portion */
+	mode2_len = len - 6;
+	print_step_mode_2(frame, mode2_len, num_antenna_paths);
+}
+
+static void print_ranging_steps(const struct l2cap_frame *frame,
+				uint8_t num_steps, uint8_t num_antenna_paths)
+{
+	uint8_t step_idx;
+
+	for (step_idx = 0; step_idx < num_steps && frame->size > 0;
+								step_idx++) {
+		uint8_t mode_byte;
+		uint8_t mode_type;
+		bool aborted;
+		uint8_t step_data_len;
+
+		if (!l2cap_frame_get_u8((void *)frame, &mode_byte)) {
+			print_text(COLOR_ERROR,
+				"        Step %u: Mode: invalid size",
+				step_idx);
+			return;
+		}
+
+		mode_type = mode_byte & 0x03;
+		aborted = (mode_byte & 0x80) != 0;
+
+		print_field("        Step %u", step_idx);
+		print_field("          Mode Type: %u", mode_type);
+		print_field("          Aborted: %s", aborted ? "Yes" : "No");
+
+		/* If aborted, step data length is 0 */
+		if (aborted)
+			continue;
+
+		/* Determine step data length based on mode type
+		 * Mode 0: Check if we have 5 bytes (initiator) or 3 bytes
+		 * (reflector)
+		 * Mode 1: Always 6 bytes
+		 * Mode 2: 1 byte (ant_perm_idx) + num_antenna_paths * 4 bytes
+		 * Mode 3: 6 bytes (Mode 1) + 1 byte (ant_perm_idx) +
+		 * num_antenna_paths * 4 bytes
+		 */
+		switch (mode_type) {
+		case 0:
+			/* Mode 0: 3 bytes without Measured Freq Offset, or
+			 * 5 bytes with it. The presence depends on the CS
+			 * role (initiator includes it, reflector does not).
+			 * Without role info, try 5 bytes if remaining data
+			 * aligns exactly, otherwise default to 3 bytes.
+			 */
+			if (frame->size >= 5 &&
+					frame->size % 5 == 0 &&
+					frame->size / 5 ==
+					(size_t)(num_steps - step_idx)) {
+				step_data_len = 5;
+			} else if (frame->size >= 3) {
+				step_data_len = 3;
+			} else {
+				print_text(COLOR_ERROR,
+					"          Insufficient data for Mode 0");
+				return;
+			}
+			break;
+		case 1:
+			/* Mode 1: Always 6 bytes */
+			if (frame->size < 6) {
+				print_text(COLOR_ERROR,
+					"          Insufficient data for Mode 1");
+				return;
+			}
+			step_data_len = 6;
+			break;
+		case 2:
+			/* Mode 2: 1 byte antenna + num_antenna_paths * 4
+			 * bytes per path
+			 */
+			step_data_len = 1 + ((num_antenna_paths + 1) * 4);
+			if (frame->size < step_data_len) {
+				print_text(COLOR_ERROR,
+					"          Insufficient data for Mode 2 (need %u)",
+					step_data_len);
+				return;
+			}
+			break;
+		case 3:
+			/* Mode 3: 6 bytes Mode 1 + 1 byte antenna +
+			 * num_antenna_paths * 4 bytes
+			 */
+			step_data_len = 7 + ((num_antenna_paths + 1) * 4);
+			if (frame->size < step_data_len) {
+				print_text(COLOR_ERROR,
+					"          Insufficient data for Mode 3 (need %u)",
+					step_data_len);
+				return;
+			}
+			break;
+		default:
+			print_text(COLOR_ERROR, "          Unknown mode type");
+			return;
+		}
+
+		if (step_data_len > frame->size) {
+			print_text(COLOR_ERROR,
+				"          Invalid step data length");
+			return;
+		}
+
+		if (step_data_len > 0) {
+			struct l2cap_frame step_frame;
+
+			l2cap_frame_clone(&step_frame, frame);
+			step_frame.size = step_data_len;
+
+			switch (mode_type) {
+			case 0:
+				print_step_mode_0(&step_frame, step_data_len);
+				break;
+			case 1:
+				print_step_mode_1(&step_frame, step_data_len);
+				break;
+			case 2:
+				print_step_mode_2(&step_frame, step_data_len,
+						num_antenna_paths);
+				break;
+			case 3:
+				print_step_mode_3(&step_frame, step_data_len,
+						num_antenna_paths);
+				break;
+			}
+
+			if (!l2cap_frame_pull((void *)frame, frame,
+							step_data_len))
+				return;
+		}
+	}
+}
+
+static void ras_ranging_data_read(const struct l2cap_frame *frame)
+{
+	uint8_t seg_header;
+	bool first_segment = false;
+
+	if (!l2cap_frame_get_u8((void *)frame, &seg_header)) {
+		print_text(COLOR_ERROR, "  Segmentation Header: invalid size");
+		goto done;
+	}
+
+	print_ras_segmentation_header(seg_header);
+
+	first_segment = seg_header & 0x01;
+	/* Only try to decode headers if this is the first segment */
+	if (first_segment && frame->size >= 4) {
+		uint8_t num_steps;
+		uint8_t num_antenna_paths;
+
+		print_field("  Ranging Data Body:");
+		num_antenna_paths = print_ras_ranging_header(frame);
+
+		/* Try to decode subevent header if enough data remains */
+		if (frame->size >= 8) {
+			print_field("    Subevent #0:");
+			num_steps = print_ras_subevent_header(frame);
+
+			/* Parse steps if we have num_steps and
+			 * num_antenna_paths
+			 */
+			if (num_steps > 0 && num_antenna_paths > 0 &&
+						frame->size > 0) {
+				print_ranging_steps((void *)frame, num_steps,
+						num_antenna_paths);
+			}
+		}
+	} else if (!first_segment && frame->size > 0) {
+		/* For continuation segments, we cannot reliably decode without
+		 * full segment reassembly, as steps may be split across
+		 * segments.
+		 * Just show the raw data.
+		 */
+		print_field("  Continuation Segment (raw data - requires "
+				"reassembly for proper decoding):");
+		print_hex_field("    Segment Data", frame->data, frame->size);
+	}
+
+	if (frame->size > 0 && first_segment)
+		print_hex_field("  Remaining Ranging Data Segment",
+						frame->data, frame->size);
+
+done:
+	if (frame->size && first_segment)
+		print_hex_field("  Remaining Data", frame->data, frame->size);
+}
+
+static void ras_ranging_data_notify(const struct l2cap_frame *frame)
+{
+	ras_ranging_data_read(frame);
+}
+
+static bool ras_get_ranging_data_cmd(const struct l2cap_frame *frame)
+{
+	uint16_t ranging_counter;
+
+	if (!l2cap_frame_get_le16((void *)frame, &ranging_counter)) {
+		print_text(COLOR_ERROR, "    Ranging Counter: invalid size");
+		return false;
+	}
+
+	print_field("    Ranging Counter: 0x%4.4x", ranging_counter);
+
+	return true;
+}
+
+static bool ras_ack_ranging_data_cmd(const struct l2cap_frame *frame)
+{
+	uint16_t ranging_counter;
+
+	if (!l2cap_frame_get_le16((void *)frame, &ranging_counter)) {
+		print_text(COLOR_ERROR, "    Ranging Counter: invalid size");
+		return false;
+	}
+
+	print_field("    Ranging Counter: 0x%4.4x", ranging_counter);
+
+	return true;
+}
+
+static bool ras_retrieve_lost_segments_cmd(const struct l2cap_frame *frame)
+{
+	uint16_t ranging_counter;
+	uint8_t first_segment, last_segment;
+
+	if (!l2cap_frame_get_le16((void *)frame, &ranging_counter)) {
+		print_text(COLOR_ERROR, "    Ranging Counter: invalid size");
+		return false;
+	}
+
+	print_field("    Ranging Counter: 0x%4.4x", ranging_counter);
+
+	if (!l2cap_frame_get_u8((void *)frame, &first_segment)) {
+		print_text(COLOR_ERROR,
+			"    First Segment Index: invalid size");
+		return false;
+	}
+
+	print_field("    First Segment Index: %u", first_segment);
+
+	if (!l2cap_frame_get_u8((void *)frame, &last_segment)) {
+		print_text(COLOR_ERROR, "    Last Segment Index: invalid size");
+		return false;
+	}
+
+	if (last_segment == 0xFF)
+		print_field("    Last Segment Index: All remaining (0xFF)");
+	else
+		print_field("    Last Segment Index: %u", last_segment);
+
+	return true;
+}
+
+static bool ras_set_filter_cmd(const struct l2cap_frame *frame)
+{
+	uint16_t filter_config;
+	uint8_t mode;
+	uint16_t filter_mask;
+
+	if (!l2cap_frame_get_le16((void *)frame, &filter_config)) {
+		print_text(COLOR_ERROR,
+			"    Filter Configuration: invalid size");
+		return false;
+	}
+
+	mode = filter_config & 0x03;
+	filter_mask = (filter_config >> 2) & 0x3FFF;
+
+	print_field("    Filter Configuration: 0x%4.4x", filter_config);
+	print_field("      Mode: %u", mode);
+	print_field("      Filter Bit Mask: 0x%4.4x", filter_mask);
+
+	return true;
+}
+
+#define RAS_CMD(_op, _desc, _func) \
+[_op] = { \
+	.desc = _desc, \
+	.func = _func, \
+}
+
+static const struct ras_cmd {
+	const char *desc;
+	bool (*func)(const struct l2cap_frame *frame);
+} ras_cmd_table[] = {
+	/* Opcode = 0x00 (Get Ranging Data) */
+	RAS_CMD(0x00, "Get Ranging Data", ras_get_ranging_data_cmd),
+	/* Opcode = 0x01 (ACK Ranging Data) */
+	RAS_CMD(0x01, "ACK Ranging Data", ras_ack_ranging_data_cmd),
+	/* Opcode = 0x02 (Retrieve Lost Ranging Data Segments) */
+	RAS_CMD(0x02, "Retrieve Lost Ranging Data Segments",
+					ras_retrieve_lost_segments_cmd),
+	/* Opcode = 0x03 (Abort Operation) */
+	RAS_CMD(0x03, "Abort Operation", NULL),
+	/* Opcode = 0x04 (Set Filter) */
+	RAS_CMD(0x04, "Set Filter", ras_set_filter_cmd),
+};
+
+static const struct ras_cmd *ras_get_cmd(uint8_t op)
+{
+	if (op > ARRAY_SIZE(ras_cmd_table))
+		return NULL;
+
+	return &ras_cmd_table[op];
+}
+
+static void ras_control_point_write(const struct l2cap_frame *frame)
+{
+	uint8_t opcode;
+	const struct ras_cmd *cmd;
+
+	if (!l2cap_frame_get_u8((void *)frame, &opcode)) {
+		print_text(COLOR_ERROR, "    Opcode: invalid size");
+		goto done;
+	}
+
+	cmd = ras_get_cmd(opcode);
+	if (!cmd) {
+		print_field("    Opcode: Reserved (0x%2.2x)", opcode);
+		goto done;
+	}
+
+	print_field("    Opcode: %s (0x%2.2x)", cmd->desc, opcode);
+
+	if (cmd->func && !cmd->func(frame))
+		goto done;
+
+done:
+	if (frame->size)
+		print_hex_field("  Data", frame->data, frame->size);
+}
+
+static void ras_data_ready_read(const struct l2cap_frame *frame)
+{
+	uint16_t counter;
+
+	if (!l2cap_frame_get_le16((void *)frame, &counter)) {
+		print_text(COLOR_ERROR, "    Counter: invalid size");
+		goto done;
+	}
+
+	print_field("    Counter: %u", counter);
+
+done:
+	if (frame->size)
+		print_hex_field("  Data", frame->data, frame->size);
+}
+
+static void ras_data_ready_notify(const struct l2cap_frame *frame)
+{
+	ras_data_ready_read(frame);
+}
+
+static void ras_data_overwritten_read(const struct l2cap_frame *frame)
+{
+	uint16_t counter;
+
+	if (!l2cap_frame_get_le16((void *)frame, &counter)) {
+		print_text(COLOR_ERROR, "    Counter: invalid size");
+		goto done;
+	}
+
+	print_field("    Overwritten Count: %u", counter);
+
+done:
+	if (frame->size)
+		print_hex_field("  Data", frame->data, frame->size);
+}
+
+static void ras_data_overwritten_notify(const struct l2cap_frame *frame)
+{
+	ras_data_overwritten_read(frame);
+}
+
 #define GMAS \
 	GATT_HANDLER(0x2c00, gmap_role_read, NULL, NULL), \
 	GATT_HANDLER(0x2c01, ugg_features_read, NULL, NULL), \
 	GATT_HANDLER(0x2c02, ugt_features_read, NULL, NULL), \
 	GATT_HANDLER(0x2c02, bgs_features_read, NULL, NULL), \
 	GATT_HANDLER(0x2c03, bgr_features_read, NULL, NULL)
+
+#define RAS \
+	GATT_HANDLER(0x2c14, ras_features_read, NULL, NULL), \
+	GATT_HANDLER(0x2c15, ras_ranging_data_read, NULL, \
+					ras_ranging_data_notify), \
+	GATT_HANDLER(0x2c16, ras_ranging_data_read, NULL, \
+					ras_ranging_data_notify), \
+	GATT_HANDLER(0x2c17, NULL, ras_control_point_write, NULL), \
+	GATT_HANDLER(0x2c18, ras_data_ready_read, NULL, \
+					ras_data_ready_notify), \
+	GATT_HANDLER(0x2c19, ras_data_overwritten_read, NULL, \
+					ras_data_overwritten_notify)
+
+static const struct bitfield_data hog_info_flags[] = {
+	{  0, "RemoteWake (0x01)"			},
+	{  1, "NormallyConnectable (0x02)"		},
+	{  2, "SCI Supported (0x04)"			},
+	{  3, "SCI Low Power Mode Supported (0x08)"	},
+	{ }
+};
+
+static void hog_info_read(const struct l2cap_frame *frame)
+{
+	uint16_t bcdhid;
+	uint8_t bcc, flags, mask;
+
+	if (!l2cap_frame_get_le16((void *)frame, &bcdhid)) {
+		print_text(COLOR_ERROR, "    bcdHID: invalid size");
+		goto done;
+	}
+
+	print_field("    bcdHID: 0x%4.4x", bcdhid);
+
+	if (!l2cap_frame_get_u8((void *)frame, &bcc)) {
+		print_text(COLOR_ERROR, "    bCountryCode: invalid size");
+		goto done;
+	}
+
+	print_field("    bCountryCode: 0x%2.2x", bcc);
+
+	if (!l2cap_frame_get_u8((void *)frame, &flags)) {
+		print_text(COLOR_ERROR, "    Flags: invalid size");
+		goto done;
+	}
+
+	print_field("    Flags: 0x%2.2x", flags);
+
+	mask = print_bitfield(4, flags, hog_info_flags);
+	if (mask)
+		print_text(COLOR_WHITE_BG, "    Unknown fields (0x%2.2x)",
+								mask);
+
+done:
+	if (frame->size)
+		print_hex_field("  Data", frame->data, frame->size);
+}
+
+static const char *hog_cmd_str(uint8_t opcode)
+{
+	switch (opcode) {
+	case 0x00:
+		return "Suspend";
+	case 0x01:
+		return "Exit Suspend";
+	default:
+		return NULL;
+	}
+}
+
+static void hog_cp_write(const struct l2cap_frame *frame)
+{
+	uint8_t opcode;
+	const char *str;
+
+	if (!l2cap_frame_get_u8((void *)frame, &opcode)) {
+		print_text(COLOR_ERROR, "    Opcode: invalid size");
+		goto done;
+	}
+
+	str = hog_cmd_str(opcode);
+	if (!str) {
+		print_field("    Opcode: Reserved (0x%2.2x)", opcode);
+		goto done;
+	}
+
+	print_field("    Opcode: %s (0x%2.2x)", str, opcode);
+
+done:
+	if (frame->size)
+		print_hex_field("  Data", frame->data, frame->size);
+}
+
+static void print_sci_mode(const struct l2cap_frame *frame)
+{
+	uint8_t mode;
+
+	if (!l2cap_frame_get_u8((void *)frame, &mode)) {
+		print_text(COLOR_ERROR, "    Mode: invalid size");
+		goto done;
+	}
+
+	switch (mode) {
+	case 0x00:
+		print_field("    Mode: None (0x00)");
+		break;
+	case 0x02:
+		print_field("    Mode:  SCI Default Mode (0x02)");
+		break;
+	case 0x03:
+		print_field("    Mode:  SCI Fast Mode (0x03)");
+		break;
+	case 0x04:
+		print_field("    Mode:  SCI Low Power Mode (0x04)");
+		break;
+	case 0x05:
+		print_field("    Mode:  SCI Full Range Mode (0x04)");
+		break;
+	default:
+		print_field("    Mode:  Reserved (0x%2.2x)", mode);
+		break;
+	}
+
+done:
+	if (frame->size)
+		print_hex_field("  Data", frame->data, frame->size);
+}
+
+static void hog_sci_mode_read(const struct l2cap_frame *frame)
+{
+	print_sci_mode(frame);
+}
+
+static void hog_sci_mode_notify(const struct l2cap_frame *frame)
+{
+	print_sci_mode(frame);
+}
+
+static void hog_sci_info_read(const struct l2cap_frame *frame)
+{
+	uint8_t min_conn_interval;
+	uint8_t num_grps;
+	uint8_t i;
+
+	if (!l2cap_frame_get_u8((void *)frame, &min_conn_interval)) {
+		print_text(COLOR_ERROR, "    Minimum Supported Connection "
+				"Interval: invalid size");
+		goto done;
+	}
+
+	print_field("    Minimum Supported Connection Interval: %.3f ms "
+		    "(0x%2.2x) ", min_conn_interval * 0.125, min_conn_interval);
+
+	if (!l2cap_frame_get_u8((void *)frame, &num_grps)) {
+		print_text(COLOR_ERROR, "    Number of Supported Subgroups: "
+				"invalid size");
+		goto done;
+	}
+
+	print_field("    Number of Supported Subgroups: %d", num_grps);
+
+	for (i = 0; i < num_grps; i++) {
+		uint16_t min, max, stride;
+
+		if (!l2cap_frame_get_le16((void *)frame, &min)) {
+			print_text(COLOR_ERROR, "    group[%u]: Minimum "
+					"Connection Interval: invalid size",
+					i);
+			goto done;
+		}
+
+		if (!l2cap_frame_get_le16((void *)frame, &max)) {
+			print_text(COLOR_ERROR, "    group[%u]: Maximum "
+					"Connection Interval: invalid size",
+					i);
+			goto done;
+		}
+
+		if (!l2cap_frame_get_le16((void *)frame, &stride)) {
+			print_text(COLOR_ERROR, "    group[%u]: Connection "
+					"Interval Stride: invalid size",
+					i);
+			goto done;
+		}
+
+		print_field("      Minimum Connection Interval[%u]: %.3f ms "
+				"(0x%4.4x)", i, min * 0.125, min);
+		print_field("      Maximum Connection Interval[%u]: %.3f ms "
+				"(0x%4.4x)", i, max * 0.125, max);
+		print_field("      Connection Interval Stride[%u]: %.3f ms "
+				"(0x%4.4x)", i, stride * 0.125, stride);
+	}
+
+done:
+	if (frame->size)
+		print_hex_field("  Data", frame->data, frame->size);
+}
+
+#define HIDS \
+	GATT_HANDLER(0x2a4a, hog_info_read, NULL, NULL), \
+	GATT_HANDLER(0x2a4c, NULL, hog_cp_write, NULL), \
+	GATT_HANDLER(0x2c39, hog_sci_mode_read, NULL, hog_sci_mode_notify), \
+	GATT_HANDLER(0x2c3a, hog_sci_info_read, NULL, NULL)
 
 #define GATT_HANDLER(_uuid, _read, _write, _notify) \
 { \
@@ -4144,7 +5160,9 @@ static const struct gatt_handler {
 	GATT_HANDLER(0x2bc1, incoming_call_read, NULL, incoming_call_notify),
 	GATT_HANDLER(0x2bc2, call_friendly_name_read, NULL,
 					call_friendly_name_notify),
-	GMAS
+	HIDS,
+	GMAS,
+	RAS
 };
 
 static const struct gatt_handler *get_handler_uuid(const bt_uuid_t *uuid)
@@ -4462,11 +5480,11 @@ static void att_read_rsp(const struct l2cap_frame *frame)
 {
 	struct att_read *read;
 
-	print_hex_field("Value", frame->data, frame->size);
-
 	read = att_get_read(frame);
-	if (!read)
+	if (!read) {
+		print_hex_field("Value", frame->data, frame->size);
 		return;
+	}
 
 	/* Check if the data size is equal to the MTU then read long procedure
 	 * maybe used.

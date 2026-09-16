@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0
 AC_PREREQ(2.60)
-AC_INIT(bluez, 5.85)
+AC_INIT(bluez, 5.87)
 
 AM_INIT_AUTOMAKE([foreign subdir-objects color-tests silent-rules
 					tar-pax no-dist-gzip dist-xz])
@@ -162,10 +162,6 @@ AC_ARG_ENABLE(nfc, AS_HELP_STRING([--enable-nfc],
 		[enable NFC pairing]), [enable_nfc=${enableval}])
 AM_CONDITIONAL(NFC, test "${enable_nfc}" = "yes")
 
-AC_ARG_ENABLE(sap, AS_HELP_STRING([--enable-sap],
-		[enable SAP profile]), [enable_sap=${enableval}])
-AM_CONDITIONAL(SAP, test "${enable_sap}" = "yes")
-
 AC_ARG_ENABLE(a2dp, AS_HELP_STRING([--disable-a2dp],
 		[disable A2DP profile]), [enable_a2dp=${enableval}])
 AM_CONDITIONAL(A2DP, test "${enable_a2dp}" != "no")
@@ -191,10 +187,6 @@ AM_CONDITIONAL(HID, test "${enable_hid}" != "no")
 AC_ARG_ENABLE(hog, AS_HELP_STRING([--disable-hog],
 		[disable HoG profile]), [enable_hog=${enableval}])
 AM_CONDITIONAL(HOG, test "${enable_hog}" != "no")
-
-AC_ARG_ENABLE(health, AS_HELP_STRING([--enable-health],
-		[enable health profiles]), [enable_health=${enableval}])
-AM_CONDITIONAL(HEALTH, test "${enable_health}" = "yes")
 
 AC_ARG_ENABLE(bap, AS_HELP_STRING([--disable-bap],
 		[disable BAP profile]), [enable_bap=${enableval}])
@@ -314,7 +306,9 @@ fi
 AC_ARG_ENABLE(obex, AS_HELP_STRING([--disable-obex],
 		[disable OBEX profile support]), [enable_obex=${enableval}])
 if (test "${enable_obex}" != "no"); then
-	PKG_CHECK_MODULES(ICAL, libical)
+	PKG_CHECK_MODULES(ICAL, [libicalvcal >= 4.0.0], [],
+                [PKG_CHECK_MODULES(ICAL, [libical])]
+        )
 fi
 AM_CONDITIONAL(OBEX, test "${enable_obex}" != "no")
 
@@ -411,6 +405,28 @@ if (test "${enable_testing}" = "yes"); then
 	[], [], [[#include <time.h>
 		#include <linux/errqueue.h>
 		#include <linux/net_tstamp.h>]])
+fi
+
+AC_ARG_ENABLE(functional-testing, AS_HELP_STRING([--enable-functional-testing],
+			[enable functional testing tools]),
+			[enable_functional_testing=yes; functional_testing_kernel=${enableval}],
+                        [enable_functional_testing=no])
+AM_CONDITIONAL(FUNCTIONAL_TESTING, test "${enable_functional_testing}" = "yes")
+AC_ARG_VAR(FUNCTIONAL_TESTING_KERNEL, [vmlinux image to use for functional testing])
+FUNCTIONAL_TESTING_KERNEL=${functional_testing_kernel}
+
+if (test "${enable_functional_testing}" = "yes"); then
+  if (test "${enable_client}" = "no" || \
+      test "${enable_tools}" != "yes" || \
+      test "${enable_testing}" != "yes"); then
+    AC_MSG_ERROR([--enable-functional-testing requires --enable-client --enable-tools --enable-testing])
+  fi
+  AC_MSG_CHECKING([pytest and dependencies])
+  python3 -m pip install --dry-run --no-index -r "${srcdir}/test/functional/requirements.txt" >/dev/null
+  if (test "$?" != "0"); then
+    AC_MSG_ERROR([pytest or dependencies missing])
+  fi
+  AC_MSG_RESULT([ok])
 fi
 
 AC_ARG_ENABLE(experimental, AS_HELP_STRING([--enable-experimental],
@@ -523,11 +539,11 @@ AC_SUBST(PLUGIN_PHONEBOOK, [${plugin_phonebook}])
 AC_CONFIG_FILES(
 	lib/bluez.pc
 	Makefile
-	mesh/bluetooth-meshd.rst
+	doc/bluetooth-meshd.rst
 	mesh/bluetooth-mesh.service
 	obexd/src/obex.service
 	obexd/src/org.bluez.obex.service
-	src/bluetoothd.rst
+	doc/bluetoothd.rst
 	src/bluetooth.service
 	tools/bluetooth-logger.service
 	tools/mpris-proxy.service

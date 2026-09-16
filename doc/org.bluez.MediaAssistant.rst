@@ -17,6 +17,7 @@ Interface
 :Service:	org.bluez
 :Interface:	org.bluez.MediaAssistant1
 :Object path:	/org/bluez/{hci0,hci1,...}/dev_{BDADDR}/src_{BDADDR}/sid#/bis#
+:Used by:	**bluetoothctl-assistant(1)**
 
 Methods
 -------
@@ -25,6 +26,10 @@ void Push(dict properties)
 ````````````````````````````````````````````````````````
 
 Send stream information to the remote device.
+
+If the assistant is in the "active" state, this method uses
+BASS_Modify_Source to update the existing source on the remote device
+instead of adding a new one with BASS_Add_Source.
 
 :dict properties:
 
@@ -44,6 +49,10 @@ Values:
 
 		Push to a specific device. Device must be connected and with
 		an active BASS session.
+
+Examples:
+
+:bluetoothctl: > assistant.push <assistant>
 
 Properties
 ----------

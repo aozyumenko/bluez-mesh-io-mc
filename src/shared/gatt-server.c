@@ -26,14 +26,6 @@
 #include "src/shared/util.h"
 #include "src/shared/timeout.h"
 
-#ifndef MAX
-#define MAX(a, b) ((a) > (b) ? (a) : (b))
-#endif
-
-#ifndef MIN
-#define MIN(a, b) ((a) < (b) ? (a) : (b))
-#endif
-
 /*
  * TODO: This is an arbitrary limit. Come up with something reasonable or
  * perhaps an API to set this value if there is a use case for it.
@@ -93,6 +85,7 @@ struct bt_gatt_server {
 	struct bt_att *att;
 	int ref_count;
 	uint16_t mtu;
+	bool perms;
 
 	unsigned int mtu_id;
 	unsigned int read_by_grp_type_id;
@@ -275,7 +268,7 @@ static void read_by_grp_type_cb(struct bt_att_chan *chan, uint16_t mtu,
 	uint16_t start, end;
 	bt_uuid_t type;
 	bt_uuid_t prim, snd;
-	uint8_t rsp_pdu[mtu];
+	uint8_t *rsp_pdu = NULL;
 	uint16_t rsp_len;
 	uint8_t ecode = 0;
 	uint16_t ehandle = 0;
@@ -326,6 +319,12 @@ static void read_by_grp_type_cb(struct bt_att_chan *chan, uint16_t mtu,
 		goto error;
 	}
 
+	rsp_pdu = malloc(mtu);
+	if (!rsp_pdu) {
+		ecode = BT_ATT_ERROR_INSUFFICIENT_RESOURCES;
+		goto error;
+	}
+
 	if (!encode_read_by_grp_type_rsp(server->db, q, server->att, mtu,
 							rsp_pdu, &rsp_len)) {
 		ecode = BT_ATT_ERROR_UNLIKELY;
@@ -337,11 +336,14 @@ static void read_by_grp_type_cb(struct bt_att_chan *chan, uint16_t mtu,
 	bt_att_chan_send_rsp(chan, BT_ATT_OP_READ_BY_GRP_TYPE_RSP,
 						rsp_pdu, rsp_len);
 
+	free(rsp_pdu);
+
 	return;
 
 error:
 	queue_destroy(q, NULL);
 	bt_att_chan_send_error_rsp(chan, opcode, ehandle, ecode);
+	free(rsp_pdu);
 }
 
 static void async_read_op_destroy(struct async_read_op *op)
@@ -413,6 +415,9 @@ static uint8_t check_permissions(struct bt_gatt_server *server,
 	uint8_t enc_size;
 	uint32_t perm;
 	int security;
+
+	if (!server->perms)
+		return 0;
 
 	perm = gatt_db_attribute_get_permissions(attr);
 
@@ -615,7 +620,7 @@ static void find_info_cb(struct bt_att_chan *chan, uint16_t mtu, uint8_t opcode,
 {
 	struct bt_gatt_server *server = user_data;
 	uint16_t start, end;
-	uint8_t rsp_pdu[mtu];
+	uint8_t *rsp_pdu = NULL;
 	uint16_t rsp_len;
 	uint8_t ecode = 0;
 	uint16_t ehandle = 0;
@@ -652,6 +657,12 @@ static void find_info_cb(struct bt_att_chan *chan, uint16_t mtu, uint8_t opcode,
 		goto error;
 	}
 
+	rsp_pdu = malloc(mtu);
+	if (!rsp_pdu) {
+		ecode = BT_ATT_ERROR_INSUFFICIENT_RESOURCES;
+		goto error;
+	}
+
 	if (!encode_find_info_rsp(server->db, q, mtu, rsp_pdu, &rsp_len)) {
 		ecode = BT_ATT_ERROR_UNLIKELY;
 		goto error;
@@ -661,11 +672,14 @@ static void find_info_cb(struct bt_att_chan *chan, uint16_t mtu, uint8_t opcode,
 
 	queue_destroy(q, NULL);
 
+	free(rsp_pdu);
+
 	return;
 
 error:
 	bt_att_chan_send_error_rsp(chan, opcode, ehandle, ecode);
 	queue_destroy(q, NULL);
+	free(rsp_pdu);
 
 }
 
@@ -713,12 +727,18 @@ static void find_by_type_val_cb(struct bt_att_chan *chan, uint16_t mtu,
 	struct bt_gatt_server *server = user_data;
 	uint16_t start, end, uuid16;
 	struct find_by_type_val_data data;
-	uint8_t rsp_pdu[mtu];
+	uint8_t *rsp_pdu = NULL;
 	uint16_t ehandle = 0;
 	bt_uuid_t uuid;
 
 	if (length < 6) {
 		data.ecode = BT_ATT_ERROR_INVALID_PDU;
+		goto error;
+	}
+
+	rsp_pdu = malloc(mtu);
+	if (!rsp_pdu) {
+		data.ecode = BT_ATT_ERROR_INSUFFICIENT_RESOURCES;
 		goto error;
 	}
 
@@ -756,10 +776,13 @@ static void find_by_type_val_cb(struct bt_att_chan *chan, uint16_t mtu,
 	bt_att_chan_send_rsp(chan, BT_ATT_OP_FIND_BY_TYPE_RSP,
 					data.pdu, data.len);
 
+	free(rsp_pdu);
+
 	return;
 
 error:
 	bt_att_chan_send_error_rsp(chan, opcode, ehandle, data.ecode);
+	free(rsp_pdu);
 }
 
 static void async_write_op_destroy(struct async_write_op *op)
@@ -1178,12 +1201,12 @@ static bool append_prep_data(struct prep_write_data *prep_data, uint16_t handle,
 					uint16_t length, uint8_t *value)
 {
 	uint8_t *val;
-	uint16_t len;
+	size_t len;
 
 	if (!length)
 		return true;
 
-	len = prep_data->length + length;
+	len = (size_t)prep_data->length + (size_t)length;
 
 	val = realloc(prep_data->value, len);
 	if (!val)
@@ -1192,7 +1215,10 @@ static bool append_prep_data(struct prep_write_data *prep_data, uint16_t handle,
 	memcpy(val + prep_data->length, value, length);
 
 	prep_data->value = val;
-	prep_data->length = len;
+
+	if (len > UINT16_MAX)
+		return false;
+	prep_data->length = (uint16_t)len;
 
 	return true;
 }
@@ -1652,6 +1678,7 @@ struct bt_gatt_server *bt_gatt_server_new(struct gatt_db *db,
 	server->db = gatt_db_ref(db);
 	server->att = bt_att_ref(att);
 	server->mtu = MAX(mtu, BT_ATT_DEFAULT_LE_MTU);
+	server->perms = true;
 	server->max_prep_queue_len = DEFAULT_MAX_PREP_QUEUE_LEN;
 	server->prep_queue = queue_new();
 	server->min_enc_size = min_enc_size;
@@ -1678,6 +1705,14 @@ struct bt_att *bt_gatt_server_get_att(struct bt_gatt_server *server)
 		return NULL;
 
 	return server->att;
+}
+
+void bt_gatt_server_set_permissions(struct bt_gatt_server *server, bool value)
+{
+	if (!server)
+		return;
+
+	server->perms = value;
 }
 
 struct bt_gatt_server *bt_gatt_server_ref(struct bt_gatt_server *server)
