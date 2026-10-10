@@ -40,7 +40,10 @@
 
 #define AL_SIZE			16
 #define RL_SIZE			16
-#define CIS_SIZE		3
+/* Maximum number of CIS of a CIG, as the Num_CIS of LE Set CIG
+ * Parameters ranges from 0x00 to 0x1f
+ */
+#define CIS_SIZE		31
 #define BIS_SIZE		3
 #define CIG_SIZE		3
 
@@ -265,8 +268,6 @@ struct btdev {
 	uint16_t sync_train_interval;
 	uint32_t sync_train_timeout;
 	uint8_t  sync_train_service_data;
-
-	uint16_t le_ext_adv_type;
 
 	); /* reset_group */
 
@@ -1589,9 +1590,14 @@ static int cmd_add_sco_conn(struct btdev *dev, const void *data, uint8_t len)
 done:
 	send_event(dev, BT_HCI_EVT_CONN_COMPLETE, &cc, sizeof(cc));
 
-	if (conn)
+	if (conn) {
+		/* Each device assigns its own handles, so the event of
+		 * the receiving side carries its handle.
+		 */
+		cc.handle = cpu_to_le16(conn->link->handle);
 		send_event(conn->link->dev, BT_HCI_EVT_CONN_COMPLETE,
 							&cc, sizeof(cc));
+	}
 
 	return 0;
 }
@@ -3765,29 +3771,6 @@ done:
 	return 0;
 }
 
-static uint16_t ext_legacy_adv_type(uint8_t type)
-{
-	switch (type) {
-	case 0x00:
-		/* Connectable undirected - ADV_IND" */
-		return 0x0013;
-	case 0x01:
-		/* Connectable directed - ADV_DIRECT_IND */
-		return 0x0015;
-	case 0x02:
-		/* Scannable undirected - ADV_SCAN_IND */
-		return 0x0012;
-	case 0x03:
-		/* Non connectable undirected - ADV_NONCONN_IND */
-		return 0x0010;
-	case 0x04:
-		/* Scan response - SCAN_RSP */
-		return 0x0012;
-	}
-
-	return 0x0000;
-}
-
 static int cmd_set_adv_params(struct btdev *dev, const void *data, uint8_t len)
 {
 	const struct bt_hci_cmd_le_set_adv_parameters *cmd = data;
@@ -3799,8 +3782,6 @@ static int cmd_set_adv_params(struct btdev *dev, const void *data, uint8_t len)
 	}
 
 	dev->le_adv_type = cmd->type;
-	/* Use Legacy PDU if the remote is using EXT Scan */
-	dev->le_ext_adv_type = ext_legacy_adv_type(cmd->type);
 	dev->le_adv_own_addr = cmd->own_addr_type;
 	dev->le_adv_direct_addr_type = cmd->direct_addr_type;
 	memcpy(dev->le_adv_direct_addr, cmd->direct_addr, 6);
@@ -4196,12 +4177,17 @@ static void le_conn_complete(struct btdev *btdev,
 			memcpy(cc.peer_addr, btdev->bdaddr, 6);
 
 		cc.role = 0x01;
-		cc.handle = cpu_to_le16(conn->handle);
+		/* Each device assigns its own handles, so the event of
+		 * the receiving side carries its handle.
+		 */
+		cc.handle = cpu_to_le16(conn->link->handle);
 		cc.interval = lecc->max_interval;
 		cc.latency = lecc->latency;
 		cc.supv_timeout = lecc->supv_timeout;
 		le_meta_event(conn->link->dev, BT_HCI_EVT_LE_CONN_COMPLETE,
 					&cc, sizeof(cc));
+
+		cc.handle = cpu_to_le16(conn->handle);
 	}
 
 	cc.status = status;
@@ -4709,10 +4695,12 @@ static void le_conn_update(struct btdev *btdev, uint16_t handle,
 	le_meta_event(btdev, BT_HCI_EVT_LE_CONN_UPDATE_COMPLETE, &ev,
 					sizeof(ev));
 
-	if (conn)
+	if (conn) {
+		ev.handle = cpu_to_le16(conn->link->handle);
 		le_meta_event(conn->link->dev,
 					BT_HCI_EVT_LE_CONN_UPDATE_COMPLETE,
 					&ev, sizeof(ev));
+	}
 }
 
 static void le_conn_param_req(struct btdev *btdev, uint16_t handle,
@@ -4729,7 +4717,7 @@ static void le_conn_param_req(struct btdev *btdev, uint16_t handle,
 
 	memset(&ev, 0, sizeof(ev));
 
-	ev.handle = cpu_to_le16(handle);
+	ev.handle = cpu_to_le16(conn->link->handle);
 	ev.min_interval = cpu_to_le16(min_interval);
 	ev.max_interval = cpu_to_le16(max_interval);
 	ev.latency = cpu_to_le16(latency);
@@ -4845,7 +4833,7 @@ static int cmd_start_encrypt(struct btdev *dev, const void *data, uint8_t len)
 
 	memcpy(dev->le_ltk, cmd->ltk, 16);
 
-	ev.handle = cpu_to_le16(conn->handle);
+	ev.handle = cpu_to_le16(conn->link->handle);
 	ev.ediv = cmd->ediv;
 	ev.rand = cmd->rand;
 
@@ -5003,7 +4991,7 @@ static int cmd_conn_param_neg_reply_complete(struct btdev *dev,
 
 	memset(&ev, 0, sizeof(ev));
 
-	ev.handle = cpu_to_le16(cmd->handle);
+	ev.handle = cpu_to_le16(conn->link->handle);
 	ev.status = cpu_to_le16(cmd->reason);
 
 	le_meta_event(conn->link->dev, BT_HCI_EVT_LE_CONN_UPDATE_COMPLETE, &ev,
@@ -5549,17 +5537,19 @@ static bool ext_adv_broadcast(void *user_data)
 
 		/* if scannable bit is set the send scan response */
 		if (ext_adv->type & 0x02) {
+			uint16_t rsp_type;
+
 			if (ext_adv->type == 0x13)
-				report_type = 0x1b;
+				rsp_type = 0x1b;
 			else if (ext_adv->type == 0x12)
-				report_type = 0x1a;
+				rsp_type = 0x1a;
 			else if (!(ext_adv->type & 0x10))
-				report_type &= 0x08;
+				rsp_type = report_type | 0x08;
 			else
 				continue;
 
 			send_ext_adv(btdev_list[i], btdev, ext_adv,
-							report_type, true);
+							rsp_type, true);
 		}
 	}
 
@@ -6190,7 +6180,10 @@ static void le_ext_conn_complete(struct btdev *btdev,
 			memcpy(ev.peer_addr, btdev->bdaddr, 6);
 
 		ev.role = 0x01;
-		ev.handle = cpu_to_le16(conn->handle);
+		/* Each device assigns its own handles, so the event of
+		 * the receiving side carries its handle.
+		 */
+		ev.handle = cpu_to_le16(conn->link->handle);
 		ev.interval = lecc->max_interval;
 		ev.latency = lecc->latency;
 		ev.supv_timeout = lecc->supv_timeout;
@@ -6205,7 +6198,10 @@ static void le_ext_conn_complete(struct btdev *btdev,
 				sizeof(ev));
 
 		/* Disable EXT ADV */
-		queue_foreach(conn->link->dev->le_ext_adv, ext_adv_term, conn);
+		queue_foreach(conn->link->dev->le_ext_adv, ext_adv_term,
+								conn->link);
+
+		ev.handle = cpu_to_le16(conn->handle);
 	}
 
 	ev.status = status;
@@ -7063,9 +7059,11 @@ static void le_cis_estabilished(struct btdev *dev, struct btdev_conn *conn,
 
 	le_meta_event(dev, BT_HCI_EVT_LE_CIS_ESTABLISHED, &evt, sizeof(evt));
 
-	if (conn)
+	if (conn) {
+		evt.conn_handle = cpu_to_le16(conn->link->handle);
 		le_meta_event(conn->link->dev, BT_HCI_EVT_LE_CIS_ESTABLISHED,
 						&evt, sizeof(evt));
+	}
 }
 
 static int cmd_create_cis_complete(struct btdev *dev, const void *data,
@@ -7110,8 +7108,11 @@ static int cmd_create_cis_complete(struct btdev *dev, const void *data,
 			}
 		}
 
-		evt.acl_handle = cpu_to_le16(acl->handle);
-		evt.cis_handle = cpu_to_le16(iso->handle);
+		/* Each device assigns its own handles, so the event of
+		 * the receiving side carries its handles.
+		 */
+		evt.acl_handle = cpu_to_le16(acl->link->handle);
+		evt.cis_handle = cpu_to_le16(iso->link->handle);
 		evt.cig_id = le_cig->params.cig_id;
 		evt.cis_id = le_cig->cis[cis_idx].cis_id;
 
@@ -8737,6 +8738,7 @@ static void send_acl(struct btdev *dev, const void *data, uint16_t len)
 	struct iovec iov[3];
 	struct btdev_conn *conn;
 	uint8_t pkt_type = BT_H4_ACL_PKT;
+	uint8_t flags;
 
 	/* Packet type */
 	iov[0].iov_base = &pkt_type;
@@ -8751,11 +8753,18 @@ static void send_acl(struct btdev *dev, const void *data, uint16_t len)
 
 	num_completed_packets(dev, conn);
 
+	flags = acl_flags(hdr.handle);
+
 	/* ACL_START_NO_FLUSH is only allowed from host to controller.
 	 * From controller to host this should be converted to ACL_START.
 	 */
-	if (acl_flags(hdr.handle) == ACL_START_NO_FLUSH)
-		hdr.handle = acl_handle_pack(conn->handle, ACL_START);
+	if (flags == ACL_START_NO_FLUSH)
+		flags = ACL_START;
+
+	/* Each device assigns its own handles, so the one of the
+	 * receiving side has to be used.
+	 */
+	hdr.handle = acl_handle_pack(conn->link->handle, flags);
 
 	iov[1].iov_base = &hdr;
 	iov[1].iov_len = sizeof(hdr);
@@ -8794,8 +8803,8 @@ static void send_sco(struct btdev *dev, const void *data, uint16_t len)
 
 static void send_iso(struct btdev *dev, const void *data, uint16_t len)
 {
-	struct bt_hci_acl_hdr *hdr;
-	struct iovec iov[2];
+	struct bt_hci_acl_hdr hdr;
+	struct iovec iov[3];
 	struct btdev_conn *conn;
 	uint8_t pkt_type = BT_H4_ISO_PKT;
 
@@ -8803,18 +8812,31 @@ static void send_iso(struct btdev *dev, const void *data, uint16_t len)
 	iov[0].iov_base = &pkt_type;
 	iov[0].iov_len = sizeof(pkt_type);
 
-	iov[1].iov_base = hdr = (void *) (data);
-	iov[1].iov_len = len;
+	memcpy(&hdr, data, sizeof(hdr));
 
 	conn = queue_find(dev->conns, match_handle,
-					UINT_TO_PTR(acl_handle(hdr->handle)));
+					UINT_TO_PTR(acl_handle(hdr.handle)));
 	if (!conn)
 		return;
 
 	num_completed_packets(dev, conn);
 
-	if (conn->link)
-		send_packet(conn->link->dev, iov, 2);
+	if (!conn->link)
+		return;
+
+	/* Each device assigns its own handles, so the one of the
+	 * receiving side has to be used.
+	 */
+	hdr.handle = acl_handle_pack(conn->link->handle,
+						acl_flags(hdr.handle));
+
+	iov[1].iov_base = &hdr;
+	iov[1].iov_len = sizeof(hdr);
+
+	iov[2].iov_base = (void *) (data + sizeof(hdr));
+	iov[2].iov_len = len - sizeof(hdr);
+
+	send_packet(conn->link->dev, iov, 3);
 }
 
 void btdev_receive_h4(struct btdev *btdev, const void *data, uint16_t len)

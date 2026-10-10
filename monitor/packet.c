@@ -148,6 +148,7 @@ struct index_data {
 	uint8_t  msft_evt_prefix[8];
 	uint8_t  msft_evt_len;
 	size_t   frame;
+	struct queue *cmd_q;
 	struct index_buf_pool acl;
 	struct index_buf_pool sco;
 	struct index_buf_pool le;
@@ -155,6 +156,275 @@ struct index_data {
 };
 
 static struct index_data index_list[MAX_INDEX];
+
+/* How a deferred command is tied to the event that completes it */
+enum pending_key {
+	PENDING_KEY_NONE,	/* Only one may be outstanding at a time */
+	PENDING_KEY_HANDLE,
+	PENDING_KEY_BDADDR,
+};
+
+/*
+ * Commands awaiting a Command Complete or a Command Status, so that the
+ * response can point back at the frame that carried the request.
+ */
+struct pending_cmd {
+	uint16_t opcode;
+	size_t frame;
+	struct timeval tv;
+	bool deferred;		/* Completed by an event, not by the status */
+	bool acked;		/* A Command Status has been seen already */
+	uint8_t key_type;
+	uint8_t key[6];
+};
+
+/* Bound the queue so commands that never get a response cannot pile up */
+#define PENDING_CMD_MAX 64
+
+/*
+ * Commands that are only acknowledged by a Command Status and complete
+ * later through a separate event. The key ties a pending command to its
+ * event when more than one may be outstanding, and the offsets are into
+ * the command and the event parameters respectively.
+ */
+struct deferred_data {
+	uint16_t opcode;
+	uint8_t evt;
+	uint8_t subevt;		/* Only used when evt is LE Meta Event */
+	uint8_t key_type;
+	uint8_t cmd_off;
+	uint8_t evt_off;
+};
+
+static const struct deferred_data deferred_table[] = {
+	/* Keyed on the connection handle */
+	{ BT_HCI_CMD_DISCONNECT, 0x05, 0x00, PENDING_KEY_HANDLE, 0, 1 },
+	{ BT_HCI_CMD_AUTH_REQUESTED, 0x06, 0x00, PENDING_KEY_HANDLE, 0, 1 },
+	{ BT_HCI_CMD_SET_CONN_ENCRYPT, 0x08, 0x00, PENDING_KEY_HANDLE, 0, 1 },
+	{ BT_HCI_CMD_SET_CONN_ENCRYPT, 0x59, 0x00, PENDING_KEY_HANDLE, 0, 1 },
+	{ BT_HCI_CMD_READ_REMOTE_FEATURES, 0x0b, 0x00,
+					PENDING_KEY_HANDLE, 0, 1 },
+	{ BT_HCI_CMD_READ_REMOTE_EXT_FEATURES, 0x23, 0x00,
+					PENDING_KEY_HANDLE, 0, 1 },
+	{ BT_HCI_CMD_READ_REMOTE_VERSION, 0x0c, 0x00,
+					PENDING_KEY_HANDLE, 0, 1 },
+	{ BT_HCI_CMD_READ_CLOCK_OFFSET, 0x1c, 0x00,
+					PENDING_KEY_HANDLE, 0, 1 },
+	{ BT_HCI_CMD_LE_READ_REMOTE_FEATURES, 0x3e, 0x04,
+					PENDING_KEY_HANDLE, 0, 1 },
+	{ BT_HCI_CMD_LE_START_ENCRYPT, 0x08, 0x00, PENDING_KEY_HANDLE, 0, 1 },
+	{ BT_HCI_CMD_LE_START_ENCRYPT, 0x59, 0x00, PENDING_KEY_HANDLE, 0, 1 },
+	/* Keyed on the remote address */
+	{ BT_HCI_CMD_CREATE_CONN, 0x03, 0x00, PENDING_KEY_BDADDR, 0, 3 },
+	{ BT_HCI_CMD_ACCEPT_CONN_REQUEST, 0x03, 0x00,
+					PENDING_KEY_BDADDR, 0, 3 },
+	{ BT_HCI_CMD_REMOTE_NAME_REQUEST, 0x07, 0x00,
+					PENDING_KEY_BDADDR, 0, 1 },
+	/*
+	 * Not keyed, as the specification only allows one of these to be
+	 * outstanding at a time. The address in the command cannot be used
+	 * because it is ignored when the accept list is in use.
+	 */
+	{ BT_HCI_CMD_INQUIRY, 0x01, 0x00, PENDING_KEY_NONE, 0, 0 },
+	{ BT_HCI_CMD_LE_CREATE_CONN, 0x3e, 0x01, PENDING_KEY_NONE, 0, 0 },
+	{ BT_HCI_CMD_LE_CREATE_CONN, 0x3e, 0x0a, PENDING_KEY_NONE, 0, 0 },
+	{ BT_HCI_CMD_LE_EXT_CREATE_CONN, 0x3e, 0x01, PENDING_KEY_NONE, 0, 0 },
+	{ BT_HCI_CMD_LE_EXT_CREATE_CONN, 0x3e, 0x0a, PENDING_KEY_NONE, 0, 0 },
+	{ }
+};
+
+static const struct deferred_data *deferred_lookup_opcode(uint16_t opcode)
+{
+	int i;
+
+	for (i = 0; deferred_table[i].opcode; i++) {
+		if (deferred_table[i].opcode == opcode)
+			return &deferred_table[i];
+	}
+
+	return NULL;
+}
+
+/*
+ * Extract the value a pending command is matched on. Handles are masked
+ * since the event carries them without the data flags.
+ */
+static bool deferred_key(uint8_t key_type, const void *data, uint8_t size,
+						uint8_t off, uint8_t *key)
+{
+	switch (key_type) {
+	case PENDING_KEY_NONE:
+		return true;
+	case PENDING_KEY_HANDLE:
+		if (size < off + 2U)
+			return false;
+		put_le16(get_le16(data + off) & 0x0fff, key);
+		return true;
+	case PENDING_KEY_BDADDR:
+		if (size < off + 6U)
+			return false;
+		memcpy(key, data + off, 6);
+		return true;
+	}
+
+	return false;
+}
+
+static bool match_pending_cmd(const void *data, const void *user_data)
+{
+	const struct pending_cmd *cmd = data;
+
+	/*
+	 * A deferred command stays queued after its Command Status, so skip
+	 * the ones already acknowledged or a second command with the same
+	 * opcode would match the first one again.
+	 */
+	return cmd->opcode == PTR_TO_UINT(user_data) && !cmd->acked;
+}
+
+struct pending_match {
+	uint16_t opcode;
+	const uint8_t *key;
+};
+
+static bool match_deferred_cmd(const void *data, const void *user_data)
+{
+	const struct pending_cmd *cmd = data;
+	const struct pending_match *match = user_data;
+
+	return cmd->opcode == match->opcode && cmd->deferred &&
+			!memcmp(cmd->key, match->key, sizeof(cmd->key));
+}
+
+static struct pending_cmd *pending_cmd_find(uint16_t index, uint16_t opcode)
+{
+	if (index >= MAX_INDEX)
+		return NULL;
+
+	/*
+	 * Several commands may be outstanding at once and they need not
+	 * complete in order, so match on the opcode and take the oldest.
+	 */
+	return queue_find(index_list[index].cmd_q, match_pending_cmd,
+							UINT_TO_PTR(opcode));
+}
+
+static void pending_cmd_remove(uint16_t index, struct pending_cmd *cmd)
+{
+	if (index >= MAX_INDEX)
+		return;
+
+	queue_remove(index_list[index].cmd_q, cmd);
+	free(cmd);
+}
+
+/*
+ * Format the request reference for a response, as the frame number of the
+ * command and the time elapsed since it was sent. Leaves the string empty
+ * when the request was not seen, which is the normal case for a capture
+ * started while commands were already in flight.
+ */
+static void pending_cmd_str(struct pending_cmd *cmd, struct timeval *tv,
+						char *str, size_t len)
+{
+	struct timeval delta;
+
+	if (!cmd) {
+		str[0] = '\0';
+		return;
+	}
+
+	if (tv && timerisset(&cmd->tv)) {
+		timersub(tv, &cmd->tv, &delta);
+		snprintf(str, len, "#%zu (%lld.%03lld msec)", cmd->frame,
+				(long long)delta.tv_sec * 1000 +
+						delta.tv_usec / 1000,
+				(long long)delta.tv_usec % 1000);
+	} else
+		snprintf(str, len, "#%zu", cmd->frame);
+}
+
+static void pending_cmd_enqueue(uint16_t index, uint16_t opcode,
+			struct timeval *tv, const void *data, uint8_t size)
+{
+	struct index_data *ctrl = &index_list[index];
+	const struct deferred_data *deferred;
+	struct pending_cmd *cmd;
+	uint8_t key[6] = {};
+
+	deferred = deferred_lookup_opcode(opcode);
+	if (deferred && !deferred_key(deferred->key_type, data, size,
+						deferred->cmd_off, key))
+		deferred = NULL;
+
+	if (!ctrl->cmd_q)
+		ctrl->cmd_q = queue_new();
+
+	if (queue_length(ctrl->cmd_q) >= PENDING_CMD_MAX)
+		free(queue_pop_head(ctrl->cmd_q));
+
+	cmd = new0(struct pending_cmd, 1);
+	cmd->opcode = opcode;
+	cmd->frame = ctrl->frame;
+	if (tv)
+		cmd->tv = *tv;
+
+	if (deferred) {
+		cmd->deferred = true;
+		cmd->key_type = deferred->key_type;
+		memcpy(cmd->key, key, sizeof(key));
+	}
+
+	queue_push_tail(ctrl->cmd_q, cmd);
+}
+
+/*
+ * Resolve the command that an event completes, for the commands that are
+ * only acknowledged by a Command Status and finish later through a
+ * separate event.
+ */
+static void deferred_cmd_str(uint16_t index, uint8_t evt, uint8_t subevt,
+				const void *data, uint8_t size,
+				struct timeval *tv, char *str, size_t len)
+{
+	int i;
+
+	str[0] = '\0';
+
+	if (index >= MAX_INDEX)
+		return;
+
+	for (i = 0; deferred_table[i].opcode; i++) {
+		const struct deferred_data *deferred = &deferred_table[i];
+		struct pending_match match;
+		struct pending_cmd *cmd;
+		uint8_t key[6] = {};
+
+		if (deferred->evt != evt || deferred->subevt != subevt)
+			continue;
+
+		if (!deferred_key(deferred->key_type, data, size,
+						deferred->evt_off, key))
+			continue;
+
+		/*
+		 * Match on the key as well as the opcode, since several of
+		 * these may be outstanding towards different devices and
+		 * they need not complete in order.
+		 */
+		match.opcode = deferred->opcode;
+		match.key = key;
+
+		cmd = queue_find(index_list[index].cmd_q, match_deferred_cmd,
+									&match);
+		if (!cmd)
+			continue;
+
+		pending_cmd_str(cmd, tv, str, len);
+		pending_cmd_remove(index, cmd);
+		return;
+	}
+}
 
 static void assign_ctrl(uint32_t cookie, uint16_t format, const char *name)
 {
@@ -285,6 +555,7 @@ static struct packet_conn_data *release_handle(uint16_t handle)
 
 			queue_destroy(conn->tx_q, free);
 			queue_destroy(conn->chan_q, free);
+			queue_destroy(conn->req_q, free);
 			memset(conn, 0, sizeof(*conn));
 			conn->handle = 0xffff;
 			return conn;
@@ -438,7 +709,7 @@ void packet_select_index(uint16_t index)
 	index_filter = true;
 }
 
-#define print_space(x) printf("%*c", (x), ' ');
+#define print_space(x) display_printf("%*c", (x), ' ')
 
 void packet_set_fallback_manufacturer(uint16_t manufacturer)
 {
@@ -648,12 +919,13 @@ static void print_packet(struct timeval *tv, struct ucred *cred, char ident,
 	}
 
 	if (ts_len > 0) {
-		printf("%s", line);
+		display_printf("%s", line);
 		if (len < col)
 			print_space(col - len - ts_len - 1);
-		printf("%s%s\n", use_color() ? COLOR_TIMESTAMP : "", ts_str);
+		display_printf("%s%s\n", use_color() ? COLOR_TIMESTAMP : "",
+				ts_str);
 	} else
-		printf("%s\n", line);
+		display_printf("%s\n", line);
 }
 
 static const struct {
@@ -2639,6 +2911,15 @@ void packet_print_version(const char *label, uint8_t version,
 	case 0x0e:
 		str = "Bluetooth 6.0";
 		break;
+	case 0x0f:
+		str = "Bluetooth 6.1";
+		break;
+	case 0x10:
+		str = "Bluetooth 6.2";
+		break;
+	case 0x11:
+		str = "Bluetooth 6.3";
+		break;
 	default:
 		str = "Reserved";
 		break;
@@ -3330,6 +3611,7 @@ static const struct bitfield_data events_page2_table[] = {
 	{ 22, "Inquiry Response Notification"				},
 	{ 23, "Authenticated Payload Timeout Expired"			},
 	{ 24, "SAM Status Change"					},
+	{ 25, "Encryption Change [v2]"					},
 	{ }
 };
 
@@ -10840,6 +11122,14 @@ static const struct opcode_data opcode_table[] = {
 	{ 0x2050, 316, "LE Transmitter Test command [v3]",
 				le_tx_test_cmd_v3, 9, false,
 				status_rsp, 1, true },
+	{ 0x2051, 317, "LE Set Connectionless CTE Transmit Parameters" },
+	{ 0x2052, 318, "LE Set Connectionless CTE Transmit Enable" },
+	{ 0x2053, 319, "LE Set Connectionless IQ Sampling Enable" },
+	{ 0x2056, 320, "LE Set Connection CTE Receive Parameters" },
+	{ 0x2055, 321, "LE Set Connection CTE Transmit Parameters" },
+	{ 0x2056, 322, "LE Connection CTE Request Enable" },
+	{ 0x2057, 323, "LE Connection CTE Response Enable" },
+	{ 0x2058, 324, "LE Read Antenna Information" },
 	{ 0x2059, 325, "LE Periodic Advertising Receive Enable",
 				le_pa_rec_enable, 3, true,
 				status_rsp, 1, true },
@@ -10856,6 +11146,8 @@ static const struct opcode_data opcode_table[] = {
 				"Parameters",
 				le_set_default_past_params,
 				6, true, status_rsp, 1, true},
+	{ 0x205e, 330, "LE Generate DHKey [v2]" },
+	{ 0x205f, 332, "LE Modify Sleep Clock Accuracy" },
 	{ BT_HCI_CMD_LE_READ_BUFFER_SIZE_V2,
 				BT_HCI_BIT_LE_READ_BUFFER_SIZE_V2,
 				"LE Read Buffer v2",
@@ -11427,8 +11719,15 @@ static void cmd_complete_evt(struct timeval *tv, uint16_t index,
 	struct opcode_data vendor_data;
 	const struct opcode_data *opcode_data = NULL;
 	const char *opcode_color, *opcode_str;
-	char vendor_str[150];
+	char vendor_str[150], req_str[32];
+	struct pending_cmd *cmd;
 	int i;
+
+	cmd = pending_cmd_find(index, opcode);
+	pending_cmd_str(cmd, tv, req_str, sizeof(req_str));
+	/* A Command Complete always terminates the command */
+	if (cmd)
+		pending_cmd_remove(index, cmd);
 
 	for (i = 0; opcode_table[i].str; i++) {
 		if (opcode_table[i].opcode == opcode) {
@@ -11478,7 +11777,8 @@ static void cmd_complete_evt(struct timeval *tv, uint16_t index,
 	}
 
 	print_indent(6, opcode_color, "", opcode_str, COLOR_OFF,
-			" (0x%2.2x|0x%4.4x) ncmd %d", ogf, ocf, evt->ncmd);
+			" (0x%2.2x|0x%4.4x) ncmd %d%s%s", ogf, ocf, evt->ncmd,
+			req_str[0] ? " " : "", req_str);
 
 	if (!opcode_data || !opcode_data->rsp_func) {
 		if (size > 3) {
@@ -11523,8 +11823,23 @@ static void cmd_status_evt(struct timeval *tv, uint16_t index,
 	uint16_t ocf = cmd_opcode_ocf(opcode);
 	const struct opcode_data *opcode_data = NULL;
 	const char *opcode_color, *opcode_str;
-	char vendor_str[150];
+	char vendor_str[150], req_str[32];
+	struct pending_cmd *cmd;
 	int i;
+
+	cmd = pending_cmd_find(index, opcode);
+	pending_cmd_str(cmd, tv, req_str, sizeof(req_str));
+	/*
+	 * A deferred command is only acknowledged here and completes later
+	 * through an event, so keep it queued. A failed status means that
+	 * event will never arrive.
+	 */
+	if (cmd) {
+		if (cmd->deferred && !evt->status)
+			cmd->acked = true;
+		else
+			pending_cmd_remove(index, cmd);
+	}
 
 	for (i = 0; opcode_table[i].str; i++) {
 		if (opcode_table[i].opcode == opcode) {
@@ -11562,7 +11877,8 @@ static void cmd_status_evt(struct timeval *tv, uint16_t index,
 	}
 
 	print_indent(6, opcode_color, "", opcode_str, COLOR_OFF,
-			" (0x%2.2x|0x%4.4x) ncmd %d", ogf, ocf, evt->ncmd);
+			" (0x%2.2x|0x%4.4x) ncmd %d%s%s", ogf, ocf, evt->ncmd,
+			req_str[0] ? " " : "", req_str);
 
 	print_status(evt->status);
 }
@@ -11687,6 +12003,125 @@ void packet_loss_add(struct packet_loss *loss, uint16_t sn, uint8_t sflags)
 
 	loss->last_sn = sn;
 	loss->have_sn = true;
+}
+
+/*
+ * Timestamp and frame number of the packet being decoded. btmon decodes one
+ * packet at a time, so this lets the upper layers reference the frame that
+ * carried a request without threading it through every protocol handler.
+ */
+static struct timeval cur_tv;
+static bool cur_tv_valid;
+static size_t cur_num;
+
+static void packet_set_context(struct timeval *tv, size_t num)
+{
+	cur_tv_valid = tv;
+	if (tv)
+		cur_tv = *tv;
+	cur_num = num;
+}
+
+void packet_get_context(struct timeval *tv, size_t *num)
+{
+	if (tv) {
+		if (cur_tv_valid)
+			*tv = cur_tv;
+		else
+			timerclear(tv);
+	}
+
+	if (num)
+		*num = cur_num;
+}
+
+/*
+ * Requests from the protocols above HCI, so that a response can point back
+ * at the frame that carried the request.
+ */
+struct packet_req {
+	uint16_t cid;
+	uint8_t proto;
+	uint16_t id;
+	size_t num;
+	struct timeval tv;
+};
+
+/* Bound the queue so requests that never get a response cannot pile up */
+#define PACKET_REQ_MAX 64
+
+static bool match_packet_req(const void *data, const void *user_data)
+{
+	const struct packet_req *req = data;
+	const struct packet_req *match = user_data;
+
+	return req->cid == match->cid && req->proto == match->proto &&
+						req->id == match->id;
+}
+
+void packet_req_add(uint16_t handle, uint16_t cid, uint8_t proto, uint16_t id,
+					struct timeval *tv, size_t num)
+{
+	struct packet_conn_data *conn;
+	struct packet_req *req;
+
+	conn = packet_get_conn_data(handle);
+	if (!conn)
+		return;
+
+	if (!conn->req_q)
+		conn->req_q = queue_new();
+
+	if (queue_length(conn->req_q) >= PACKET_REQ_MAX)
+		free(queue_pop_head(conn->req_q));
+
+	req = new0(struct packet_req, 1);
+	req->cid = cid;
+	req->proto = proto;
+	req->id = id;
+	req->num = num;
+	if (tv)
+		req->tv = *tv;
+
+	queue_push_tail(conn->req_q, req);
+}
+
+/*
+ * Format the request reference for a response. Leaves the string empty when
+ * the request was not seen, which is the normal case for a capture started
+ * while a transaction was already in progress.
+ */
+void packet_req_str(uint16_t handle, uint16_t cid, uint8_t proto, uint16_t id,
+			struct timeval *tv, char *str, size_t len)
+{
+	struct packet_conn_data *conn;
+	struct packet_req *req, match;
+	struct timeval delta;
+
+	str[0] = '\0';
+
+	conn = packet_get_conn_data(handle);
+	if (!conn)
+		return;
+
+	match.cid = cid;
+	match.proto = proto;
+	match.id = id;
+
+	req = queue_remove_if(conn->req_q, match_packet_req, &match);
+	if (!req)
+		return;
+
+	if (tv && timerisset(tv) && timerisset(&req->tv)) {
+		timersub(tv, &req->tv, &delta);
+		snprintf(str, len, "#%zu (%lld.%03lld msec)", req->num,
+				(long long)delta.tv_sec * 1000 +
+						delta.tv_usec / 1000,
+				(long long)delta.tv_usec % 1000);
+	} else
+		snprintf(str, len, "#%zu", req->num);
+
+	free(req);
 }
 
 static void packet_dequeue_tx(struct timeval *tv, uint16_t handle)
@@ -13748,7 +14183,8 @@ struct subevent_data {
 
 static void print_subevent(struct timeval *tv, uint16_t index,
 				const struct subevent_data *subevent_data,
-				const void *data, uint8_t size)
+				const void *data, uint8_t size,
+				const char *req_str)
 {
 	const char *subevent_color;
 
@@ -13759,6 +14195,9 @@ static void print_subevent(struct timeval *tv, uint16_t index,
 
 	print_indent(6, subevent_color, "", subevent_data->str, COLOR_OFF,
 					" (0x%2.2x)", subevent_data->subevent);
+
+	if (req_str && req_str[0])
+		print_field("Request: %s", req_str);
 
 	if (!subevent_data->func) {
 		packet_hexdump(data, size);
@@ -13916,6 +14355,7 @@ static void le_meta_event_evt(struct timeval *tv, uint16_t index,
 	uint8_t subevent = *((const uint8_t *) data);
 	struct subevent_data unknown;
 	const struct subevent_data *subevent_data = &unknown;
+	char req_str[32];
 	int i;
 
 	unknown.subevent = subevent;
@@ -13931,7 +14371,10 @@ static void le_meta_event_evt(struct timeval *tv, uint16_t index,
 		}
 	}
 
-	print_subevent(tv, index, subevent_data, data + 1, size - 1);
+	deferred_cmd_str(index, BT_HCI_EVT_LE_META_EVENT, subevent, data + 1,
+					size - 1, tv, req_str, sizeof(req_str));
+
+	print_subevent(tv, index, subevent_data, data + 1, size - 1, req_str);
 }
 
 static void evt_vendor(struct timeval *tv, uint16_t index,
@@ -13960,7 +14403,7 @@ static void evt_vendor(struct timeval *tv, uint16_t index,
 		vendor_data.fixed = vnd->evt_fixed;
 
 		print_subevent(tv, index, &vendor_data, data + consumed_size,
-							size - consumed_size);
+					size - consumed_size, NULL);
 	} else {
 		uint16_t manufacturer;
 
@@ -14156,6 +14599,11 @@ void packet_del_index(struct timeval *tv, uint16_t index, const char *label)
 {
 	print_packet(tv, NULL, '=', index, NULL, COLOR_DEL_INDEX,
 					"Delete Index", label, NULL);
+
+	if (index < MAX_INDEX) {
+		queue_destroy(index_list[index].cmd_q, free);
+		index_list[index].cmd_q = NULL;
+	}
 }
 
 void packet_open_index(struct timeval *tv, uint16_t index, const char *label)
@@ -14168,6 +14616,11 @@ void packet_close_index(struct timeval *tv, uint16_t index, const char *label)
 {
 	print_packet(tv, NULL, '=', index, NULL, COLOR_CLOSE_INDEX,
 					"Close Index", label, NULL);
+
+	if (index < MAX_INDEX) {
+		queue_destroy(index_list[index].cmd_q, free);
+		index_list[index].cmd_q = NULL;
+	}
 }
 
 void packet_index_info(struct timeval *tv, uint16_t index, const char *label,
@@ -14318,6 +14771,10 @@ void packet_hci_command(struct timeval *tv, struct ucred *cred, uint16_t index,
 
 	data += HCI_COMMAND_HDR_SIZE;
 	size -= HCI_COMMAND_HDR_SIZE;
+
+	/* NOP carries no request and is only used to update ncmd */
+	if (opcode != BT_HCI_CMD_NOP)
+		pending_cmd_enqueue(index, opcode, tv, data, hdr->plen);
 
 	for (i = 0; opcode_table[i].str; i++) {
 		if (opcode_table[i].opcode == opcode) {
@@ -14477,6 +14934,19 @@ void packet_hci_event(struct timeval *tv, struct ucred *cred, uint16_t index,
 		}
 	}
 
+	/*
+	 * LE Meta Events are resolved once the subevent is known, so that
+	 * the reference can be printed under it.
+	 */
+	if (hdr->evt != BT_HCI_EVT_LE_META_EVENT) {
+		char req_str[32];
+
+		deferred_cmd_str(index, hdr->evt, 0x00, data, hdr->plen, tv,
+						req_str, sizeof(req_str));
+		if (req_str[0])
+			print_field("Request: %s", req_str);
+	}
+
 	event_data->func(tv, index, data, hdr->plen);
 }
 
@@ -14607,7 +15077,11 @@ void packet_hci_acldata(struct timeval *tv, struct ucred *cred, uint16_t index,
 	if (filter_mask & PACKET_FILTER_SHOW_ACL_DATA)
 		packet_hexdump(data, size);
 
+	packet_set_context(tv, index_list[index].frame);
+
 	l2cap_packet(index, in, acl_handle(handle), flags, data, size);
+
+	packet_set_context(NULL, 0);
 }
 
 void packet_hci_scodata(struct timeval *tv, struct ucred *cred, uint16_t index,
@@ -17853,6 +18327,127 @@ static void mgmt_conn_subrate_evt(const void *data, uint16_t size)
 	print_field("Supervision timeout: %u", supv_timeout);
 }
 
+static void mgmt_print_security_level(const char *desc, uint32_t value)
+{
+	const char *level;
+
+	switch (value) {
+	case BT_SECURITY_SDP:
+		level = "No security";
+		break;
+	case BT_SECURITY_LOW:
+		level = "Unauthenticated pairing with encryption not required";
+		break;
+	case BT_SECURITY_MEDIUM:
+		level = "Unauthenticated pairing with encryption desired";
+		break;
+	case BT_SECURITY_HIGH:
+		level = "Authenticated pairing with encryption";
+		break;
+	case BT_SECURITY_FIPS:
+		level = "FIPS authenticated pairing with encryption";
+		break;
+	default:
+		level = "Reserved";
+		break;
+	}
+
+	print_field("%s: %s (0x%8.8x)", desc, level, value);
+}
+
+static void mgmt_print_encryption_type(const char *desc, uint32_t value)
+{
+	const char *type;
+
+	switch (value) {
+	case MGMT_CONN_SEC_ENCRYPT_NONE:
+		type = "No encryption";
+		break;
+	case MGMT_CONN_SEC_ENCRYPT_E0:
+		type = "E0";
+		break;
+	case MGMT_CONN_SEC_ENCRYPT_AES_CCM:
+		type = "AES-CCM";
+		break;
+	default:
+		type = "Reserved";
+		break;
+	}
+
+	print_field("%s: %s (0x%8.8x)", desc, type, value);
+}
+
+static void mgmt_print_sec_level_tlv(void *data, void *user_data)
+{
+	const struct mgmt_tlv *entry = data;
+	uint16_t type = get_le16(&entry->type);
+	const char *desc = default_system_config(type);
+	uint32_t value;
+	char buf[8];
+
+	switch (type) {
+	case MGMT_SEC_LEVEL_CHANGED_PARAM_LEVEL:
+		desc = "Security Level";
+		break;
+	case MGMT_SEC_LEVEL_CHANGED_PARAM_ENC_TYPE:
+		desc = "Encryption Type";
+		break;
+	default:
+		snprintf(buf, sizeof(buf), "0x%4.4x", entry->type);
+		desc = buf;
+		break;
+	}
+
+	if (entry->length == 1 || entry->length == 2 || entry->length == 4) {
+		if (entry->length == 1)
+			value = get_u8(entry->value);
+		else if (entry->length == 2)
+			value = get_le16(entry->value);
+		else
+			value = get_le32(entry->value);
+
+		switch (type) {
+		case MGMT_SEC_LEVEL_CHANGED_PARAM_LEVEL:
+			mgmt_print_security_level(desc, value);
+			break;
+		case MGMT_SEC_LEVEL_CHANGED_PARAM_ENC_TYPE:
+			mgmt_print_encryption_type(desc, value);
+			break;
+		default:
+			print_field("%s: %u", desc, value);
+			break;
+		}
+	} else {
+		print_hex_field(desc, entry->value, entry->length);
+	}
+}
+
+static void mgmt_security_level_changed_evt(const void *data, uint16_t size)
+{
+	const uint8_t *addr = data;
+	uint8_t addr_type = get_u8(data + 6);
+	uint8_t tlv_length = get_u8(data + 7);
+	uint16_t offset = sizeof(struct mgmt_addr_info) + 1;
+	struct mgmt_tlv_list *tlv_list;
+
+	mgmt_print_address(addr, addr_type);
+
+	if (offset + tlv_length != size) {
+		print_text(COLOR_ERROR, "  Unexpected security level changed "
+					"TLV length %u", tlv_length);
+		return;
+	}
+
+	tlv_list = mgmt_tlv_list_load_from_buf(data + offset, tlv_length);
+	if (!tlv_list) {
+		print_text(COLOR_ERROR, "  Unable to parse security level "
+					"changed event");
+		return;
+	}
+	mgmt_tlv_list_foreach(tlv_list, mgmt_print_sec_level_tlv, NULL);
+	mgmt_tlv_list_free(tlv_list);
+}
+
 static const struct mgmt_data mgmt_event_table[] = {
 	{ 0x0001, "Command Complete",
 			mgmt_command_complete_evt, 3, false },
@@ -17952,6 +18547,8 @@ static const struct mgmt_data mgmt_event_table[] = {
 			mgmt_mesh_packet_cmplt_evt, 1, true },
 	{ 0x0033, "Connection Subrate",
 			mgmt_conn_subrate_evt, 18, true },
+	{ 0x0034, "Security Level Changed",
+			mgmt_security_level_changed_evt, 8, false },
 	{ }
 };
 
@@ -18191,7 +18788,7 @@ void packet_todo(void)
 {
 	int i;
 
-	printf("HCI commands with missing decodings:\n");
+	display_printf("HCI commands with missing decodings:\n");
 
 	for (i = 0; opcode_table[i].str; i++) {
 		if (opcode_table[i].bit < 0)
@@ -18200,22 +18797,22 @@ void packet_todo(void)
 		if (opcode_table[i].cmd_func)
 			continue;
 
-		printf("\t%s\n", opcode_table[i].str);
+		display_printf("\t%s\n", opcode_table[i].str);
 	}
 
-	printf("HCI events with missing decodings:\n");
+	display_printf("HCI events with missing decodings:\n");
 
 	for (i = 0; event_table[i].str; i++) {
 		if (event_table[i].func)
 			continue;
 
-		printf("\t%s\n", event_table[i].str);
+		display_printf("\t%s\n", event_table[i].str);
 	}
 
 	for (i = 0; le_meta_event_table[i].str; i++) {
 		if (le_meta_event_table[i].func)
 			continue;
 
-		printf("\t%s\n", le_meta_event_table[i].str);
+		display_printf("\t%s\n", le_meta_event_table[i].str);
 	}
 }

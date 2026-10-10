@@ -141,3 +141,39 @@ boolean Connected [readonly, experimental]
 Indicates if the remote device is currently connected to LE bearer.
 
 A PropertiesChanged signal indicate changes to this status.
+
+boolean Connectable [readonly, optional, experimental]
+``````````````````````````````````````````````````````
+
+Indicates if the remote device accepts connections on LE bearer, based on the
+most recent advertising report. It is false when the last advertising report
+was non-connectable, e.g. ADV_NONCONN_IND or ADV_SCAN_IND.
+
+The property is only present once the device has been discovered or connected
+over LE bearer.
+
+A PropertiesChanged signal indicate changes to this status.
+
+string Role [readonly, optional, experimental]
+``````````````````````````````````````````````
+
+Indicates the role of the remote device in the current connection on LE bearer.
+It is only present while the remote device is connected over LE bearer.
+
+It is the link layer role of the connection. It does not imply which side acts
+as GATT client or server, as GATT roles are independent of it and both may be
+used at the same time.
+
+Possible values:
+
+:"central":
+
+	The remote device initiated the connection, and the adapter is the
+	peripheral.
+
+:"peripheral":
+
+	The adapter initiated the connection, and the remote device is the
+	peripheral.
+
+A PropertiesChanged signal indicate changes to this status.

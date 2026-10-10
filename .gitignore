@@ -45,7 +45,6 @@ tools/97-hid2hci.rules
 profiles/cups/bluetooth
 profiles/iap/iapd
 
-attrib/gatttool
 tools/avinfo
 tools/bccmd
 tools/hwdb
@@ -97,6 +96,7 @@ tools/isotest
 tools/iso-tester
 test/bluezutils.pyc
 unit/test-tester
+unit/test-mainloop
 unit/test-ringbuf
 unit/test-queue
 unit/test-util
@@ -174,7 +174,6 @@ unit/test-avctp
 unit/test-avrcp
 unit/test-gatt
 unit/test-midi
-unit/test-gattrib
 unit/test-mesh-crypto
 unit/test-micp
 unit/test-vcp

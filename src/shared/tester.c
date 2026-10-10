@@ -558,6 +558,8 @@ void tester_pre_setup_failed(void)
 		test->timeout_id = 0;
 	}
 
+	test->result = TEST_RESULT_FAILED;
+
 	print_progress(test->name, COLOR_RED, "pre setup failed");
 
 	g_idle_add(done_callback, test);
@@ -624,6 +626,7 @@ void tester_setup_failed(void)
 	if (test->stage != TEST_STAGE_SETUP)
 		return;
 
+	test->result = TEST_RESULT_FAILED;
 	test->stage = TEST_STAGE_POST_TEARDOWN;
 
 	if (test->timeout_id > 0) {
@@ -944,6 +947,25 @@ static bool test_io_send(struct io *io, void *user_data)
 
 	if (!iov)
 		return false;
+
+	/* IOV_NULL following an expected PDU means there is no response to
+	 * it, e.g. a Write Command: wait for the next PDU instead, unless
+	 * followed by another IOV_NULL chaining the PDUs to send.
+	 */
+	if (!iov->iov_base) {
+		/* Nothing left to send or to expect */
+		if (!test->iovcnt) {
+			if (test->io_complete_func)
+				test->io_complete_func(test->test_data);
+			return false;
+		}
+
+		if (test->iov->iov_base)
+			return false;
+
+		test_get_iov(test);
+		return test_io_send(io, user_data);
+	}
 
 	len = io_send(io, iov, 1);
 

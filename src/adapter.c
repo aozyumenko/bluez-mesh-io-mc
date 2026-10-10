@@ -45,6 +45,7 @@
 #include "src/shared/util.h"
 #include "src/shared/queue.h"
 #include "src/shared/att.h"
+#include "src/shared/crypto.h"
 #include "src/shared/gatt-db.h"
 #include "src/shared/timeout.h"
 
@@ -59,9 +60,6 @@
 #include "uuid-helper.h"
 #include "agent.h"
 #include "storage.h"
-#include "attrib/gattrib.h"
-#include "attrib/att.h"
-#include "attrib/gatt.h"
 #include "gatt-database.h"
 #include "advertising.h"
 #include "adv_monitor.h"
@@ -1880,6 +1878,12 @@ static void start_discovery_complete(uint8_t status, uint16_t length,
 
 		if (status != MGMT_STATUS_SUCCESS)
 			return;
+
+		if (length < sizeof(*rp)) {
+			btd_error(adapter->dev_id,
+				"Wrong size of start discovery return parameters");
+			return;
+		}
 
 		/* Stop discovering as there are no clients left */
 		cp.type = rp->type;
@@ -4580,7 +4584,7 @@ static void load_ltks(struct btd_adapter *adapter, GSList *keys)
 			device_set_paired(dev, info->bdaddr_type);
 			device_set_bonded(dev, info->bdaddr_type);
 			device_set_ltk(dev, info->val, info->central,
-						info->enc_size);
+					info->authenticated, info->enc_size);
 		}
 	}
 
@@ -5353,59 +5357,12 @@ static void load_drivers(struct btd_adapter *adapter)
 		probe_driver(adapter, l->data);
 }
 
-struct profile_allowlist_map {
-	const char *name;
-	const char *uuid;
-	bool use_remote_uuid;
-};
-
-/*
- * Adapter server policy UUID defaults to local_uuid when available.
- * Profiles listed below are exceptions.
- *
- * A2DP profiles map to ADVANCED_AUDIO_UUID so profile probe gating matches
- * the A2DP profile class (0x110d), while adapter service registration/removal
- * still filters specific Source/Sink records by their own UUIDs.
- */
-static const struct profile_allowlist_map profile_allowlist_map[] = {
-	{ "a2dp-source", ADVANCED_AUDIO_UUID, false },
-	{ "a2dp-sink", ADVANCED_AUDIO_UUID, false },
-	{ "audio-avrcp-target", NULL, true },
-	{ "avrcp-controller", NULL, true },
-	{ "vcp", NULL, true },
-	{ "micp", NULL, true },
-	{ "ccp", NULL, true },
-	{ "gmap", NULL, true },
-	{ "tmap", NULL, true },
-	{ "bass", NULL, true },
-	{ "bap", NULL, true },
-	{ "mcp-gmcs", NULL, true },
-};
-
 static const char *profile_allowlist_uuid(const struct btd_profile *profile)
 {
-	size_t i;
-
 	if (profile->local_uuid)
 		return profile->local_uuid;
 
-	if (!profile->name)
-		return NULL;
-
-	for (i = 0; i < ARRAY_SIZE(profile_allowlist_map); i++) {
-		const struct profile_allowlist_map *entry =
-						&profile_allowlist_map[i];
-
-		if (strcmp(profile->name, entry->name))
-			continue;
-
-		if (entry->use_remote_uuid)
-			return profile->remote_uuid;
-
-		return entry->uuid;
-	}
-
-	return NULL;
+	return btd_profile_get_policy_uuid(profile);
 }
 
 bool btd_adapter_is_profile_allowed(struct btd_adapter *adapter,
@@ -7340,7 +7297,6 @@ static struct btd_adapter *btd_adapter_new(uint16_t index)
 
 static void adapter_remove(struct btd_adapter *adapter)
 {
-	GSList *l;
 	struct gatt_db *db;
 	struct btd_ranging_provider_manager *ranging_manager;
 
@@ -7349,13 +7305,19 @@ static void adapter_remove(struct btd_adapter *adapter)
 	g_slist_free(adapter->connect_list);
 	adapter->connect_list = NULL;
 
-	for (l = adapter->devices; l; l = l->next) {
-		device_removed_drivers(adapter, l->data);
-		device_remove(l->data, FALSE);
-	}
+	while (adapter->devices) {
+		struct btd_device *device = adapter->devices->data;
 
-	g_slist_free(adapter->devices);
-	adapter->devices = NULL;
+		/* Take the device out of the list before removing it, as
+		 * freeing it looks devices up, e.g. when cleaning up its
+		 * GATT server, and the ones already freed would still be
+		 * found.
+		 */
+		adapter->devices = g_slist_remove(adapter->devices, device);
+
+		device_removed_drivers(adapter, device);
+		device_remove(device, FALSE);
+	}
 
 	g_slist_free(adapter->discovery_found);
 	adapter->discovery_found = NULL;
@@ -9288,7 +9250,8 @@ static void new_long_term_key_callback(uint16_t index, uint16_t length,
 		device_set_bonded(device, addr->type);
 	}
 
-	device_set_ltk(device, ev->key.val, ev->key.central, ev->key.enc_size);
+	device_set_ltk(device, ev->key.val, ev->key.central, ev->key.type,
+							ev->key.enc_size);
 
 	bonding_complete(adapter, &addr->bdaddr, addr->type, 0);
 }
@@ -10193,6 +10156,34 @@ static void unpaired_callback(uint16_t index, uint16_t length,
 	device_set_unpaired(device, ev->addr.type);
 }
 
+static void device_sec_level_callback(uint16_t index, uint16_t length,
+					  const void *param, void *user_data)
+{
+	const struct mgmt_ev_security_level_changed *ev = param;
+	struct btd_adapter *adapter = user_data;
+	struct btd_device *dev;
+	char addr[18];
+
+	if (length < sizeof(*ev)) {
+		btd_error(adapter->dev_id,
+			  "Too small Device Security Level Changed event: %d",
+			  length);
+		return;
+	}
+
+	ba2str(&ev->addr.bdaddr, addr);
+
+	dev = btd_adapter_find_device(adapter, &ev->addr.bdaddr, ev->addr.type);
+	if (!dev) {
+		btd_error(adapter->dev_id,
+			"Device Security Level Changed for unknown device %s",
+			addr);
+		return;
+	}
+
+	btd_device_sec_level_changed(dev, ev->tlv_data, length - 8);
+}
+
 static void clear_devices_complete(uint8_t status, uint16_t length,
 					const void *param, void *user_data)
 {
@@ -10909,6 +10900,11 @@ static void read_info_complete(uint8_t status, uint16_t length,
 	mgmt_register(adapter->mgmt, MGMT_EV_CONTROLLER_RESUME,
 						adapter->dev_id,
 						controller_resume_callback,
+						adapter, NULL);
+
+	mgmt_register(adapter->mgmt, MGMT_EV_SECURITY_LEVEL_CHANGED,
+						adapter->dev_id,
+						device_sec_level_callback,
 						adapter, NULL);
 
 	set_dev_class(adapter);

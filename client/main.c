@@ -28,6 +28,7 @@
 #include "src/shared/util.h"
 #include "src/shared/ad.h"
 #include "gdbus/gdbus.h"
+#include "main.h"
 #include "print.h"
 #include "agent.h"
 #include "gatt.h"
@@ -182,6 +183,19 @@ static struct set_discovery_filter_args {
 	.set = true,
 };
 
+static bool device_is_broadcaster(GDBusProxy *proxy)
+{
+	DBusMessageIter iter;
+	dbus_bool_t connectable;
+
+	if (!g_dbus_proxy_get_property(proxy, "Connectable", &iter))
+		return false;
+
+	dbus_message_iter_get_basic(&iter, &connectable);
+
+	return !connectable;
+}
+
 static void print_device(GDBusProxy *proxy, const char *description)
 {
 	DBusMessageIter iter;
@@ -217,6 +231,20 @@ static void print_device(GDBusProxy *proxy, const char *description)
 			return;
 
 		bt_shell_printf("%s%s%s" COLOR_BOLDGRAY "Device %s %s"
+					COLOR_OFF "\n",
+					description ? "[" : "",
+					description ? : "",
+					description ? "] " : "",
+					address, name);
+
+		return;
+	}
+
+	/* Print discoverable broadcasters in red to warn the user they cannot
+	 * be connected to despite being discoverable.
+	 */
+	if (device_is_broadcaster(proxy)) {
+		bt_shell_printf("%s%s%s" COLOR_RED "Device %s %s"
 					COLOR_OFF "\n",
 					description ? "[" : "",
 					description ? : "",
@@ -1416,9 +1444,17 @@ static void cmd_agent(int argc, char *argv[])
 	dbus_bool_t enable;
 	const char *capability;
 
-	if (!parse_argument(argc, argv, agent_arguments, "capability",
-						&enable, &capability))
+	/* The capability of the auto response is given after a colon,
+	 * e.g. auto:NoInputNoOutput, so it cannot be looked up in the
+	 * list of arguments.
+	 */
+	if (argc > 1 && !strncasecmp(argv[1], "auto:", 5)) {
+		enable = TRUE;
+		capability = argv[1];
+	} else if (!parse_argument(argc, argv, agent_arguments, "capability",
+						&enable, &capability)) {
 		return bt_shell_noninteractive_quit(EXIT_FAILURE);
+	}
 
 	if (enable == TRUE) {
 		g_free(auto_register_agent);
@@ -2011,12 +2047,15 @@ static void cmd_info(int argc, char *argv[])
 	print_property(proxy, "WakeAllowed");
 	print_property(proxy, "LegacyPairing");
 	print_property(proxy, "CablePairing");
+	print_property(proxy, "SecurityLevel");
+	print_property(proxy, "EncryptionType");
 	print_uuids(proxy);
 	print_property(proxy, "Modalias");
 	print_property(proxy, "ManufacturerData");
 	print_property(proxy, "ServiceData");
 	print_property(proxy, "RSSI");
 	print_property(proxy, "TxPower");
+	print_property(proxy, "Connectable");
 	print_property(proxy, "AdvertisingFlags");
 	print_property(proxy, "AdvertisingData");
 	print_property(proxy, "Sets");
@@ -2045,6 +2084,8 @@ static void cmd_info(int argc, char *argv[])
 		print_property_with_label(bearer, "Bonded", "BREDR.Bonded");
 		print_property_with_label(bearer, "Connected",
 							"BREDR.Connected");
+		print_property_with_label(bearer, "Connectable",
+							"BREDR.Connectable");
 	}
 
 	bearer = find_proxies_by_iface(default_ctrl->bearers,
@@ -2054,10 +2095,16 @@ static void cmd_info(int argc, char *argv[])
 		print_property_with_label(bearer, "Paired", "LE.Paired");
 		print_property_with_label(bearer, "Bonded", "LE.Bonded");
 		print_property_with_label(bearer, "Connected", "LE.Connected");
+		print_property_with_label(bearer, "Connectable",
+							"LE.Connectable");
+		print_property_with_label(bearer, "Role", "LE.Role");
 	}
 
 	return bt_shell_noninteractive_quit(EXIT_SUCCESS);
 }
+
+static const char *proxy_address(GDBusProxy *proxy);
+static void connect_device(GDBusProxy *proxy);
 
 static void pair_reply(DBusMessage *message, void *user_data)
 {
@@ -2092,10 +2139,30 @@ static const char *proxy_address(GDBusProxy *proxy)
 static void cmd_pair(int argc, char *argv[])
 {
 	GDBusProxy *proxy;
+	DBusMessageIter iter;
+	dbus_bool_t paired;
 
 	proxy = find_device(argc, argv);
 	if (!proxy)
 		return bt_shell_noninteractive_quit(EXIT_FAILURE);
+
+	/* Pairing a device that is already paired is rejected with
+	 * AlreadyExists, so connect it instead: the bond is there, which
+	 * is what pairing it again would be for, and removing it first is
+	 * what actually pairs it anew.
+	 */
+	if (g_dbus_proxy_get_property(proxy, "Paired", &iter)) {
+		dbus_message_iter_get_basic(&iter, &paired);
+
+		if (paired) {
+			bt_shell_printf("Device %s is already paired, "
+					"connecting instead, remove it first "
+					"to pair it again\n",
+					proxy_address(proxy));
+			connect_device(proxy);
+			return;
+		}
+	}
 
 	if (g_dbus_proxy_method_call(proxy, "Pair", NULL, pair_reply,
 							NULL, NULL) == FALSE) {
@@ -2354,6 +2421,23 @@ static void connect_reply(DBusMessage *message, void *user_data)
 
 	set_default_device(proxy, NULL);
 	return bt_shell_noninteractive_quit(EXIT_SUCCESS);
+}
+
+static void connect_device(GDBusProxy *proxy)
+{
+	struct connection_data *data;
+
+	data = new0(struct connection_data, 1);
+	data->proxy = proxy;
+
+	if (g_dbus_proxy_method_call(proxy, "Connect", connection_setup,
+					connect_reply, data, NULL) == FALSE) {
+		bt_shell_printf("Failed to connect\n");
+		g_free(data);
+		return bt_shell_noninteractive_quit(EXIT_FAILURE);
+	}
+
+	bt_shell_printf("Attempting to connect to %s\n", proxy_address(proxy));
 }
 
 static void prompt_scan_connect(const char *input, void *user_data)
@@ -4034,7 +4118,7 @@ static const struct bt_shell_menu main_menu = {
 							NULL },
 	{ "discoverable-timeout", "[value]", cmd_discoverable_timeout,
 					"Set discoverable timeout", NULL },
-	{ "agent",        "<on/off/auto/capability>", cmd_agent,
+	{ "agent",        "<on/off/auto[:capability]/capability>", cmd_agent,
 				"Enable/disable agent with given capability",
 							capability_generator},
 	{ "default-agent",NULL,       cmd_default_agent,
@@ -4120,6 +4204,7 @@ static bool timeout_quit(void *user_data)
 int main(int argc, char *argv[])
 {
 	GDBusClient *client;
+	DBusError error;
 	int status;
 	int timeout;
 	unsigned int timeout_id;
@@ -4151,7 +4236,18 @@ int main(int argc, char *argv[])
 	else
 		auto_register_agent = g_strdup("");
 
-	dbus_conn = g_dbus_setup_bus(DBUS_BUS_SYSTEM, NULL, NULL);
+	dbus_error_init(&error);
+	dbus_conn = g_dbus_setup_bus(DBUS_BUS_SYSTEM, NULL, &error);
+	if (!dbus_conn) {
+		fprintf(stderr, "Failed to connect to system D-Bus: %s\n",
+			error.message ? error.message : "unavailable");
+		dbus_error_free(&error);
+		g_free(auto_register_agent);
+		bt_shell_cleanup();
+		return EXIT_FAILURE;
+	}
+
+	dbus_error_free(&error);
 	g_dbus_attach_object_manager(dbus_conn);
 	cs_set_dbus_conn(dbus_conn);
 

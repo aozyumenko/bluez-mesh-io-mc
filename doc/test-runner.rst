@@ -205,6 +205,11 @@ Bluetooth
 	CONFIG_UNIX=y
 
 	CONFIG_UHID=y
+	CONFIG_HIDRAW=y
+
+CONFIG_HIDRAW is used by unit/test-uhid, when run as root e.g. with
+test-runner, to check the replies to the reports requested by the kernel
+through a hidraw device, as HIDIOCGFEATURE does.
 
 For 6lowpan-tester, the following are required:
 
@@ -354,6 +359,17 @@ In addition the above kernel config option the following is required:
 	CONFIG_PCI_MSI=y
 	CONFIG_ACPI=y
 	CONFIG_BT_HCIBTINTEL_PCIE=y
+
+IOMMU and interrupt remapping, without which vfio-pci fails to allocate
+MSI-X vectors (-ENOSPC):
+
+.. code-block::
+
+	CONFIG_INTEL_IOMMU=y
+	CONFIG_INTEL_IOMMU_DEFAULT_ON=y
+	CONFIG_INTEL_IOMMU_SVM=y
+	CONFIG_IRQ_REMAP=y
+	CONFIG_AMD_IOMMU=y
 
 On the host, an IOMMU must be enabled in the firmware and on the host kernel
 command line (``intel_iommu=on`` or ``amd_iommu=on``). The controller itself
