@@ -1157,6 +1157,10 @@ static bool is_us(struct mesh_net *net, uint16_t addr, bool src)
 	if (addr >= net->src_addr && addr <= net->last_addr)
 		return true;
 
+	if (IS_GROUP(addr) && l_queue_find(net->destinations, match_dest_dst,
+							L_UINT_TO_PTR(PROMISCUOUS_GROUP_ADDR)))
+		return true;
+
 	tst = l_queue_find(net->destinations, match_dest_dst,
 							L_UINT_TO_PTR(addr));
 
