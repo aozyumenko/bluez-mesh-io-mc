@@ -375,6 +375,8 @@ static void forward_model(void *a, void *b)
 	} else {
 		if (l_queue_find(mod->subs, simple_match, L_UINT_TO_PTR(dst)))
 			fwd->has_dst = true;
+		else if (IS_GROUP(dst) && l_queue_find(mod->subs, simple_match, L_UINT_TO_PTR(PROMISCUOUS_GROUP_ADDR)))
+			fwd->has_dst = true;
 	}
 
 	if (!fwd->has_dst)

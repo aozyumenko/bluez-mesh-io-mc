@@ -126,3 +126,4 @@
 
 #define IS_FIXED_GROUP_ADDRESS(x)	((x) >= PROXIES_ADDRESS)
 #define IS_ALL_NODES(x)	((x) == ALL_NODES_ADDRESS)
+#define PROMISCUOUS_GROUP_ADDR		0xfeff
